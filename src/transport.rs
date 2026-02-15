@@ -307,7 +307,7 @@ pub struct TransportState {
     pub transport_enabled: bool,
     pub discovery_announcer: Option<InterfaceAnnouncer>,
     pub interface_discovery: Option<InterfaceDiscovery>,
-    pub interface_announce_handler: Option<InterfaceAnnounceHandler>,
+    pub interface_announce_handler: Option<Arc<InterfaceAnnounceHandler>>,
     pub outbound_handlers: HashMap<String, Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
 }
 
@@ -436,6 +436,11 @@ static TRANSPORT: Lazy<Mutex<TransportState>> = Lazy::new(|| Mutex::new(Transpor
     ..TransportState::default()
 }));
 
+type OutboundHandler = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
+static OUTBOUND_HANDLERS: Lazy<Mutex<HashMap<String, OutboundHandler>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Clone, Debug)]
 pub struct TransportSnapshot {
     pub interfaces: Vec<InterfaceStub>,
@@ -472,24 +477,54 @@ pub fn get_state_snapshot() -> TransportSnapshot {
 
 pub struct Transport;
 
+fn mark_packet_sent(packet: &mut Packet, outbound_time: f64) {
+    packet.sent = true;
+    packet.sent_at = Some(outbound_time);
+}
+
 impl Transport {
     pub fn register_outbound_handler(
         name: &str,
         handler: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     ) {
-        let mut state = TRANSPORT.lock().unwrap();
-        state.outbound_handlers.insert(name.to_string(), handler);
+        OUTBOUND_HANDLERS
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), handler);
     }
 
     pub fn unregister_outbound_handler(name: &str) {
+        OUTBOUND_HANDLERS.lock().unwrap().remove(name);
+    }
+
+    pub fn set_receipt_delivery_callback(
+        receipt_hash: &[u8],
+        callback: Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync>,
+    ) {
         let mut state = TRANSPORT.lock().unwrap();
-        state.outbound_handlers.remove(name);
+        for receipt in state.receipts.iter_mut() {
+            if receipt.hash == receipt_hash {
+                receipt.set_delivery_callback(callback.clone());
+            }
+        }
+    }
+
+    pub fn set_receipt_timeout_callback(
+        receipt_hash: &[u8],
+        callback: Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync>,
+    ) {
+        let mut state = TRANSPORT.lock().unwrap();
+        for receipt in state.receipts.iter_mut() {
+            if receipt.hash == receipt_hash {
+                receipt.set_timeout_callback(callback.clone());
+            }
+        }
     }
 
     pub fn dispatch_outbound(name: &str, raw: &[u8]) -> bool {
         let handler = {
-            let state = TRANSPORT.lock().unwrap();
-            state.outbound_handlers.get(name).cloned()
+            let handlers = OUTBOUND_HANDLERS.lock().unwrap();
+            handlers.get(name).cloned()
         };
 
         if let Some(handler) = handler {
@@ -796,7 +831,7 @@ impl Transport {
 
         if state.interface_announce_handler.is_none() {
             let handler = InterfaceAnnounceHandler::new(required, None);
-            state.interface_announce_handler = Some(handler);
+            state.interface_announce_handler = Some(Arc::new(handler));
         }
     }
 
@@ -955,8 +990,13 @@ impl Transport {
                 false,
                 false,
             );
-            if let Some(dest) = state.destinations.get_mut(idx) {
+            if let Some(mut dest) = state.destinations.get(idx).cloned() {
+                drop(state);
                 let _ = dest.announce(None, true, attached_interface, tag, true);
+                let mut state = TRANSPORT.lock().unwrap();
+                if idx < state.destinations.len() {
+                    state.destinations[idx] = dest;
+                }
             }
             return;
         }
@@ -1364,6 +1404,7 @@ impl Transport {
     }
 
     pub fn jobs() {
+        let jobs_lock_started = std::time::Instant::now();
         let mut state = TRANSPORT.lock().unwrap();
         if state.jobs_locked {
             return;
@@ -1836,6 +1877,11 @@ impl Transport {
                 Transport::request_path(&destination_hash, None, blocked_if, None, None);
             }
         }
+
+        let held_ms = jobs_lock_started.elapsed().as_millis();
+        if held_ms > 500 {
+            eprintln!("[DEBUG] Transport::jobs held TRANSPORT mutex for {} ms", held_ms);
+        }
     }
 
     pub fn prioritize_interfaces() {
@@ -1844,31 +1890,24 @@ impl Transport {
     }
     pub fn outbound(packet: &mut Packet) -> bool {
         let mut state = TRANSPORT.lock().unwrap();
+        let mut wait_loops: u64 = 0;
         while state.jobs_running {
             drop(state);
             thread::sleep(Duration::from_millis(1));
             state = TRANSPORT.lock().unwrap();
+            wait_loops += 1;
+            if wait_loops % 1000 == 0 {
+                eprintln!("[DEBUG] Transport::outbound waiting for jobs lock ({} ms)", wait_loops);
+            }
+        }
+        if wait_loops > 0 {
+            eprintln!("[DEBUG] Transport::outbound acquired lock after {} ms", wait_loops);
         }
         state.jobs_locked = true;
         let mut sent = false;
+        let mut transmissions: Vec<(String, Vec<u8>)> = Vec::new();
         let outbound_time = now();
-
-        let mut generate_receipt = false;
-        if packet.create_receipt
-            && packet.packet_type == DATA
-            && packet.destination_type.is_some()
-            && packet.destination_type != Some(crate::destination::DestinationType::Plain)
-        {
-            generate_receipt = true;
-        }
-
-        let packet_sent = |packet: &mut Packet| {
-            packet.sent = true;
-            packet.sent_at = Some(outbound_time);
-            if generate_receipt {
-                packet.receipt = Some(crate::packet::PacketReceipt::new(packet));
-            }
-        };
+        eprintln!("[DEBUG] Transport::outbound entered critical section");
 
         let destination_hash = packet.destination_hash.clone().or_else(|| packet.destination.as_ref().map(|d| d.hash.clone()));
 
@@ -1884,10 +1923,10 @@ impl Transport {
                 Some(PathEntryValue::ReceivingInterface(Some(name))) => Some(name.clone()),
                 _ => None,
             };
-
-            let outbound_interface = outbound_interface_name
+            let outbound_interface_exists = outbound_interface_name
                 .as_ref()
-                .and_then(|name| state.interfaces.iter().find(|i| &i.name == name));
+                .map(|name| state.interfaces.iter().any(|i| &i.name == name))
+                .unwrap_or(false);
 
             let hops = match entry.get(IDX_PT_HOPS) {
                 Some(PathEntryValue::Hops(hops)) => *hops,
@@ -1903,9 +1942,11 @@ impl Transport {
                         if packet.raw.len() > 2 {
                             new_raw.extend_from_slice(&packet.raw[2..]);
                         }
-                        packet_sent(packet);
-                        if let Some(iface) = outbound_interface {
-                            iface.process_outgoing(&new_raw);
+                        mark_packet_sent(packet, outbound_time);
+                        if outbound_interface_exists {
+                            if let Some(iface_name) = outbound_interface_name.clone() {
+                                transmissions.push((iface_name, new_raw));
+                            }
                             sent = true;
                         }
                     }
@@ -1919,17 +1960,21 @@ impl Transport {
                         if packet.raw.len() > 2 {
                             new_raw.extend_from_slice(&packet.raw[2..]);
                         }
-                        packet_sent(packet);
-                        if let Some(iface) = outbound_interface {
-                            iface.process_outgoing(&new_raw);
+                        mark_packet_sent(packet, outbound_time);
+                        if outbound_interface_exists {
+                            if let Some(iface_name) = outbound_interface_name.clone() {
+                                transmissions.push((iface_name, new_raw));
+                            }
                             sent = true;
                         }
                     }
                 }
             } else {
-                packet_sent(packet);
-                if let Some(iface) = outbound_interface {
-                    iface.process_outgoing(&packet.raw);
+                mark_packet_sent(packet, outbound_time);
+                if outbound_interface_exists {
+                    if let Some(iface_name) = outbound_interface_name.clone() {
+                        transmissions.push((iface_name, packet.raw.clone()));
+                    }
                     sent = true;
                 }
             }
@@ -1962,11 +2007,11 @@ impl Transport {
                         if packet.packet_hash.is_some() {
                             packet_hashes.push(packet.packet_hash.clone().unwrap());
                         }
-                        interface.process_outgoing(&packet.raw);
+                        transmissions.push((interface.name.clone(), packet.raw.clone()));
                         if packet.packet_type == ANNOUNCE {
                             interface.sent_announce();
                         }
-                        packet_sent(packet);
+                        mark_packet_sent(packet, outbound_time);
                         sent = true;
                     }
                 }
@@ -1976,7 +2021,58 @@ impl Transport {
             }
         }
 
+        if sent && packet.should_generate_receipt() && packet.receipt.is_none() {
+            let timeout = if packet.destination_type == Some(crate::destination::DestinationType::Link) {
+                let destination = packet.destination.clone().unwrap_or_default();
+                destination
+                    .link
+                    .as_ref()
+                    .and_then(|l| l.rtt)
+                    .unwrap_or(0.0)
+                    * destination
+                        .link
+                        .as_ref()
+                        .map(|l| l.traffic_timeout_factor)
+                        .unwrap_or(1.0)
+                        .max(0.005)
+            } else {
+                let hops = if let Some(dest_hash) = packet
+                    .destination_hash
+                    .as_ref()
+                    .or_else(|| packet.destination.as_ref().map(|d| &d.hash))
+                {
+                    if let Some(entry) = state.path_table.get(dest_hash) {
+                        match entry.get(IDX_PT_HOPS) {
+                            Some(PathEntryValue::Hops(h)) => *h,
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                crate::reticulum::DEFAULT_PER_HOP_TIMEOUT
+                    + crate::packet::TIMEOUT_PER_HOP * hops as f64
+            };
+
+            let receipt = crate::packet::PacketReceipt::new_with_timeout(packet, timeout);
+            packet.receipt = Some(receipt.clone());
+            state.receipts.push(receipt);
+        }
+
+        eprintln!("[DEBUG] Transport::outbound prepared {} transmissions", transmissions.len());
         state.jobs_locked = false;
+        drop(state);
+
+        for (iface_name, raw) in transmissions {
+            eprintln!("[DEBUG] Transport::outbound dispatching {} bytes on {}", raw.len(), iface_name);
+            let _ = Transport::dispatch_outbound(&iface_name, &raw);
+            eprintln!("[DEBUG] Transport::outbound dispatch complete on {}", iface_name);
+        }
+
+        eprintln!("[DEBUG] Transport::outbound returning sent={}", sent);
         sent
     }
 
@@ -2502,6 +2598,7 @@ impl Transport {
             eprintln!("[INBOUND] Packet unpack FAILED");
             return false;
         }
+        packet.hops = packet.hops.saturating_add(1);
         eprintln!("[INBOUND] Packet unpacked, type: {}", packet.packet_type);
         if !Transport::packet_filter(&packet) {
             eprintln!("[INBOUND] Packet FILTERED OUT");
@@ -2541,7 +2638,87 @@ impl Transport {
             }
         }
 
+        let mut announce_should_add = false;
+        if packet.packet_type == ANNOUNCE {
+            eprintln!(
+                "[ANNOUNCE] Received packet, data len: {}, context: {}, context_flag: {}",
+                packet.data.len(),
+                packet.context,
+                packet.context_flag
+            );
+
+            announce_should_add = true;
+            if packet.data.len() >= (crate::identity::KEYSIZE / 8) {
+                let pub_key = packet.data[..(crate::identity::KEYSIZE / 8)].to_vec();
+                if !Identity::validate_announce(
+                    &packet.data,
+                    packet.destination_hash.as_ref().map(|v| v.as_slice()),
+                    Some(&pub_key),
+                    packet.context_flag,
+                ) {
+                    eprintln!("[ANNOUNCE] Validation FAILED");
+                    announce_should_add = false;
+                } else {
+                    eprintln!("[ANNOUNCE] Validation SUCCESS");
+                }
+            }
+
+            if announce_should_add {
+                if let (Some(destination_hash), Some(announced_identity)) = (
+                    packet.destination_hash.as_deref(),
+                    Self::extract_announce_identity(&packet),
+                ) {
+                    if let Ok(public_key) = announced_identity.get_public_key() {
+                        let app_data_for_remember = Self::extract_announce_app_data(&packet);
+                        let _ = Identity::remember_destination(
+                            destination_hash,
+                            &public_key,
+                            app_data_for_remember,
+                        );
+                    }
+                }
+            }
+        }
+
+        let interface_announce_callback = if packet.packet_type == ANNOUNCE && announce_should_add {
+            let handler = {
+                let state = TRANSPORT.lock().unwrap();
+                state.interface_announce_handler.clone()
+            };
+
+            if let Some(handler) = handler {
+                if let Some(filter_hash) = Self::name_hash_for_aspect_filter(&handler.aspect_filter) {
+                    if let Some(name_hash) = Self::extract_announce_name_hash(&packet) {
+                        if name_hash == filter_hash {
+                            if let Some(announced_identity) = Self::extract_announce_identity(&packet) {
+                                if let Some(app_data) = Self::extract_announce_app_data(&packet) {
+                                    Some((handler, packet.destination_hash.clone().unwrap_or_default(), announced_identity, app_data))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let inbound_lock_started = std::time::Instant::now();
         let mut state = TRANSPORT.lock().unwrap();
+        let mut deferred_outbound: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut deferred_announce_callbacks: Vec<(AnnounceCallback, Vec<u8>, Identity, Vec<u8>, Option<Vec<u8>>, bool)> = Vec::new();
 
         let mut remember_packet_hash = true;
         if let Some(destination_hash) = &packet.destination_hash {
@@ -2561,60 +2738,17 @@ impl Transport {
         }
 
         if packet.packet_type == ANNOUNCE {
-            eprintln!(
-                "[ANNOUNCE] Received packet, data len: {}, context: {}, context_flag: {}",
-                packet.data.len(),
-                packet.context,
-                packet.context_flag
-            );
-            let mut should_add = true;
-            if packet.data.len() >= (crate::identity::KEYSIZE / 8) {
-                let pub_key = packet.data[..(crate::identity::KEYSIZE / 8)].to_vec();
-                if !Identity::validate_announce(&packet.data, packet.destination_hash.as_ref().map(|v| v.as_slice()), Some(&pub_key), packet.context_flag) {
-                    eprintln!("[ANNOUNCE] Validation FAILED");
-                    should_add = false;
-                } else {
-                    eprintln!("[ANNOUNCE] Validation SUCCESS");
-                }
-            }
-
-            if should_add {
-                if let Some(handler) = state.interface_announce_handler.as_ref() {
-                    if let Some(filter_hash) = Self::name_hash_for_aspect_filter(&handler.aspect_filter) {
-                        if let Some(name_hash) = Self::extract_announce_name_hash(&packet) {
-                            if name_hash == filter_hash {
-                                if let Some(announced_identity) = Self::extract_announce_identity(&packet) {
-                                    if let Some(app_data) = Self::extract_announce_app_data(&packet) {
-                                        handler.received_announce(
-                                            packet.destination_hash.as_deref().unwrap_or_default(),
-                                            &announced_identity,
-                                            &app_data,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
+            if announce_should_add {
                 if let (Some(destination_hash), Some(announced_identity)) = (
                     packet.destination_hash.as_deref(),
                     Self::extract_announce_identity(&packet),
                 ) {
-                    let app_data = Self::extract_announce_app_data(&packet);
-                    if let Ok(public_key) = announced_identity.get_public_key() {
-                        let _ = Identity::remember_destination(
-                            destination_hash,
-                            &public_key,
-                            app_data.clone(),
-                        );
-                    }
-
                     let is_path_response = packet.context == crate::packet::PATH_RESPONSE;
-                    let announce_packet_hash = packet.packet_hash.clone();
-                    let announce_app_data = app_data.unwrap_or_default();
+                    let callback_packet_hash = packet.packet_hash.clone();
+                    let callback_handlers = state.announce_handlers.clone();
+                    let callback_app_data = Self::extract_announce_app_data(&packet).unwrap_or_default();
 
-                    for handler in &state.announce_handlers {
+                    for handler in &callback_handlers {
                         if is_path_response && !handler.receive_path_responses {
                             continue;
                         }
@@ -2631,13 +2765,14 @@ impl Transport {
                             }
                         }
 
-                        (handler.callback)(
-                            destination_hash,
-                            &announced_identity,
-                            &announce_app_data,
-                            announce_packet_hash.clone(),
+                        deferred_announce_callbacks.push((
+                            handler.callback.clone(),
+                            destination_hash.to_vec(),
+                            announced_identity.clone(),
+                            callback_app_data.clone(),
+                            callback_packet_hash.clone(),
                             is_path_response,
-                        );
+                        ));
                     }
                 }
 
@@ -2835,9 +2970,7 @@ impl Transport {
                             }
 
                             if let Some(name) = outbound_interface_name.as_ref() {
-                                if let Some(iface) = find_interface_by_name(&mut state.interfaces, name) {
-                                    iface.process_outgoing(&new_raw);
-                                }
+                                deferred_outbound.push((name.clone(), new_raw));
                             }
 
                             if let Some(PathEntryValue::Timestamp(ts)) = state.path_table.get_mut(destination_hash).and_then(|e| e.get_mut(IDX_PT_TIMESTAMP)) {
@@ -2894,7 +3027,7 @@ impl Transport {
                         new_raw[1] = packet.hops;
                     }
                     if let Some(iface) = state.interfaces.iter().find(|i| &i.name == name) {
-                        iface.process_outgoing(&new_raw);
+                        deferred_outbound.push((iface.name.clone(), new_raw));
                     }
                     if let Some(entry) = state.link_table.get_mut(destination_hash) {
                         if let Some(LinkEntryValue::Timestamp(ts)) = entry.get_mut(IDX_LT_TIMESTAMP) {
@@ -2917,13 +3050,16 @@ impl Transport {
 
         if packet.packet_type == DATA {
             if packet.destination_type == Some(crate::destination::DestinationType::Link) {
+                let mut handled = crate::link::dispatch_runtime_packet(&packet);
                 if let Some(destination_hash) = &packet.destination_hash {
                     for link in &mut state.active_links {
                         if &link.link_id == destination_hash {
                             let _ = link.receive(&packet);
+                            handled = true;
                         }
                     }
                 }
+                let _ = handled;
             } else {
                 if let Some(destination_hash) = &packet.destination_hash {
                     for dest in &mut state.destinations {
@@ -2936,14 +3072,23 @@ impl Transport {
         }
 
         if packet.packet_type == PROOF {
-            if packet.context == crate::packet::LRPROOF {
+            if packet.destination_type == Some(crate::destination::DestinationType::Link) {
+                let mut handled = crate::link::dispatch_runtime_packet(&packet);
                 if let Some(destination_hash) = &packet.destination_hash {
                     for link in &mut state.pending_links {
                         if &link.link_id == destination_hash {
                             let _ = link.receive(&packet);
+                            handled = true;
+                        }
+                    }
+                    for link in &mut state.active_links {
+                        if &link.link_id == destination_hash {
+                            let _ = link.receive(&packet);
+                            handled = true;
                         }
                     }
                 }
+                let _ = handled;
             } else {
                 if let Some(destination_hash) = &packet.destination_hash {
                     if let Some(entry) = state.reverse_table.remove(destination_hash) {
@@ -2962,7 +3107,7 @@ impl Transport {
                                     new_raw[1] = packet.hops;
                                 }
                                 if let Some(iface) = find_interface_by_name(&mut state.interfaces, name) {
-                                    iface.process_outgoing(&new_raw);
+                                    deferred_outbound.push((iface.name.clone(), new_raw));
                                 }
                             }
                         } else if let Some(name) = outb.as_ref() {
@@ -3002,6 +3147,32 @@ impl Transport {
                     }
                 }
             }
+        }
+
+        drop(state);
+        for (iface_name, raw) in deferred_outbound {
+            let _ = Transport::dispatch_outbound(&iface_name, &raw);
+        }
+
+        if let Some((handler, destination_hash, announced_identity, app_data)) = interface_announce_callback {
+            handler.received_announce(&destination_hash, &announced_identity, &app_data);
+        }
+
+        for (callback, destination_hash, announced_identity, app_data, packet_hash, is_path_response) in deferred_announce_callbacks {
+            thread::spawn(move || {
+                callback(
+                    &destination_hash,
+                    &announced_identity,
+                    &app_data,
+                    packet_hash,
+                    is_path_response,
+                );
+            });
+        }
+
+        let held_ms = inbound_lock_started.elapsed().as_millis();
+        if held_ms > 500 {
+            eprintln!("[DEBUG] Transport::inbound held TRANSPORT mutex for {} ms", held_ms);
         }
 
         true
@@ -3062,9 +3233,8 @@ impl Transport {
         }
 
         if packet.context == crate::packet::KEEPALIVE
-            || packet.context == crate::packet::RESOURCE_REQ
-            || packet.context == crate::packet::RESOURCE_PRF
-            || packet.context == crate::packet::RESOURCE
+            || (packet.context >= crate::packet::RESOURCE
+                && packet.context <= crate::packet::RESOURCE_RCL)
             || packet.context == crate::packet::CACHE_REQUEST
             || packet.context == crate::packet::CHANNEL
         {

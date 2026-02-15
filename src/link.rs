@@ -1,15 +1,111 @@
-use crate::{identity, reticulum, destination::Destination, resource::Resource};
+use crate::{identity, reticulum, destination::{Destination, DestinationType}, resource::Resource};
 use crate::packet::{self, Packet, DATA, PROOF, LINKIDENTIFY};
 use crate::identity::{Identity, Token};
+use once_cell::sync::Lazy;
+use rand::RngCore;
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::Weak;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::thread;
 use x25519_dalek::{StaticSecret as X25519PrivateKey, PublicKey as X25519PublicKey};
 use ed25519_dalek::{PublicKey as Ed25519PublicKey, Signature, Signer, Verifier};
 use hkdf::Hkdf;
 use sha2::Sha256;
+
+static RUNTIME_LINKS: Lazy<Mutex<HashMap<Vec<u8>, Weak<Mutex<Link>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+pub fn register_runtime_link(link: Arc<Mutex<Link>>) {
+    if let Ok(link_guard) = link.lock() {
+        if let Ok(mut links) = RUNTIME_LINKS.lock() {
+            links.insert(link_guard.link_id.clone(), Arc::downgrade(&link));
+        }
+    }
+}
+
+pub fn unregister_runtime_link(link_id: &[u8]) {
+    if let Ok(mut links) = RUNTIME_LINKS.lock() {
+        links.remove(link_id);
+    }
+}
+
+pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
+    let destination_hash = match packet.destination_hash.as_ref() {
+        Some(hash) => hash.clone(),
+        None => return false,
+    };
+    eprintln!("[LINK-RUNTIME] dispatch packet type={} ctx={} dst={}", packet.packet_type, packet.context, crate::hexrep(&destination_hash, false));
+
+    let link = {
+        let mut links = match RUNTIME_LINKS.lock() {
+            Ok(links) => links,
+            Err(_) => return false,
+        };
+
+        match links.get(&destination_hash).and_then(|w| w.upgrade()) {
+            Some(link) => link,
+            None => {
+                eprintln!("[LINK-RUNTIME] no runtime link for {}", crate::hexrep(&destination_hash, false));
+                links.remove(&destination_hash);
+                return false;
+            }
+        }
+    };
+
+    let handled = if let Ok(mut link_guard) = link.lock() {
+        eprintln!("[LINK-RUNTIME] delivering to link {}", crate::hexrep(&link_guard.link_id, false));
+        link_guard.receive(packet).is_ok()
+    } else {
+        false
+    };
+
+    handled
+}
+
+pub fn runtime_encrypt_for_destination(destination_hash: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let link = {
+        let mut links = RUNTIME_LINKS
+            .lock()
+            .map_err(|_| "Runtime link registry lock poisoned".to_string())?;
+
+        match links.get(destination_hash).and_then(|w| w.upgrade()) {
+            Some(link) => link,
+            None => {
+                links.remove(destination_hash);
+                return Err("No runtime link found for destination".to_string());
+            }
+        }
+    };
+
+    let link_guard = link
+        .lock()
+        .map_err(|_| "Runtime link lock poisoned".to_string())?;
+    link_guard.encrypt(plaintext)
+}
+
+pub fn runtime_decrypt_for_destination(destination_hash: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    let link = {
+        let mut links = RUNTIME_LINKS
+            .lock()
+            .map_err(|_| "Runtime link registry lock poisoned".to_string())?;
+
+        match links.get(destination_hash).and_then(|w| w.upgrade()) {
+            Some(link) => link,
+            None => {
+                links.remove(destination_hash);
+                return Err("No runtime link found for destination".to_string());
+            }
+        }
+    };
+
+    let link_guard = link
+        .lock()
+        .map_err(|_| "Runtime link lock poisoned".to_string())?;
+    link_guard.decrypt(ciphertext)
+}
 
 // Link state constants
 pub const STATE_PENDING: u8 = 0x00;
@@ -75,7 +171,7 @@ pub fn signalling_bytes(mtu: usize, mode: u8) -> Result<[u8; 3], String> {
     if mode != MODE_AES256_CBC && mode != MODE_AES128_CBC {
         return Err(format!("Requested link mode {} not enabled", mode));
     }
-    let signalling_value = (mtu as u32 & MTU_BYTEMASK) + (((mode as u32) << 5) & MODE_BYTEMASK) << 16;
+    let signalling_value = (mtu as u32 & MTU_BYTEMASK) + ((((mode as u32) << 5) & MODE_BYTEMASK) << 16);
     let bytes = signalling_value.to_be_bytes();
     Ok([bytes[1], bytes[2], bytes[3]])
 }
@@ -394,6 +490,61 @@ impl Clone for Link {
 }
 
 impl Link {
+    fn set_link_id_from_packet(&mut self, packet: &Packet) {
+        self.link_id = link_id_from_lr_packet(packet);
+    }
+
+    pub fn initiate(&mut self) -> Result<(), String> {
+        if !self.initiator {
+            return Err("Cannot initiate inbound link".to_string());
+        }
+
+        let mut x25519_private = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut x25519_private);
+        let x25519_public = X25519PublicKey::from(&X25519PrivateKey::from(x25519_private));
+
+        let signing_identity = Identity::new(true);
+        let signing_private = signing_identity.get_private_key()?;
+        let signing_public = signing_identity.get_public_key()?;
+        if signing_private.len() != 64 || signing_public.len() != 64 {
+            return Err("Invalid generated key sizes for link initiation".to_string());
+        }
+
+        self.prv_bytes = Some(x25519_private.to_vec());
+        self.pub_bytes = Some(x25519_public.as_bytes().to_vec());
+        self.sig_prv_bytes = Some(signing_private[32..64].to_vec());
+        self.sig_pub_bytes = Some(signing_public[32..64].to_vec());
+
+        let mut request_data = self.pub_bytes.clone().ok_or("Missing link public key")?;
+        request_data.extend_from_slice(&self.sig_pub_bytes.clone().ok_or("Missing link signing public key")?);
+        request_data.extend_from_slice(&signalling_bytes(reticulum::MTU, self.mode)?);
+
+        let destination = self.destination.lock().map_err(|_| "Destination lock poisoned")?.clone();
+        let mut packet = Packet::new(
+            Some(destination),
+            request_data,
+            packet::LINKREQUEST,
+            packet::NONE,
+            crate::transport::BROADCAST,
+            packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        );
+
+        packet.pack()?;
+        self.establishment_cost += packet.raw.len();
+        self.set_link_id_from_packet(&packet);
+        self.request_time = current_time();
+
+        crate::transport::Transport::register_link(self.clone());
+        packet.send()?;
+        self.had_outbound(false);
+
+        Ok(())
+    }
+
     /// Create a new outbound link to a destination
     pub fn new_outbound(destination: Destination, mode: u8) -> Result<Self, String> {
         let link_id = (0..16).map(|i| ((i * 7) % 256) as u8).collect::<Vec<_>>();
@@ -1008,6 +1159,7 @@ impl Link {
             // Send teardown packet
         }
         self.state = STATE_CLOSED;
+        unregister_runtime_link(&self.link_id);
         self.link_closed();
     }
     
@@ -1050,7 +1202,10 @@ impl Link {
                     self.handle_data_packet(packet)?;
                 }
                 PROOF => {
-                    self.handle_proof_packet(packet)?;
+                    if let Err(err) = self.handle_proof_packet(packet) {
+						eprintln!("[LINK] proof handling error: {}", err);
+						return Err(err);
+					}
                 }
                 _ => {}
             }
@@ -1063,6 +1218,11 @@ impl Link {
     /// Handle DATA packets
     fn handle_data_packet(&mut self, packet: &Packet) -> Result<(), String> {
         let plaintext = self.decrypt(&packet.data)?;
+
+        if packet.context == crate::packet::LRRTT {
+            self.handle_lrrtt_packet(&plaintext)?;
+            return Ok(());
+        }
 
         if packet.context == crate::packet::REQUEST {
             self.handle_request_packet(&plaintext)?;
@@ -1079,10 +1239,132 @@ impl Link {
             return Ok(());
         }
 
+        if packet.context == crate::packet::RESOURCE_REQ {
+            let hash_len = identity::HASHLENGTH / 8;
+            if plaintext.len() >= 1 + hash_len {
+                let offset = if plaintext[0] == crate::resource::Resource::HASHMAP_IS_EXHAUSTED {
+                    1 + crate::resource::Resource::MAPHASH_LEN
+                } else {
+                    1
+                };
+                if plaintext.len() >= offset + hash_len {
+                    let resource_hash = &plaintext[offset..offset + hash_len];
+                    let mut targets: Vec<Arc<Mutex<Resource>>> = Vec::new();
+                    if let Ok(mut resources) = self.outgoing_resources.lock() {
+                        for resource in resources.iter_mut() {
+                            if let Ok(mut resource_guard) = resource.lock() {
+                                if resource_guard.hash == resource_hash {
+                                    if let Some(packet_hash) = packet.packet_hash.as_ref() {
+                                        resource_guard.req_hashlist.push(packet_hash.clone());
+                                    }
+                                    targets.push(resource.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    for target in targets {
+                        let request_data = plaintext.clone();
+                        thread::spawn(move || {
+                            if let Ok(mut resource_guard) = target.lock() {
+                                resource_guard.request(&request_data);
+                            }
+                        });
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if packet.context == crate::packet::RESOURCE_HMU {
+            let hash_len = identity::HASHLENGTH / 8;
+            if plaintext.len() >= hash_len {
+                let resource_hash = &plaintext[..hash_len];
+                if let Ok(mut resources) = self.incoming_resources.lock() {
+                    for resource in resources.iter_mut() {
+                        if let Ok(mut resource_guard) = resource.lock() {
+                            if resource_guard.hash == resource_hash {
+                                resource_guard.hashmap_update_packet(&plaintext);
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if packet.context == crate::packet::RESOURCE_ICL {
+            let hash_len = identity::HASHLENGTH / 8;
+            if plaintext.len() >= hash_len {
+                let resource_hash = &plaintext[..hash_len];
+                if let Ok(mut resources) = self.incoming_resources.lock() {
+                    for resource in resources.iter_mut() {
+                        if let Ok(mut resource_guard) = resource.lock() {
+                            if resource_guard.hash == resource_hash {
+                                resource_guard.cancel();
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if packet.context == crate::packet::RESOURCE_RCL {
+            let hash_len = identity::HASHLENGTH / 8;
+            if plaintext.len() >= hash_len {
+                let resource_hash = &plaintext[..hash_len];
+                if let Ok(mut resources) = self.outgoing_resources.lock() {
+                    for resource in resources.iter_mut() {
+                        if let Ok(mut resource_guard) = resource.lock() {
+                            if resource_guard.hash == resource_hash {
+                                resource_guard.rejected();
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if packet.context == crate::packet::RESOURCE {
+            if let Ok(mut resources) = self.incoming_resources.lock() {
+                for resource in resources.iter_mut() {
+                    if let Ok(mut resource_guard) = resource.lock() {
+                        resource_guard.receive_part(packet);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         if let Some(callback) = &self.callbacks.packet {
             callback(&plaintext, packet);
         }
         
+        Ok(())
+    }
+
+    fn handle_lrrtt_packet(&mut self, plaintext: &[u8]) -> Result<(), String> {
+        if self.initiator {
+            return Ok(());
+        }
+
+        let measured_rtt = self
+            .request_time
+            .and_then(|requested| current_time().map(|now| (now.saturating_sub(requested)) as f64))
+            .unwrap_or(0.0);
+
+        let peer_rtt: f64 = from_slice(plaintext).map_err(|e| format!("Invalid LRRTT payload: {}", e))?;
+        self.rtt = Some(measured_rtt.max(peer_rtt));
+        self.status = STATE_ACTIVE;
+        self.state = STATE_ACTIVE;
+        self.activated_at = current_time();
+
+        if let Some(callback) = &self.callbacks.link_established {
+            callback(Arc::new(Mutex::new(self.clone())));
+        }
+
         Ok(())
     }
 
@@ -1308,8 +1590,139 @@ impl Link {
     }
     
     /// Handle PROOF packets
-    fn handle_proof_packet(&mut self, _packet: &Packet) -> Result<(), String> {
-        // Validate proof based on context
+    fn handle_proof_packet(&mut self, packet: &Packet) -> Result<(), String> {
+        if packet.context == crate::packet::RESOURCE_PRF {
+            let hash_len = identity::HASHLENGTH / 8;
+            eprintln!("[LINK] RESOURCE_PRF received data_len={}", packet.data.len());
+            if packet.data.len() >= hash_len {
+                let resource_hash = &packet.data[..hash_len];
+                let mut targets: Vec<Arc<Mutex<Resource>>> = Vec::new();
+                if let Ok(mut resources) = self.outgoing_resources.lock() {
+                    for resource in resources.iter_mut() {
+                        if let Ok(mut resource_guard) = resource.lock() {
+                            if resource_guard.hash == resource_hash {
+                                targets.push(resource.clone());
+                            }
+                        }
+                    }
+                }
+
+                let proof_data = packet.data.clone();
+                let matched = targets.len();
+                for target in targets {
+                    let proof = proof_data.clone();
+                    thread::spawn(move || {
+                        if let Ok(mut resource_guard) = target.lock() {
+                            resource_guard.validate_proof(&proof);
+                        }
+                    });
+                }
+                eprintln!("[LINK] RESOURCE_PRF matched_outgoing_resources={}", matched);
+            }
+            return Ok(());
+        }
+
+        eprintln!("[LINK] handle_proof_packet state={} initiator={} data_len={}", self.state, self.initiator, packet.data.len());
+        if !self.initiator || self.state != STATE_PENDING {
+            return Ok(());
+        }
+
+        let data = &packet.data;
+        if data.len() != (identity::SIGLENGTH / 8 + ECPUBSIZE / 2)
+            && data.len() != (identity::SIGLENGTH / 8 + ECPUBSIZE / 2 + LINK_MTU_SIZE)
+        {
+            return Err("Invalid link proof packet length".to_string());
+        }
+
+        let mode = mode_from_lp_packet(data);
+        if mode != self.mode {
+            eprintln!("[LINK] proof mode mismatch local={} remote={}", self.mode, mode);
+            return Err("Invalid link mode in proof packet".to_string());
+        }
+
+        let signature = data[..identity::SIGLENGTH / 8].to_vec();
+        let peer_pub_bytes = data[identity::SIGLENGTH / 8..identity::SIGLENGTH / 8 + ECPUBSIZE / 2].to_vec();
+
+        let (peer_sig_pub_bytes, destination_identity) = {
+            let destination = self.destination.lock().map_err(|_| "Destination lock poisoned")?;
+            let identity = destination.identity.clone().ok_or("Missing destination identity on link")?;
+            let public_key = identity.get_public_key()?;
+            if public_key.len() != 64 {
+                return Err("Invalid destination public key length".to_string());
+            }
+            (public_key[32..64].to_vec(), identity)
+        };
+
+        self.load_peer(peer_pub_bytes.clone(), peer_sig_pub_bytes.clone())?;
+        self.handshake()?;
+
+        let mut signed_data = self.link_id.clone();
+        signed_data.extend_from_slice(&peer_pub_bytes);
+        signed_data.extend_from_slice(&peer_sig_pub_bytes);
+        if data.len() == (identity::SIGLENGTH / 8 + ECPUBSIZE / 2 + LINK_MTU_SIZE) {
+            signed_data.extend_from_slice(&signalling_bytes(mtu_from_lp_packet(data).unwrap_or(reticulum::MTU), mode)?);
+        }
+
+        if !destination_identity.validate(&signature, &signed_data) {
+            eprintln!("[LINK] proof signature validation failed");
+            return Err("Invalid link proof signature".to_string());
+        }
+
+        let now = current_time().unwrap_or(0);
+        if let Some(request_time) = self.request_time {
+            self.rtt = Some((now.saturating_sub(request_time)) as f64);
+        }
+        self.state = STATE_ACTIVE;
+        self.status = STATE_ACTIVE;
+        self.activated_at = Some(now);
+        self.last_proof = now;
+        self.last_inbound = now;
+        self.last_outbound = now;
+        if let Some(mtu) = mtu_from_lp_packet(data) {
+            self.mtu = mtu;
+            self.update_mdu();
+        }
+
+        eprintln!("[LINK] proof accepted, link activated {}", crate::hexrep(&self.link_id, false));
+
+        if let Some(callback) = &self.callbacks.link_established {
+            let callback = Arc::clone(callback);
+            let link_clone = Arc::new(Mutex::new(self.clone()));
+            thread::spawn(move || {
+                callback(link_clone);
+            });
+        }
+
+        if let Some(rtt) = self.rtt {
+            let rtt_data = to_vec_named(&rtt).map_err(|e| format!("Failed to encode LRRTT payload: {}", e))?;
+
+            let mut link_destination = self
+                .destination
+                .lock()
+                .map_err(|_| "Destination lock poisoned")?
+                .clone();
+            link_destination.dest_type = DestinationType::Link;
+            link_destination.hash = self.link_id.clone();
+            link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
+
+            thread::spawn(move || {
+                let mut rtt_packet = Packet::new(
+                    Some(link_destination),
+                    rtt_data,
+                    DATA,
+                    packet::LRRTT,
+                    crate::transport::BROADCAST,
+                    packet::HEADER_1,
+                    None,
+                    None,
+                    false,
+                    0,
+                );
+                let _ = rtt_packet.send();
+            });
+            self.had_outbound(false);
+        }
+
         Ok(())
     }
     
@@ -1340,10 +1753,15 @@ impl Link {
         let mut proof_data = public_key.clone();
         proof_data.extend_from_slice(&signature);
 
-        // Get destination (clone the Arc reference)
-        let dest = self.destination.lock()
+        // Send identify over the active link destination semantics
+        let mut dest = self
+            .destination
+            .lock()
             .map_err(|_| "Failed to lock destination".to_string())?
             .clone();
+        dest.dest_type = crate::destination::DestinationType::Link;
+        dest.hash = self.link_id.clone();
+        dest.hexhash = crate::hexrep(&dest.hash, false);
 
         // Create packet with LINKIDENTIFY context
         let packet = Packet::new(

@@ -214,7 +214,9 @@ impl Packet {
             {
                 Ok(self.data.clone())
             } else {
+                eprintln!("[DEBUG] Packet::pack encrypt begin, ctx={}, ptype={}", self.context, self.packet_type);
                 let encrypted = destination.encrypt(&self.data)?;
+                eprintln!("[DEBUG] Packet::pack encrypt returned ({} bytes)", encrypted.len());
                 if destination.latest_ratchet_id.is_some() {
                     self.ratchet_id = destination.latest_ratchet_id.clone();
                 }
@@ -308,12 +310,7 @@ impl Packet {
         if Transport::outbound(self) {
             self.sent = true;
             self.sent_at = Some(now_seconds());
-            if self.should_generate_receipt() {
-                let receipt = PacketReceipt::new(self);
-                self.receipt = Some(receipt.clone());
-                return Ok(Some(receipt));
-            }
-            Ok(None)
+            Ok(self.receipt.clone())
         } else {
             self.sent = false;
             self.receipt = None;
@@ -528,6 +525,13 @@ impl PacketReceipt {
             reticulum::DEFAULT_PER_HOP_TIMEOUT
                 + TIMEOUT_PER_HOP * Transport::hops_to(packet.destination_hash.as_ref().unwrap_or(&vec![])) as f64
         };
+        Self::new_with_timeout(packet, timeout)
+    }
+
+    pub fn new_with_timeout(packet: &Packet, timeout: f64) -> Self {
+        let hash = packet.get_hash();
+        let truncated = packet.get_truncated_hash();
+        let destination = packet.destination.clone().unwrap_or_default();
         PacketReceipt {
             hash,
             truncated_hash: truncated,
@@ -549,7 +553,8 @@ impl PacketReceipt {
             let signature = &proof[HASHLENGTH / 8..HASHLENGTH / 8 + SIGLENGTH / 8];
             if proof_hash == self.hash.as_slice() {
                 if let Some(identity) = &self.destination.identity {
-                    if identity.validate(signature, &self.hash) {
+                    let valid = identity.validate(signature, &self.hash);
+                    if valid {
                         self.status = PacketReceipt::DELIVERED;
                         self.proved = true;
                         self.concluded_at = Some(now_seconds());
@@ -566,7 +571,8 @@ impl PacketReceipt {
             false
         } else if proof.len() == Self::IMPL_LENGTH {
             if let Some(identity) = &self.destination.identity {
-                if identity.validate(proof, &self.hash) {
+                let valid = identity.validate(proof, &self.hash);
+                if valid {
                     self.status = PacketReceipt::DELIVERED;
                     self.proved = true;
                     self.concluded_at = Some(now_seconds());

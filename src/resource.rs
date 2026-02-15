@@ -151,6 +151,22 @@ impl Resource {
     pub const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
     pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
 
+    fn packet_destination(&self) -> Option<crate::destination::Destination> {
+        self.link
+            .lock()
+            .ok()
+            .and_then(|link| {
+                let link_id = link.link_id.clone();
+                link.destination.lock().ok().map(|destination| {
+                    let mut link_destination = destination.clone();
+                    link_destination.dest_type = crate::destination::DestinationType::Link;
+                    link_destination.hash = link_id;
+                    link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
+                    link_destination
+                })
+            })
+    }
+
     pub fn reject(advertisement_packet: &Packet) {
         if let Some(plaintext) = &advertisement_packet.plaintext {
             if let Ok(adv) = ResourceAdvertisement::unpack(plaintext) {
@@ -468,7 +484,8 @@ impl Resource {
             self.uncompressed_size = data.len();
             self.total_size = data.len();
 
-            let mut payload = data.clone();
+            let uncompressed_payload = data.clone();
+            let mut payload = uncompressed_payload.clone();
             let should_compress = match self.auto_compress_option {
                 AutoCompressOption::Disabled => false,
                 AutoCompressOption::Enabled => data.len() <= self.auto_compress_limit,
@@ -493,18 +510,24 @@ impl Resource {
             random.truncate(Resource::RANDOM_HASH_SIZE);
             self.random_hash = random.clone();
 
-            let mut data_with_random = random;
-            data_with_random.extend_from_slice(&payload);
+            let mut hash_material = uncompressed_payload.clone();
+            hash_material.extend_from_slice(&self.random_hash);
 
             self.compressed_size = payload.len();
             self.uncompressed_size = data.len();
 
-            let hash = identity::full_hash(&data_with_random);
+            let hash = identity::full_hash(&hash_material);
             self.hash = hash.clone();
-            self.truncated_hash = identity::truncated_hash(&data_with_random);
-            self.expected_proof = identity::full_hash(&[data_with_random.clone(), hash.clone()].concat());
+            self.truncated_hash = identity::truncated_hash(&hash_material);
+
+            let mut proof_material = uncompressed_payload;
+            proof_material.extend_from_slice(&hash);
+            self.expected_proof = identity::full_hash(&proof_material);
 
             self.original_hash = original_hash.unwrap_or_else(|| hash.clone());
+
+            let mut data_with_random = self.random_hash.clone();
+            data_with_random.extend_from_slice(&payload);
             self.data = Some(self.link.lock().unwrap().encrypt(&data_with_random).unwrap_or(data_with_random));
             self.encrypted = true;
 
@@ -546,7 +569,7 @@ impl Resource {
                 }
 
                 let mut part_packet = Packet::new(
-                    None,
+                    self.packet_destination(),
                     part_data.clone(),
                     crate::packet::DATA,
                     RESOURCE,
@@ -610,7 +633,7 @@ impl Resource {
         let adv = ResourceAdvertisement::new_from_resource(self);
         let packed = adv.pack(0).unwrap_or_default();
         let mut packet = Packet::new(
-            None,
+            self.packet_destination(),
             packed,
             crate::packet::DATA,
             RESOURCE_ADV,
@@ -670,7 +693,7 @@ impl Resource {
                                 let adv = ResourceAdvertisement::new_from_resource(self);
                                 let packed = adv.pack(0).unwrap_or_default();
                                 let mut packet = Packet::new(
-                                    None,
+                                    self.packet_destination(),
                                     packed,
                                     crate::packet::DATA,
                                     RESOURCE_ADV,
@@ -749,7 +772,7 @@ impl Resource {
                             let mut expected_data = self.hash.clone();
                             expected_data.extend_from_slice(&self.expected_proof);
                             let mut expected_packet = Packet::new(
-                                None,
+                                self.packet_destination(),
                                 expected_data,
                                 PROOF,
                                 RESOURCE_PRF,
@@ -887,7 +910,7 @@ impl Resource {
                 request_data.extend_from_slice(&requested_hashes);
 
                 let mut request_packet = Packet::new(
-                    None,
+                    self.packet_destination(),
                     request_data,
                     crate::packet::DATA,
                     RESOURCE_REQ,
@@ -985,7 +1008,7 @@ impl Resource {
                 let mut hmu = self.hash.clone();
                 hmu.extend_from_slice(&update);
                 let mut hmu_packet = Packet::new(
-                    None,
+                    self.packet_destination(),
                     hmu,
                     crate::packet::DATA,
                     RESOURCE_HMU,
@@ -1239,7 +1262,7 @@ impl Resource {
             let mut proof_data = self.hash.clone();
             proof_data.extend_from_slice(&proof);
             let mut packet = Packet::new(
-                None,
+                self.packet_destination(),
                 proof_data,
                 PROOF,
                 RESOURCE_PRF,
@@ -1284,7 +1307,16 @@ impl Resource {
                             next.lock().unwrap().advertise();
                         }
                     }
+                } else {
+                    eprintln!(
+                        "[RESOURCE] proof mismatch hash={} expected={} got={}",
+                        crate::hexrep(&self.hash, false),
+                        crate::hexrep(&self.expected_proof, false),
+                        crate::hexrep(&proof_data[identity::HASHLENGTH / 8..], false)
+                    );
                 }
+            } else {
+                eprintln!("[RESOURCE] unexpected proof length={} for hash={}", proof_data.len(), crate::hexrep(&self.hash, false));
             }
         }
     }
@@ -1295,7 +1327,7 @@ impl Resource {
             if self.initiator {
                 if self.link.lock().unwrap().is_active() {
                     let mut packet = Packet::new(
-                        None,
+                        self.packet_destination(),
                         self.hash.clone(),
                         crate::packet::DATA,
                         RESOURCE_ICL,
@@ -1710,14 +1742,18 @@ pub struct ResourceAdvertisementData {
     pub t: u64,
     pub d: u64,
     pub n: u64,
+	#[serde(with = "serde_bytes")]
     pub h: Vec<u8>,
+	#[serde(with = "serde_bytes")]
     pub r: Vec<u8>,
+	#[serde(with = "serde_bytes")]
     pub o: Vec<u8>,
     pub i: u64,
     pub l: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+	#[serde(default, serialize_with = "serialize_optional_bytes", deserialize_with = "deserialize_optional_bytes")]
     pub q: Option<Vec<u8>>,
     pub f: u8,
+	#[serde(with = "serde_bytes")]
     pub m: Vec<u8>,
     #[serde(skip)]
     pub e: bool,
@@ -1731,6 +1767,24 @@ pub struct ResourceAdvertisementData {
     pub p: bool,
     #[serde(skip)]
     pub x: bool,
+}
+
+fn serialize_optional_bytes<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(bytes) => serializer.serialize_some(&serde_bytes::Bytes::new(bytes)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_optional_bytes<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_bytes::ByteBuf>::deserialize(deserializer)?;
+    Ok(value.map(|bytes| bytes.into_vec()))
 }
 
 impl ResourceAdvertisementData {

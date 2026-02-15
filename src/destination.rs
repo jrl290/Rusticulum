@@ -133,7 +133,7 @@ impl Clone for Destination {
 			name_hash: self.name_hash.clone(),
 			dest_type: self.dest_type,
 			direction: self.direction,
-			identity: None,  // Identity doesn't impl Clone
+			identity: self.identity.clone(),
 			latest_ratchet_id: self.latest_ratchet_id.clone(),
 			link: self.link.clone(),
 			name: self.name.clone(),
@@ -235,7 +235,7 @@ impl Destination {
 	pub fn hash(identity_hash: Option<&[u8]>, app_name: &str, aspects: &[&str]) -> Vec<u8> {
 		let name_for_hash = Self::expand_name(None, app_name, aspects);
 		let name_hash = full_hash(name_for_hash.as_bytes());
-		let name_hash_truncated = &name_hash[..crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+		let name_hash_truncated = &name_hash[..crate::identity::NAME_HASH_LENGTH / 8];
 		
 		let mut addr_hash_material = name_hash_truncated.to_vec();
 		if let Some(identity) = identity_hash {
@@ -311,7 +311,7 @@ impl Destination {
 		// Calculate name_hash
 		let name_without_identity = Self::expand_name(None, &app_name, &aspect_strs);
 		let name_hash_result = full_hash(name_without_identity.as_bytes());
-		let name_hash_length = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+		let name_hash_length = crate::identity::NAME_HASH_LENGTH / 8;
 		let name_hash = name_hash_result[..name_hash_length].to_vec();
 		
 		// Calculate destination hash
@@ -394,7 +394,7 @@ impl Destination {
 		// Calculate name_hash
 		let name_without_identity = Self::expand_name(None, &app_name, &aspect_strs);
 		let name_hash_result = full_hash(name_without_identity.as_bytes());
-		let name_hash_length = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+		let name_hash_length = crate::identity::NAME_HASH_LENGTH / 8;
 		let name_hash = name_hash_result[..name_hash_length].to_vec();
 		
 		// Calculate destination hash
@@ -969,11 +969,7 @@ impl Destination {
 				}
 			}
 			DestinationType::Link => {
-				if let Some(identity) = &self.identity {
-					identity.encrypt(plaintext)
-				} else {
-					Err("No identity for link encryption".to_string())
-				}
+				crate::link::runtime_encrypt_for_destination(&self.hash, plaintext)
 			}
 		}
 	}
@@ -1014,11 +1010,7 @@ impl Destination {
 				}
 			}
 			DestinationType::Link => {
-				if let Some(identity) = self.identity.as_mut() {
-					identity.decrypt(ciphertext)
-				} else {
-					Err("No identity for link decryption".to_string())
-				}
+				crate::link::runtime_decrypt_for_destination(&self.hash, ciphertext)
 			}
 		}
 	}

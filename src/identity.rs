@@ -77,17 +77,12 @@ impl Token {
         let mut iv = [0u8; 16];
         OsRng.fill_bytes(&mut iv);
 
-        // Pad plaintext to multiple of 16
-        let block_size = 16;
-        let pad_len = block_size - (plaintext.len() % block_size);
-        let mut padded = plaintext.to_vec();
-        padded.extend_from_slice(&vec![pad_len as u8; pad_len]);
-
         // Encrypt
         let cipher = Aes256CbcEnc::new_from_slices(&self.encryption_key, &iv)
             .map_err(|e| format!("Failed to create cipher: {}", e))?;
-        let mut buf = padded.clone();
-        let ciphertext = cipher.encrypt_padded_mut::<block_padding::Pkcs7>(&mut buf, padded.len())
+        let mut buf = vec![0u8; plaintext.len() + AES128_BLOCKSIZE];
+        buf[..plaintext.len()].copy_from_slice(plaintext);
+        let ciphertext = cipher.encrypt_padded_mut::<block_padding::Pkcs7>(&mut buf, plaintext.len())
             .map_err(|e| format!("Encryption failed: {}", e))?
             .to_vec();
 
@@ -395,7 +390,9 @@ impl Identity {
     
     /// Encrypt plaintext for this identity
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        eprintln!("[DEBUG] Identity::encrypt begin ({} bytes)", plaintext.len());
         let enc_pub = self.encryption_pub_key.as_ref().ok_or("Identity has no public key")?;
+        let salt = self.hash.as_ref().ok_or("Identity hash not available")?;
         // Generate ephemeral X25519 keypair
         let mut ephemeral_bytes = [0u8; 32];
         rand::thread_rng().fill(&mut ephemeral_bytes);
@@ -404,20 +401,24 @@ impl Identity {
         
         // Perform ECDH
         let shared_secret = ephemeral_prv.diffie_hellman(enc_pub);
+        eprintln!("[DEBUG] Identity::encrypt ecdh done");
         
         // Derive encryption key using HKDF
-        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+        let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), shared_secret.as_bytes());
         let mut derived_key = [0u8; 64];
         hkdf.expand(b"", &mut derived_key)
             .map_err(|_| "HKDF expansion failed".to_string())?;
+        eprintln!("[DEBUG] Identity::encrypt hkdf done");
         
         // Encrypt with Token
         let token = Token::new(&derived_key)?;
         let ciphertext = token.encrypt(plaintext)?;
+        eprintln!("[DEBUG] Identity::encrypt token.encrypt done");
         
         // Return: ephemeral_pub (32) + ciphertext
         let mut result = ephemeral_pub.as_bytes().to_vec();
         result.extend_from_slice(&ciphertext);
+        eprintln!("[DEBUG] Identity::encrypt end ({} bytes)", result.len());
         Ok(result)
     }
 
@@ -452,11 +453,12 @@ impl Identity {
         ephemeral_pub: &X25519PublicKey,
         token_data: &[u8]
     ) -> Result<Vec<u8>, String> {
+        let salt = self.hash.as_ref().ok_or("Identity hash not available")?;
         // Perform ECDH
         let shared_secret = prv_key.diffie_hellman(ephemeral_pub);
         
         // Derive decryption key using HKDF
-        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+        let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), shared_secret.as_bytes());
         let mut derived_key = [0u8; 64];
         hkdf.expand(b"", &mut derived_key)
             .map_err(|_| "HKDF expansion failed".to_string())?;
@@ -472,7 +474,11 @@ impl Identity {
     pub fn sign(&self, data: &[u8]) -> Vec<u8> {
         use ed25519_dalek::Signer;
         let sign_prv = self.signing_prv_key.as_ref().expect("Identity has no private key");
-        let kp_secret = ed25519_dalek::Keypair::from_bytes(&sign_prv.to_bytes())
+        let sign_pub = self.signing_pub_key.as_ref().expect("Identity has no public key");
+        let mut keypair_bytes = [0u8; 64];
+        keypair_bytes[..32].copy_from_slice(sign_prv.as_bytes());
+        keypair_bytes[32..].copy_from_slice(sign_pub.as_bytes());
+        let kp_secret = ed25519_dalek::Keypair::from_bytes(&keypair_bytes)
             .expect("Failed to reconstruct keypair from bytes");
         let signature = kp_secret.sign(data);
         signature.to_bytes().to_vec()

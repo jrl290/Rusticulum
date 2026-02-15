@@ -12,6 +12,7 @@ sha2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 rmp = "=0.8.14"
 rmp-serde = "=1.1.2"
+serde_bytes = "0.11"
 x25519-dalek = { version = "=1.1.1" }
 ed25519-dalek = { version = "=1.0.1", features = ["rand"] }
 hkdf = "=0.12.3"

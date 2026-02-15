@@ -394,6 +394,7 @@ impl TcpClientInterface {
 
     /// Process outgoing data
     pub fn process_outgoing(&mut self, data: Vec<u8>) -> Result<(), String> {
+        eprintln!("[DEBUG] TcpClientInterface::process_outgoing start ({} bytes)", data.len());
         if !self.base.online || self.detached {
             return Err("Interface offline or detached".to_string());
         }
@@ -413,6 +414,7 @@ impl TcpClientInterface {
         };
 
         if let Some(ref mut socket) = self.socket {
+            eprintln!("[DEBUG] TcpClientInterface::process_outgoing writing {} bytes", framed.len());
             socket.write_all(&framed)
                 .map_err(|e| format!("Failed to send data: {}", e))?;
             
@@ -422,6 +424,7 @@ impl TcpClientInterface {
         }
 
         self.writing = false;
+        eprintln!("[DEBUG] TcpClientInterface::process_outgoing end");
         Ok(())
     }
 
@@ -553,8 +556,113 @@ impl TcpClientInterface {
 
     pub fn start_read_loop(interface: Arc<Mutex<TcpClientInterface>>) {
         thread::spawn(move || {
-            let mut iface = interface.lock().unwrap();
-            let _ = iface.read_loop();
+            let (mut socket, interface_name, kiss_framing, hw_mtu) = {
+                let iface = interface.lock().unwrap();
+                let Some(socket_ref) = iface.socket.as_ref() else {
+                    return;
+                };
+
+                let Ok(cloned_socket) = socket_ref.try_clone() else {
+                    return;
+                };
+
+                (
+                    cloned_socket,
+                    iface.base.name.clone(),
+                    iface.kiss_framing,
+                    iface.base.hw_mtu.unwrap_or(Self::HW_MTU),
+                )
+            };
+
+            let mut in_frame = false;
+            let mut escape = false;
+            let mut frame_buffer = Vec::new();
+            let mut data_buffer = Vec::new();
+            let mut command = Kiss::CMD_UNKNOWN;
+            let mut buf = [0u8; 4096];
+
+            loop {
+                match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data_in = &buf[..n];
+
+                        if kiss_framing {
+                            for &byte in data_in {
+                                if in_frame && byte == Kiss::FEND && command == Kiss::CMD_DATA {
+                                    in_frame = false;
+                                    if !data_buffer.is_empty() {
+                                        let _ = Transport::inbound(data_buffer.clone(), interface_name.clone());
+                                        data_buffer.clear();
+                                    }
+                                } else if byte == Kiss::FEND {
+                                    in_frame = true;
+                                    command = Kiss::CMD_UNKNOWN;
+                                    data_buffer.clear();
+                                } else if in_frame && data_buffer.len() < hw_mtu {
+                                    if data_buffer.is_empty() && command == Kiss::CMD_UNKNOWN {
+                                        command = byte & 0x0F;
+                                    } else if command == Kiss::CMD_DATA {
+                                        if byte == Kiss::FESC {
+                                            escape = true;
+                                        } else if escape {
+                                            let unescaped = match byte {
+                                                b if b == Kiss::TFEND => Kiss::FEND,
+                                                b if b == Kiss::TFESC => Kiss::FESC,
+                                                b => b,
+                                            };
+                                            data_buffer.push(unescaped);
+                                            escape = false;
+                                        } else {
+                                            data_buffer.push(byte);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            frame_buffer.extend_from_slice(data_in);
+
+                            loop {
+                                if let Some(frame_start) = frame_buffer.iter().position(|&b| b == Hdlc::FLAG) {
+                                    if let Some(frame_end_offset) = frame_buffer[frame_start + 1..].iter().position(|&b| b == Hdlc::FLAG) {
+                                        let frame_end = frame_start + 1 + frame_end_offset;
+                                        let frame = &frame_buffer[frame_start + 1..frame_end];
+
+                                        let mut unescaped = Vec::new();
+                                        let mut esc = false;
+                                        for &byte in frame {
+                                            if esc {
+                                                if byte == (Hdlc::FLAG ^ Hdlc::ESC_MASK) {
+                                                    unescaped.push(Hdlc::FLAG);
+                                                } else if byte == (Hdlc::ESC ^ Hdlc::ESC_MASK) {
+                                                    unescaped.push(Hdlc::ESC);
+                                                }
+                                                esc = false;
+                                            } else if byte == Hdlc::ESC {
+                                                esc = true;
+                                            } else {
+                                                unescaped.push(byte);
+                                            }
+                                        }
+
+                                        const HEADER_MINSIZE: usize = 2;
+                                        if unescaped.len() > HEADER_MINSIZE {
+                                            let _ = Transport::inbound(unescaped, interface_name.clone());
+                                        }
+
+                                        frame_buffer.drain(..=frame_end);
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         });
     }
 
