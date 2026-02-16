@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
 
@@ -1419,9 +1419,10 @@ impl Transport {
     }
 
     pub fn jobloop() {
+        let job_interval = TRANSPORT.lock().unwrap().job_interval;
         loop {
             Transport::jobs();
-            thread::sleep(Duration::from_secs_f64(TRANSPORT.lock().unwrap().job_interval));
+            thread::sleep(Duration::from_secs_f64(job_interval));
         }
     }
 
@@ -1911,7 +1912,17 @@ impl Transport {
         state.interfaces.sort_by(|a, b| b.bitrate.partial_cmp(&a.bitrate).unwrap_or(std::cmp::Ordering::Equal));
     }
     pub fn outbound(packet: &mut Packet) -> bool {
+        let outbound_lock_wait_started = Instant::now();
         let mut state = TRANSPORT.lock().unwrap();
+        let initial_wait_ms = outbound_lock_wait_started.elapsed().as_millis();
+        if initial_wait_ms > 250 {
+            eprintln!(
+                "[TRANSPORT] outbound lock wait={}ms ptype={} ctx={}",
+                initial_wait_ms,
+                packet.packet_type,
+                packet.context
+            );
+        }
         let mut wait_loops: u64 = 0;
         while state.jobs_running {
             drop(state);
@@ -1926,6 +1937,7 @@ impl Transport {
             eprintln!("[DEBUG] Transport::outbound acquired lock after {} ms", wait_loops);
         }
         state.jobs_locked = true;
+        let outbound_lock_held_started = Instant::now();
         let mut sent = false;
         let mut transmissions: Vec<(String, Vec<u8>)> = Vec::new();
         let outbound_time = now();
@@ -2085,6 +2097,16 @@ impl Transport {
         }
 
         eprintln!("[DEBUG] Transport::outbound prepared {} transmissions", transmissions.len());
+        let outbound_held_ms = outbound_lock_held_started.elapsed().as_millis();
+        if outbound_held_ms > 500 {
+            eprintln!(
+                "[TRANSPORT] outbound held lock={}ms ptype={} ctx={} tx_count={}",
+                outbound_held_ms,
+                packet.packet_type,
+                packet.context,
+                transmissions.len()
+            );
+        }
         state.jobs_locked = false;
         drop(state);
 
@@ -2413,8 +2435,19 @@ impl Transport {
     }
 
     pub fn has_path(destination_hash: &[u8]) -> bool {
+        let lock_wait_start = Instant::now();
         let state = TRANSPORT.lock().unwrap();
-        state.path_table.contains_key(destination_hash)
+        let waited_ms = lock_wait_start.elapsed().as_millis();
+        let found = state.path_table.contains_key(destination_hash);
+        if waited_ms > 250 {
+            eprintln!(
+                "[TRANSPORT] has_path lock wait={}ms found={} path_table_size={}",
+                waited_ms,
+                found,
+                state.path_table.len()
+            );
+        }
+        found
     }
 
     pub fn add_packet_hash(packet_hash: Vec<u8>) {
@@ -2602,8 +2635,11 @@ impl Transport {
     }
 
     pub fn register_announce_handler(handler: AnnounceHandler) {
+        eprintln!("[TRANSPORT] register_announce_handler waiting lock");
         let mut state = TRANSPORT.lock().unwrap();
+        eprintln!("[TRANSPORT] register_announce_handler lock acquired (existing_handlers={})", state.announce_handlers.len());
         state.announce_handlers.push(handler);
+        eprintln!("[TRANSPORT] register_announce_handler complete (handlers={})", state.announce_handlers.len());
     }
 
     pub fn deregister_announce_handler(aspect_filter: &str) {
@@ -2612,46 +2648,77 @@ impl Transport {
     }
 
     pub fn inbound(raw: Vec<u8>, receiving_interface: Option<String>) -> bool {
-        eprintln!("[INBOUND] Received {} byte packet", raw.len());
         let mut packet = Packet::new(None, Vec::new(), 0, 0, BROADCAST, crate::packet::HEADER_1, None, None, false, 0);
         packet.raw = raw;
         packet.receiving_interface = receiving_interface;
         if !packet.unpack() {
-            eprintln!("[INBOUND] Packet unpack FAILED");
             return false;
         }
         packet.hops = packet.hops.saturating_add(1);
-        eprintln!("[INBOUND] Packet unpacked, type: {}", packet.packet_type);
-        if !Transport::packet_filter(&packet) {
-            eprintln!("[INBOUND] Packet FILTERED OUT");
+
+        // Inline packet_filter + control destination check in a single lock acquisition
+        let (filter_pass, control_aspects) = {
+            let state = TRANSPORT.lock().unwrap();
+
+            // --- packet_filter logic (inlined to avoid separate lock) ---
+            let filter_ok = if state.is_connected_to_shared_instance {
+                true
+            } else if packet.transport_id.is_some() && packet.packet_type != ANNOUNCE {
+                if let Some(identity) = &state.identity {
+                    identity.hash.as_ref().map(|hash| packet.transport_id.as_ref() == Some(hash)).unwrap_or(false)
+                } else {
+                    false
+                }
+            } else if packet.context == crate::packet::KEEPALIVE
+                || (packet.context >= crate::packet::RESOURCE && packet.context <= crate::packet::RESOURCE_RCL)
+                || packet.context == crate::packet::CACHE_REQUEST
+                || packet.context == crate::packet::CHANNEL
+            {
+                true
+            } else if packet.destination_type == Some(crate::destination::DestinationType::Plain) && packet.packet_type != ANNOUNCE {
+                packet.hops <= 1
+            } else if packet.destination_type == Some(crate::destination::DestinationType::Group) && packet.packet_type != ANNOUNCE {
+                packet.hops <= 1
+            } else if let Some(hash) = &packet.packet_hash {
+                !state.packet_hashlist.contains(hash) && !state.packet_hashlist_prev.contains(hash)
+            } else if packet.packet_type == ANNOUNCE {
+                packet.destination_type != Some(crate::destination::DestinationType::Link)
+            } else {
+                false
+            };
+
+            if !filter_ok {
+                (false, None)
+            } else {
+                // --- control destination check (done while we already hold the lock) ---
+                let ctrl = packet.destination_hash.as_ref().and_then(|dh| {
+                    if state.control_hashes.contains(dh) {
+                        for control_dest in &state.control_destinations {
+                            if &control_dest.hash == dh && control_dest.app_name == APP_NAME {
+                                return Some(control_dest.aspects.clone());
+                            }
+                        }
+                        Some(Vec::new()) // in control_hashes but no matching dest
+                    } else {
+                        None
+                    }
+                });
+                (true, ctrl)
+            }
+        };
+
+        if !filter_pass {
             return false;
         }
-        eprintln!("[INBOUND] Packet passed filter");
 
-        // Check if this packet is destined for a control destination
-        if let Some(destination_hash) = &packet.destination_hash {
-            let state = TRANSPORT.lock().unwrap();
-            if state.control_hashes.contains(destination_hash) {
-                // Find the matching control destination
-                let mut matched_aspects: Option<Vec<String>> = None;
-                for control_dest in &state.control_destinations {
-                    if &control_dest.hash == destination_hash && control_dest.app_name == APP_NAME {
-                        matched_aspects = Some(control_dest.aspects.clone());
-                        break;
-                    }
-                }
-                drop(state);
-                
-                // Route to the control destination handler
-                if let Some(aspects) = matched_aspects {
-                    match aspects.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
-                        ["path", "request"] => Transport::path_request_handler(&packet.data, &packet),
-                        ["tunnel", "synthesize"] => Transport::tunnel_synthesize_handler(&packet.data, &packet),
-                        _ => {}
-                    }
-                }
-                return true;
+        // Handle control destination routing (lock already released)
+        if let Some(aspects) = control_aspects {
+            match aspects.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
+                ["path", "request"] => Transport::path_request_handler(&packet.data, &packet),
+                ["tunnel", "synthesize"] => Transport::tunnel_synthesize_handler(&packet.data, &packet),
+                _ => {}
             }
+            return true;
         }
 
         if packet.context == CACHE_REQUEST {
@@ -2737,17 +2804,31 @@ impl Transport {
             None
         };
 
-        let inbound_lock_started = std::time::Instant::now();
+        let inbound_lock_wait_started = Instant::now();
         let mut state = TRANSPORT.lock().unwrap();
+        let inbound_wait_ms = inbound_lock_wait_started.elapsed().as_millis();
+        if inbound_wait_ms > 250 {
+            eprintln!(
+                "[TRANSPORT] inbound lock wait={}ms ptype={} ctx={}",
+                inbound_wait_ms,
+                packet.packet_type,
+                packet.context
+            );
+        }
+        let inbound_lock_started = Instant::now();
         let mut deferred_outbound: Vec<(String, Vec<u8>)> = Vec::new();
         let mut deferred_announce_callbacks: Vec<(AnnounceCallback, Vec<u8>, Identity, Vec<u8>, Option<Vec<u8>>, bool)> = Vec::new();
         let mut deferred_destination_receives: Vec<(Destination, Packet)> = Vec::new();
+        let mut deferred_link_packets: Vec<Packet> = Vec::new();
 
         let mut remember_packet_hash = true;
         if let Some(destination_hash) = &packet.destination_hash {
             if state.link_table.contains_key(destination_hash) {
                 remember_packet_hash = false;
             }
+        }
+        if packet.destination_type == Some(crate::destination::DestinationType::Link) {
+            remember_packet_hash = false;
         }
         if packet.packet_type == PROOF && packet.context == crate::packet::LRPROOF {
             remember_packet_hash = false;
@@ -3073,16 +3154,7 @@ impl Transport {
 
         if packet.packet_type == DATA {
             if packet.destination_type == Some(crate::destination::DestinationType::Link) {
-                let mut handled = crate::link::dispatch_runtime_packet(&packet);
-                if let Some(destination_hash) = &packet.destination_hash {
-                    for link in &mut state.active_links {
-                        if &link.link_id == destination_hash {
-                            let _ = link.receive(&packet);
-                            handled = true;
-                        }
-                    }
-                }
-                let _ = handled;
+                deferred_link_packets.push(packet.clone());
             } else {
                 if let Some(destination_hash) = &packet.destination_hash {
                     for dest in &mut state.destinations {
@@ -3095,31 +3167,10 @@ impl Transport {
         }
 
         if packet.packet_type == PROOF {
-            if packet.destination_type == Some(crate::destination::DestinationType::Link) {
-                let mut handled = crate::link::dispatch_runtime_packet(&packet);
-                if let Some(destination_hash) = &packet.destination_hash {
-                    for link in &mut state.pending_links {
-                        if &link.link_id == destination_hash {
-                            let _ = link.receive(&packet);
-                            handled = true;
-                        }
-                    }
-                    for link in &mut state.active_links {
-                        if &link.link_id == destination_hash {
-                            let _ = link.receive(&packet);
-                            handled = true;
-                        }
-                    }
-
-                    if handled {
-                        for receipt in &mut state.receipts {
-                            if crate::link::validate_runtime_proof_for_receipt(destination_hash, &packet.data, receipt) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                let _ = handled;
+            if packet.context == crate::packet::LRPROOF
+                || packet.destination_type == Some(crate::destination::DestinationType::Link)
+            {
+                deferred_link_packets.push(packet.clone());
             } else {
                 if let Some(destination_hash) = &packet.destination_hash {
                     if let Some(entry) = state.reverse_table.remove(destination_hash) {
@@ -3161,12 +3212,39 @@ impl Transport {
         }
 
         drop(state);
+        let deferred_outbound_count = deferred_outbound.len();
+        let deferred_destination_count = deferred_destination_receives.len();
+        let deferred_link_count = deferred_link_packets.len();
+        let deferred_callback_count = deferred_announce_callbacks.len();
+
         for (iface_name, raw) in deferred_outbound {
             let _ = Transport::dispatch_outbound(&iface_name, &raw);
         }
 
         for (mut destination, destination_packet) in deferred_destination_receives {
             let _ = destination.receive(&destination_packet);
+        }
+
+        for link_packet in deferred_link_packets {
+            let handled = crate::link::dispatch_runtime_packet(&link_packet);
+            if handled
+                && link_packet.packet_type == PROOF
+                && link_packet.destination_type == Some(crate::destination::DestinationType::Link)
+            {
+                if let Some(destination_hash) = link_packet.destination_hash.as_ref() {
+                    if let Ok(mut state) = TRANSPORT.lock() {
+                        for receipt in &mut state.receipts {
+                            if crate::link::validate_runtime_proof_for_receipt(
+                                destination_hash,
+                                &link_packet.data,
+                                receipt,
+                            ) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if let Some((handler, destination_hash, announced_identity, app_data)) = interface_announce_callback {
@@ -3187,7 +3265,16 @@ impl Transport {
 
         let held_ms = inbound_lock_started.elapsed().as_millis();
         if held_ms > 500 {
-            eprintln!("[DEBUG] Transport::inbound held TRANSPORT mutex for {} ms", held_ms);
+            eprintln!(
+                "[TRANSPORT] inbound held lock={}ms ptype={} ctx={} deferred_tx={} deferred_callbacks={} deferred_dest={} deferred_links={}",
+                held_ms,
+                packet.packet_type,
+                packet.context,
+                deferred_outbound_count,
+                deferred_callback_count,
+                deferred_destination_count,
+                deferred_link_count
+            );
         }
 
         true
@@ -3201,15 +3288,16 @@ impl Transport {
         tag: Option<Vec<u8>>,
     ) {
         let request_tag = request_tag.or(tag).unwrap_or_else(|| Identity::get_random_hash());
-        let path_request_data = if let Some(identity) = &TRANSPORT.lock().unwrap().identity {
+        let path_request_data = {
+            let state = TRANSPORT.lock().unwrap();
             let mut data = destination_hash.to_vec();
-            if let Some(hash) = identity.hash.as_ref() {
-                data.extend_from_slice(hash);
+            if state.transport_enabled {
+                if let Some(identity) = &state.identity {
+                    if let Some(hash) = identity.hash.as_ref() {
+                        data.extend_from_slice(hash);
+                    }
+                }
             }
-            data.extend_from_slice(&request_tag);
-            data
-        } else {
-            let mut data = destination_hash.to_vec();
             data.extend_from_slice(&request_tag);
             data
         };
@@ -3374,6 +3462,23 @@ mod tests {
         saved_destinations: Vec<Destination>,
         saved_packet_hashlist: std::collections::HashSet<Vec<u8>>,
         saved_packet_hashlist_prev: std::collections::HashSet<Vec<u8>>,
+        saved_identity: Option<Identity>,
+    }
+
+    struct RuntimeLinkGuard {
+        link_id: Vec<u8>,
+    }
+
+    impl RuntimeLinkGuard {
+        fn new(link_id: Vec<u8>) -> Self {
+            Self { link_id }
+        }
+    }
+
+    impl Drop for RuntimeLinkGuard {
+        fn drop(&mut self) {
+            crate::link::unregister_runtime_link(&self.link_id);
+        }
     }
 
     impl ReceiptStateRestore {
@@ -3383,22 +3488,26 @@ mod tests {
             let saved_destinations = std::mem::take(&mut state.destinations);
             let saved_packet_hashlist = std::mem::take(&mut state.packet_hashlist);
             let saved_packet_hashlist_prev = std::mem::take(&mut state.packet_hashlist_prev);
+            let saved_identity = state.identity.clone();
             Self {
                 saved,
                 saved_destinations,
                 saved_packet_hashlist,
                 saved_packet_hashlist_prev,
+                saved_identity,
             }
         }
     }
 
     impl Drop for ReceiptStateRestore {
         fn drop(&mut self) {
-            let mut state = TRANSPORT.lock().unwrap();
-            state.receipts = std::mem::take(&mut self.saved);
-            state.destinations = std::mem::take(&mut self.saved_destinations);
-            state.packet_hashlist = std::mem::take(&mut self.saved_packet_hashlist);
-            state.packet_hashlist_prev = std::mem::take(&mut self.saved_packet_hashlist_prev);
+            if let Ok(mut state) = TRANSPORT.lock() {
+                state.receipts = std::mem::take(&mut self.saved);
+                state.destinations = std::mem::take(&mut self.saved_destinations);
+                state.packet_hashlist = std::mem::take(&mut self.saved_packet_hashlist);
+                state.packet_hashlist_prev = std::mem::take(&mut self.saved_packet_hashlist_prev);
+                state.identity = self.saved_identity.clone();
+            }
         }
     }
 
@@ -3581,5 +3690,227 @@ mod tests {
             .expect("receipt should exist");
         assert_eq!(updated.status, crate::packet::PacketReceipt::DELIVERED);
         assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn inbound_lrproof_without_runtime_link_does_not_validate_generic_receipt() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let identity = Identity::new(true);
+        let mut receipt = make_receipt(0x44, crate::packet::PacketReceipt::SENT);
+        receipt.destination.identity = Some(identity.clone());
+
+        let callback_hits = Arc::new(AtomicUsize::new(0));
+        let callback_hits_clone = callback_hits.clone();
+        receipt.set_delivery_callback(Arc::new(move |_| {
+            callback_hits_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.receipts.push(receipt.clone());
+        }
+
+        let signature = identity.sign(&receipt.hash);
+        let mut lrproof_data = receipt.hash.clone();
+        lrproof_data.extend_from_slice(&signature);
+
+        let mut lrproof_destination = Destination::new_outbound(
+            None,
+            DestinationType::Plain,
+            "proof".to_string(),
+            vec!["return".to_string()],
+        )
+        .expect("lrproof destination");
+        lrproof_destination.hash = vec![0xE1; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+        lrproof_destination.hexhash = crate::hexrep(&lrproof_destination.hash, false);
+
+        let mut lrproof_packet = Packet::new(
+            Some(lrproof_destination),
+            lrproof_data,
+            PROOF,
+            crate::packet::LRPROOF,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            crate::packet::FLAG_UNSET,
+        );
+        lrproof_packet.pack().expect("pack lrproof packet");
+
+        assert!(Transport::inbound(
+            lrproof_packet.raw.clone(),
+            Some("test-if".to_string())
+        ));
+
+        let state = TRANSPORT.lock().unwrap();
+        let updated = state
+            .receipts
+            .iter()
+            .find(|r| r.hash == receipt.hash)
+            .expect("receipt should exist");
+        assert_eq!(updated.status, crate::packet::PacketReceipt::SENT);
+        assert_eq!(callback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn inbound_link_proof_with_runtime_link_validates_receipt() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let proving_identity = Identity::new(true);
+        let mut receipt = make_receipt(0x55, crate::packet::PacketReceipt::SENT);
+
+        let callback_hits = Arc::new(AtomicUsize::new(0));
+        let callback_hits_clone = callback_hits.clone();
+        receipt.set_delivery_callback(Arc::new(move |_| {
+            callback_hits_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.receipts.push(receipt.clone());
+        }
+
+        let runtime_link_id = vec![0xD2; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+        let mut runtime_destination = Destination::new_outbound(
+            None,
+            DestinationType::Plain,
+            "runtime".to_string(),
+            vec!["link".to_string()],
+        )
+        .expect("runtime destination");
+        runtime_destination.hash = runtime_link_id.clone();
+        runtime_destination.hexhash = crate::hexrep(&runtime_destination.hash, false);
+
+        let mut runtime_link = crate::link::Link::new_outbound(runtime_destination, crate::link::MODE_DEFAULT)
+            .expect("runtime link");
+        runtime_link.link_id = runtime_link_id.clone();
+        runtime_link.initiator = false;
+        let proving_public = proving_identity
+            .get_public_key()
+            .expect("proving identity public key");
+        runtime_link
+            .load_peer(vec![0u8; 32], proving_public[32..64].to_vec())
+            .expect("load proving key into runtime link");
+
+        let runtime_link = Arc::new(Mutex::new(runtime_link));
+        let runtime_link_handle = runtime_link.clone();
+        crate::link::register_runtime_link(runtime_link);
+        let _runtime_guard = RuntimeLinkGuard::new(runtime_link_id.clone());
+
+        let signature = proving_identity.sign(&receipt.hash);
+        let mut proof_data = receipt.hash.clone();
+        proof_data.extend_from_slice(&signature);
+
+        let mut proof_destination = Destination::new_outbound(
+            None,
+            DestinationType::Plain,
+            "proof".to_string(),
+            vec!["return".to_string()],
+        )
+        .expect("proof destination");
+        proof_destination.dest_type = DestinationType::Link;
+        proof_destination.hash = runtime_link_id;
+        proof_destination.hexhash = crate::hexrep(&proof_destination.hash, false);
+
+        let mut proof_packet = Packet::new(
+            Some(proof_destination),
+            proof_data,
+            PROOF,
+            crate::packet::NONE,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            crate::packet::FLAG_UNSET,
+        );
+        proof_packet.pack().expect("pack runtime proof packet");
+
+        assert!(Transport::inbound(
+            proof_packet.raw.clone(),
+            Some("test-if".to_string())
+        ));
+
+        let state = TRANSPORT.lock().unwrap();
+        let updated = state
+            .receipts
+            .iter()
+            .find(|r| r.hash == receipt.hash)
+            .expect("receipt should exist");
+        assert_eq!(updated.status, crate::packet::PacketReceipt::DELIVERED);
+        assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
+        drop(runtime_link_handle);
+    }
+
+    #[test]
+    fn packet_filter_rejects_lrproof_for_other_transport_identity() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let local_identity = Identity::new(true);
+        let local_hash = local_identity.hash.clone().expect("local identity hash");
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(local_identity);
+        }
+
+        let mut packet = Packet::new(
+            None,
+            vec![0xAB; 96],
+            PROOF,
+            crate::packet::LRPROOF,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            Some(vec![0xCD; crate::reticulum::TRUNCATED_HASHLENGTH / 8]),
+            None,
+            false,
+            crate::packet::FLAG_UNSET,
+        );
+        packet.destination_type = Some(DestinationType::Link);
+        packet.destination_hash = Some(vec![0x01; crate::reticulum::TRUNCATED_HASHLENGTH / 8]);
+        packet.packet_hash = Some(vec![0x02; crate::identity::HASHLENGTH / 8]);
+
+        assert!(!Transport::packet_filter(&packet));
+
+        packet.transport_id = Some(local_hash);
+        assert!(Transport::packet_filter(&packet));
+    }
+
+    #[test]
+    fn packet_filter_rejects_link_proof_for_other_transport_identity() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let local_identity = Identity::new(true);
+        let local_hash = local_identity.hash.clone().expect("local identity hash");
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(local_identity);
+        }
+
+        let mut packet = Packet::new(
+            None,
+            vec![0xEF; 96],
+            PROOF,
+            crate::packet::NONE,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            Some(vec![0xAA; crate::reticulum::TRUNCATED_HASHLENGTH / 8]),
+            None,
+            false,
+            crate::packet::FLAG_UNSET,
+        );
+        packet.destination_type = Some(DestinationType::Link);
+        packet.destination_hash = Some(vec![0xBB; crate::reticulum::TRUNCATED_HASHLENGTH / 8]);
+        packet.packet_hash = Some(vec![0xCC; crate::identity::HASHLENGTH / 8]);
+
+        assert!(!Transport::packet_filter(&packet));
+
+        packet.transport_id = Some(local_hash);
+        assert!(Transport::packet_filter(&packet));
     }
 }
