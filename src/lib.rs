@@ -164,12 +164,22 @@ pub fn log(msg: impl ToString, level: i32, override_destination: bool, pt: bool)
         return;
     }
 
-    let logstring = if pt {
-        format!("[{}] {} {}", precise_timestamp_str(now_seconds()), loglevelname(level), msg)
-    } else if !state.compact_log_fmt {
-        format!("[{}] {} {}", timestamp_str(now_seconds()), loglevelname(level), msg)
+    let now_dt = Local::now();
+    let timestamp = if pt {
+        let rendered = format_time(now_dt, &state.logtimefmt_p);
+        if rendered.len() >= 3 {
+            rendered[..rendered.len() - 3].to_string()
+        } else {
+            rendered
+        }
     } else {
-        format!("[{}] {}", timestamp_str(now_seconds()), msg)
+        format_time(now_dt, &state.logtimefmt)
+    };
+
+    let logstring = if !state.compact_log_fmt {
+        format!("[{}] {} {}", timestamp, loglevelname(level), msg)
+    } else {
+        format!("[{}] {}", timestamp, msg)
     };
 
     let _lock = LOGGING_LOCK.lock().unwrap();

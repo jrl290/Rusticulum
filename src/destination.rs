@@ -3,6 +3,7 @@ use crate::packet::{Packet, LINKREQUEST, DATA, PATH_RESPONSE as PATHRESPONSE, NO
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex};
 
@@ -685,8 +686,12 @@ impl Destination {
 			
 			// Handle DATA packets
 			if packet.packet_type == DATA {
-				if let Some(callback) = &self.callbacks.packet {
-					callback(&_plaintext, packet);
+				if let Some(callback) = self.callbacks.packet.clone() {
+					let plaintext = _plaintext.clone();
+					let packet_clone = packet.clone();
+					thread::spawn(move || {
+						callback(&plaintext, &packet_clone);
+					});
 				}
 				return Ok(true);
 			}
@@ -735,7 +740,9 @@ impl Destination {
 			false,
 			0,
 		);
-		let _ = response_packet.send();
+		thread::spawn(move || {
+			let _ = response_packet.send();
+		});
 		Ok(())
 	}
 	

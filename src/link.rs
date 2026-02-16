@@ -86,6 +86,35 @@ pub fn runtime_encrypt_for_destination(destination_hash: &[u8], plaintext: &[u8]
     link_guard.encrypt(plaintext)
 }
 
+pub fn validate_runtime_proof_for_receipt(
+    destination_hash: &[u8],
+    proof: &[u8],
+    receipt: &mut crate::packet::PacketReceipt,
+) -> bool {
+    let link = {
+        let mut links = match RUNTIME_LINKS.lock() {
+            Ok(links) => links,
+            Err(_) => return false,
+        };
+
+        match links.get(destination_hash).and_then(|w| w.upgrade()) {
+            Some(link) => link,
+            None => {
+                links.remove(destination_hash);
+                return false;
+            }
+        }
+    };
+
+    let validated = if let Ok(link_guard) = link.lock() {
+        receipt.validate_link_proof(proof, &link_guard)
+    } else {
+        false
+    };
+
+    validated
+}
+
 pub fn runtime_decrypt_for_destination(destination_hash: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     let link = {
         let mut links = RUNTIME_LINKS
@@ -1249,27 +1278,25 @@ impl Link {
                 };
                 if plaintext.len() >= offset + hash_len {
                     let resource_hash = &plaintext[offset..offset + hash_len];
-                    let mut targets: Vec<Arc<Mutex<Resource>>> = Vec::new();
                     if let Ok(mut resources) = self.outgoing_resources.lock() {
                         for resource in resources.iter_mut() {
                             if let Ok(mut resource_guard) = resource.lock() {
                                 if resource_guard.hash == resource_hash {
+                                    let mut should_process = true;
                                     if let Some(packet_hash) = packet.packet_hash.as_ref() {
-                                        resource_guard.req_hashlist.push(packet_hash.clone());
+                                        if resource_guard.req_hashlist.iter().any(|seen| seen == packet_hash) {
+                                            should_process = false;
+                                        } else {
+                                            resource_guard.req_hashlist.push(packet_hash.clone());
+                                        }
                                     }
-                                    targets.push(resource.clone());
+
+                                    if should_process {
+                                        resource_guard.request(&plaintext);
+                                    }
                                 }
                             }
                         }
-                    }
-
-                    for target in targets {
-                        let request_data = plaintext.clone();
-                        thread::spawn(move || {
-                            if let Ok(mut resource_guard) = target.lock() {
-                                resource_guard.request(&request_data);
-                            }
-                        });
                     }
                 }
             }

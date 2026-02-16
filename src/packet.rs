@@ -1,4 +1,5 @@
 use crate::destination::{Destination, DestinationType};
+use crate::identity::Identity;
 use crate::identity::{full_hash, truncated_hash, HASHLENGTH, SIGLENGTH};
 use crate::reticulum;
 use crate::transport::Transport;
@@ -549,11 +550,12 @@ impl PacketReceipt {
 
     pub fn validate_proof(&mut self, proof: &[u8]) -> bool {
         if proof.len() == Self::EXPL_LENGTH {
-            let proof_hash = &proof[..HASHLENGTH / 8];
-            let signature = &proof[HASHLENGTH / 8..HASHLENGTH / 8 + SIGLENGTH / 8];
+            let hash_len = HASHLENGTH / 8;
+            let proof_hash = &proof[..hash_len];
+            let signature = &proof[hash_len..hash_len + SIGLENGTH / 8];
             if proof_hash == self.hash.as_slice() {
                 if let Some(identity) = &self.destination.identity {
-                    let valid = identity.validate(signature, &self.hash);
+                    let valid = Self::validate_with_identity_variants(identity, signature, &self.hash);
                     if valid {
                         self.status = PacketReceipt::DELIVERED;
                         self.proved = true;
@@ -571,7 +573,7 @@ impl PacketReceipt {
             false
         } else if proof.len() == Self::IMPL_LENGTH {
             if let Some(identity) = &self.destination.identity {
-                let valid = identity.validate(proof, &self.hash);
+                let valid = Self::validate_with_identity_variants(identity, proof, &self.hash);
                 if valid {
                     self.status = PacketReceipt::DELIVERED;
                     self.proved = true;
@@ -591,6 +593,26 @@ impl PacketReceipt {
         }
     }
 
+    fn validate_with_identity_variants(identity: &Identity, signature: &[u8], hash: &[u8]) -> bool {
+        if identity.validate(signature, hash) {
+            return true;
+        }
+
+        if let Ok(public_key) = identity.get_public_key() {
+            if public_key.len() == 64 {
+                let mut swapped = public_key.clone();
+                swapped[..32].copy_from_slice(&public_key[32..64]);
+                swapped[32..64].copy_from_slice(&public_key[..32]);
+
+                if let Ok(swapped_identity) = Identity::from_public_key(&swapped) {
+                    return swapped_identity.validate(signature, hash);
+                }
+            }
+        }
+
+        false
+    }
+
     /// Validate a proof packet (Python: validate_proof_packet)
     /// Dispatches to validate_link_proof or validate_proof depending on packet type
     pub fn validate_proof_packet(&mut self, proof_packet: &Packet) -> bool {
@@ -605,8 +627,9 @@ impl PacketReceipt {
     pub fn validate_link_proof(&mut self, proof: &[u8], link: &crate::link::Link) -> bool {
         // Hardcoded as explicit proofs for now (matches Python TODO comment)
         if proof.len() == Self::EXPL_LENGTH {
-            let proof_hash = &proof[..HASHLENGTH / 8];
-            let signature = &proof[HASHLENGTH / 8..HASHLENGTH / 8 + SIGLENGTH / 8];
+            let hash_len = HASHLENGTH / 8;
+            let proof_hash = &proof[..hash_len];
+            let signature = &proof[hash_len..hash_len + SIGLENGTH / 8];
             if proof_hash == self.hash.as_slice() {
                 // In full implementation: link.validate(signature, &self.hash)
                 // For now, use basic validation
@@ -685,4 +708,67 @@ impl PacketReceipt {
 fn now_seconds() -> f64 {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
     now.as_secs() as f64 + (now.subsec_nanos() as f64 / 1_000_000_000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::destination::Destination;
+    use crate::identity::Identity;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_receipt(identity: Identity) -> PacketReceipt {
+        let hash = vec![0x42; 32];
+        PacketReceipt {
+            hash: hash.clone(),
+            truncated_hash: hash[..(reticulum::TRUNCATED_HASHLENGTH / 8)].to_vec(),
+            sent: true,
+            sent_at: 0.0,
+            proved: false,
+            status: PacketReceipt::SENT,
+            destination: Destination {
+                identity: Some(identity),
+                ..Destination::default()
+            },
+            concluded_at: None,
+            timeout: 1.0,
+            delivery_callback: None,
+            timeout_callback: None,
+        }
+    }
+
+    #[test]
+    fn validate_proof_marks_receipt_delivered_and_invokes_callback() {
+        let identity = Identity::new(true);
+        let mut receipt = make_receipt(identity.clone());
+        let callback_hits = Arc::new(AtomicUsize::new(0));
+        let callback_hits_clone = callback_hits.clone();
+
+        receipt.set_delivery_callback(Arc::new(move |_| {
+            callback_hits_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let signature = identity.sign(&receipt.hash);
+        let mut proof = receipt.hash.clone();
+        proof.extend_from_slice(&signature);
+
+        assert!(receipt.validate_proof(&proof));
+        assert_eq!(receipt.status, PacketReceipt::DELIVERED);
+        assert!(receipt.proved);
+        assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn validate_proof_rejects_truncated_explicit_hash_prefix() {
+        let identity = Identity::new(true);
+        let mut receipt = make_receipt(identity.clone());
+        let signature = identity.sign(&receipt.hash);
+
+        let mut invalid_proof = receipt.truncated_hash.clone();
+        invalid_proof.extend_from_slice(&signature);
+
+        assert!(!receipt.validate_proof(&invalid_proof));
+        assert_eq!(receipt.status, PacketReceipt::SENT);
+        assert!(!receipt.proved);
+    }
 }
