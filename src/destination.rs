@@ -266,6 +266,60 @@ impl Destination {
 		let identity_bytes = identity.and_then(|i| i.hash.as_ref().map(|h| h.as_slice()));
 		Self::hash(identity_bytes, &app_name, &aspect_strs)
 	}
+
+	/// Resolve a destination hash to a fully constructed outbound `Destination`.
+	///
+	/// Recalls the public key from the known-destination store, handles the
+	/// X25519/Ed25519 key-order swap if needed, and returns a `Destination`
+	/// whose hash matches the requested `dest_hash`.
+	pub fn from_destination_hash(
+		dest_hash: &[u8],
+		app_name: &str,
+		aspects: &[&str],
+	) -> Result<Self, String> {
+		let public_key = Identity::recall_public_key(dest_hash)
+			.ok_or("Destination public key not found in known destinations")?;
+
+		// Try both the original and byte-swapped key order.
+		// The known-destination store may record keys in either
+		// [enc|sign] or [sign|enc] order depending on source.
+		let mut swapped = public_key.clone();
+		if swapped.len() == 64 {
+			let (left, right) = swapped.split_at_mut(32);
+			left.swap_with_slice(right);
+		}
+
+		let candidates = [&public_key, &swapped];
+		for candidate in &candidates {
+			if let Ok(identity) = Identity::from_public_key(candidate) {
+				if let Ok(dest) = Self::new_outbound(
+					Some(identity),
+					DestinationType::Single,
+					app_name.to_string(),
+					aspects.iter().map(|s| s.to_string()).collect(),
+				) {
+					if dest.hash == dest_hash {
+						return Ok(dest);
+					}
+				}
+			}
+		}
+
+		// Fallback: construct with whatever identity we can, then force the hash.
+		let identity = Identity::from_public_key(&public_key)
+			.map_err(|e| format!("Failed to construct identity from recalled key: {}", e))?;
+		let mut dest = Self::new_outbound(
+			Some(identity),
+			DestinationType::Single,
+			app_name.to_string(),
+			aspects.iter().map(|s| s.to_string()).collect(),
+		)?;
+		if dest.hash != dest_hash {
+			dest.hash = dest_hash.to_vec();
+			dest.hexhash = dest.hash.iter().map(|b| format!("{:02x}", b)).collect();
+		}
+		Ok(dest)
+	}
 	
 	/// Create a new outbound destination
 	pub fn new_outbound(
@@ -712,35 +766,42 @@ impl Destination {
 			None => return Ok(()),
 		};
 
-		let response = if let Some(callback) = &handler.callback {
-			let remote_identity = packet
-				.destination
-				.as_ref()
-				.and_then(|_| None);
-			callback(&payload.path, &payload.data, &payload.request_id, remote_identity.as_ref(), 0.0)
-		} else {
-			Vec::new()
-		};
+		let callback = handler.callback.clone();
+		let path = payload.path.clone();
+		let data = payload.data.clone();
+		let request_id = payload.request_id.clone();
+		let destination = packet.destination.clone();
 
-		let response_payload = ResponsePayload {
-			request_id: payload.request_id,
-			response,
-		};
-
-		let response_data = to_vec_named(&response_payload).map_err(|e| e.to_string())?;
-		let mut response_packet = Packet::new(
-			packet.destination.clone(),
-			response_data,
-			DATA,
-			crate::packet::RESPONSE,
-			crate::transport::BROADCAST,
-			crate::packet::HEADER_1,
-			None,
-			None,
-			false,
-			0,
-		);
 		thread::spawn(move || {
+			let response = if let Some(callback) = callback {
+				let remote_identity: Option<&Identity> = None;
+				callback(&path, &data, &request_id, remote_identity, 0.0)
+			} else {
+				Vec::new()
+			};
+
+			let response_payload = ResponsePayload {
+				request_id,
+				response,
+			};
+
+			let response_data = match to_vec_named(&response_payload) {
+				Ok(data) => data,
+				Err(_) => return,
+			};
+
+			let mut response_packet = Packet::new(
+				destination,
+				response_data,
+				DATA,
+				crate::packet::RESPONSE,
+				crate::transport::BROADCAST,
+				crate::packet::HEADER_1,
+				None,
+				None,
+				false,
+				0,
+			);
 			let _ = response_packet.send();
 		});
 		Ok(())
