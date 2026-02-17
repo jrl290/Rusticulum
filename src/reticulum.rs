@@ -1720,6 +1720,83 @@ impl Reticulum {
                     }
                     crate::transport::Transport::register_interface_stub_config(stub_config);
                 }
+                "RNodeInterface" => {
+                    let port = config.get("port").unwrap_or("/dev/ttyUSB0").to_string();
+                    let frequency = config.get_int("frequency").unwrap_or(0) as u64;
+                    let bandwidth = config.get_int("bandwidth").unwrap_or(125000) as u32;
+                    let txpower = config.get_int("txpower").unwrap_or(7) as u8;
+                    let sf = config.get_int("spreadingfactor").unwrap_or(7) as u8;
+                    let cr = config.get_int("codingrate").unwrap_or(5) as u8;
+                    let flow_control = config.get_bool("flow_control").unwrap_or(false);
+                    let st_alock = config.get_float("airtime_limit_short").map(|v| v as f32);
+                    let lt_alock = config.get_float("airtime_limit_long").map(|v| v as f32);
+                    let id_interval = config.get_int("id_interval").map(|v| Duration::from_secs(v as u64));
+                    let id_callsign = config.get("id_callsign").map(|s| s.as_bytes().to_vec());
+
+                    match crate::interfaces::rnode_interface::RNodeInterface::new(
+                        name,
+                        &port,
+                        frequency,
+                        bandwidth,
+                        txpower,
+                        sf,
+                        cr,
+                        flow_control,
+                        st_alock,
+                        lt_alock,
+                        id_interval,
+                        id_callsign,
+                    ) {
+                        Ok(interface) => {
+                            let interface = Arc::new(Mutex::new(interface));
+
+                            // Start read loop FIRST so it can process detect/config responses
+                            crate::interfaces::rnode_interface::RNodeInterface::start_read_loop(
+                                Arc::clone(&interface),
+                                Arc::new(Mutex::new(crate::transport::Transport)),
+                            );
+
+                            // Configure the radio (detect, set params, go online)
+                            // Uses _shared variant that releases the outer lock between
+                            // steps so the read loop can process serial responses.
+                            if let Err(err) = crate::interfaces::rnode_interface::RNodeInterface::configure_device_shared(&interface) {
+                                log(
+                                    &format!("Failed to configure RNode device {}: {}", name, err),
+                                    LOG_ERROR,
+                                    false,
+                                    false,
+                                );
+                                if instance_init {
+                                    panic!("Failed to configure RNode device");
+                                }
+                            }
+
+                            // Register outbound handler
+                            let handler_iface = Arc::clone(&interface);
+                            crate::transport::Transport::register_outbound_handler(
+                                name,
+                                Arc::new(move |raw| {
+                                    let iface = handler_iface.lock().unwrap();
+                                    iface.process_outgoing(raw.to_vec()).is_ok()
+                                }),
+                            );
+
+                            self.system_interfaces.push(SystemInterface::RNode(interface));
+                        }
+                        Err(err) => {
+                            log(
+                                &format!("Failed to create RNode interface {}: {}", name, err),
+                                LOG_ERROR,
+                                false,
+                                false,
+                            );
+                            if instance_init {
+                                panic!("Failed to create RNode interface");
+                            }
+                        }
+                    }
+                    crate::transport::Transport::register_interface_stub_config(stub_config);
+                }
                 "BackboneInterface" => {
                     match crate::interfaces::backbone_interface::BackboneInterface::new(&config_map) {
                         Ok(mut interface) => {

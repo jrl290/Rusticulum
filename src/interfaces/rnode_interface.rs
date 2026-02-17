@@ -1202,9 +1202,109 @@ impl RNodeInterface {
 			));
 		}
 
-		// Mark as online
-		self.inner.lock().unwrap().online = true;
+		// Mark as ready and online
+		{
+			let mut inner = self.inner.lock().unwrap();
+			inner.interface_ready = true;
+			inner.online = true;
+		}
 		println!("RNodeInterface[{}] is configured and powered up", self.name);
+		Ok(())
+	}
+
+	/// Configure device via the shared Arc, releasing the outer lock between
+	/// steps so the read loop thread can process serial responses (detect,
+	/// radio state, etc.).
+	pub fn configure_device_shared(interface: &Arc<Mutex<RNodeInterface>>) -> io::Result<()> {
+		// Reset state
+		{
+			let iface = interface.lock().unwrap();
+			let mut inner = iface.inner.lock().unwrap();
+			inner.r_frequency = None;
+			inner.r_bandwidth = None;
+			inner.r_txpower = None;
+			inner.r_sf = None;
+			inner.r_cr = None;
+			inner.r_state = None;
+			inner.detected = false;
+		}
+
+		// Wait for device to settle after serial open
+		thread::sleep(Duration::from_secs(2));
+
+		// Send detect command (lock briefly, then release)
+		{
+			let iface = interface.lock().unwrap();
+			iface.detect()?;
+		}
+
+		// Give device time to respond — read loop processes bytes while we sleep
+		thread::sleep(Duration::from_millis(200));
+
+		// Check if detected
+		{
+			let iface = interface.lock().unwrap();
+			let inner = iface.inner.lock().unwrap();
+			if !inner.detected {
+				return Err(io::Error::new(
+					io::ErrorKind::NotConnected,
+					"Could not detect RNode device",
+				));
+			}
+			if !inner.firmware_ok {
+				return Err(io::Error::new(
+					io::ErrorKind::Other,
+					format!(
+						"Firmware version {}.{} is too old (need {}.{})",
+						inner.maj_version,
+						inner.min_version,
+						REQUIRED_FW_VER_MAJ,
+						REQUIRED_FW_VER_MIN
+					),
+				));
+			}
+			let has_display = inner.platform == Some(PLATFORM_ESP32)
+				|| inner.platform == Some(PLATFORM_NRF52);
+			drop(inner);
+			iface.inner.lock().unwrap().display = Some(has_display);
+		}
+
+		// Initialize radio (lock briefly for each command)
+		{
+			let iface = interface.lock().unwrap();
+			iface.init_radio()?;
+		}
+
+		// Validate radio state after a delay
+		let delay = {
+			let iface = interface.lock().unwrap();
+			let inner = iface.inner.lock().unwrap();
+			match &inner.connection {
+				ConnectionType::Ble(_) => Duration::from_secs_f32(1.0),
+				ConnectionType::Tcp(_) => Duration::from_secs_f32(1.5),
+				ConnectionType::Serial(_) => Duration::from_millis(250),
+			}
+		};
+		thread::sleep(delay);
+
+		{
+			let iface = interface.lock().unwrap();
+			if !iface.validate_radio_state() {
+				return Err(io::Error::new(
+					io::ErrorKind::Other,
+					"Radio parameters did not validate",
+				));
+			}
+			let mut inner = iface.inner.lock().unwrap();
+			inner.interface_ready = true;
+			inner.online = true;
+			drop(inner);
+			println!(
+				"RNodeInterface[{}] is configured and powered up",
+				iface.name
+			);
+		}
+
 		Ok(())
 	}
 
@@ -1471,14 +1571,20 @@ impl RNodeInterface {
 					if in_frame && byte == KISS_FEND && command == CMD_DATA {
 						in_frame = false;
 						if !data_buffer.is_empty() {
-							let iface = interface.lock().unwrap();
-							*iface.rxb.lock().unwrap() += data_buffer.len() as u64;
-							let interface_name = iface.name.clone();
+							// Grab what we need then RELEASE the lock before
+							// calling inbound — inbound can trigger prove()
+							// → outbound → dispatch → handler closure which
+							// re-locks this interface.
+							let interface_name = {
+								let iface = interface.lock().unwrap();
+								*iface.rxb.lock().unwrap() += data_buffer.len() as u64;
+								let name = iface.name.clone();
+								let mut inner = iface.inner.lock().unwrap();
+								inner.r_stat_rssi = None;
+								inner.r_stat_snr = None;
+								name
+							}; // lock released here
 							let _ = RnsTransport::inbound(data_buffer.clone(), Some(interface_name));
-
-							let mut inner = iface.inner.lock().unwrap();
-							inner.r_stat_rssi = None;
-							inner.r_stat_snr = None;
 						}
 						data_buffer.clear();
 						command_buffer.clear();
