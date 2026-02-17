@@ -971,7 +971,7 @@ impl RNodeInterface {
 	}
 
 	fn kiss_escape(data: &[u8]) -> Vec<u8> {
-		let mut escaped = Vec::with_capacity(data.len() * 2);
+		let mut escaped = Vec::with_capacity(data.len() + 16);
 		for &byte in data {
 			match byte {
 				KISS_FEND => {
@@ -1513,9 +1513,23 @@ impl RNodeInterface {
 				inner.interface_ready = false;
 			}
 
-			let escaped = Self::kiss_escape(&data);
-			let mut frame = vec![KISS_FEND, CMD_DATA];
-			frame.extend(escaped);
+			// Build KISS frame in a single allocation: FEND + CMD_DATA + escaped data + FEND
+			let mut frame = Vec::with_capacity(data.len() + 16 + 3);
+			frame.push(KISS_FEND);
+			frame.push(CMD_DATA);
+			for &byte in &data {
+				match byte {
+					KISS_FEND => {
+						frame.push(KISS_FESC);
+						frame.push(KISS_TFEND);
+					}
+					KISS_FESC => {
+						frame.push(KISS_FESC);
+						frame.push(KISS_TFESC);
+					}
+					_ => frame.push(byte),
+				}
+			}
 			frame.push(KISS_FEND);
 
 			inner.connection.write_all(&frame)?;
