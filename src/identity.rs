@@ -424,6 +424,14 @@ impl Identity {
 
     /// Decrypt ciphertext encrypted for this identity (supports ratchets)
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        self.decrypt_with_ratchets(ciphertext, None)
+    }
+
+    /// Decrypt with optional additional destination ratchet private keys.
+    /// `dest_ratchets` is a list of X25519 private key bytes (32 bytes each)
+    /// from the destination's ratchet rotation. These are tried before the
+    /// identity's own ratchets.
+    pub fn decrypt_with_ratchets(&mut self, ciphertext: &[u8], dest_ratchets: Option<&[Vec<u8>]>) -> Result<Vec<u8>, String> {
         if ciphertext.len() <= 32 {
             return Err("Ciphertext too short".to_string());
         }
@@ -434,7 +442,19 @@ impl Identity {
         let ephemeral_pub = X25519PublicKey::from(ephemeral_pub_bytes);
         let token_data = &ciphertext[32..];
 
-        // Try ratchet keys first
+        // Try destination ratchet keys first (from Destination.ratchets rotation)
+        if let Some(ratchets) = dest_ratchets {
+            for ratchet_prv_bytes in ratchets {
+                if ratchet_prv_bytes.len() == 32 {
+                    let ratchet_prv = X25519PrivateKey::from(*<&[u8; 32]>::try_from(ratchet_prv_bytes.as_slice()).unwrap());
+                    if let Ok(plaintext) = self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {
+                        return Ok(plaintext);
+                    }
+                }
+            }
+        }
+
+        // Try identity's own ratchet keys
         for (_ratchet_id, ratchet_prv_bytes) in &self.ratchets {
             let ratchet_prv = X25519PrivateKey::from(*<&[u8; 32]>::try_from(ratchet_prv_bytes.as_slice()).unwrap());
             if let Ok(plaintext) = self.decrypt_with_key(&ratchet_prv, &ephemeral_pub, token_data) {

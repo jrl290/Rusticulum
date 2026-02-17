@@ -813,10 +813,20 @@ impl Destination {
 			return Ok(());
 		}
 		
+		eprintln!("[DEST] incoming_link_request: data_len={} accept={}", _data.len(), self.accept_link_requests);
+		
 		// Validate the link request and create Link if valid
-		// In full implementation: Link::validate_request(self, data, packet)
-		// If valid, the link would be added to self.links
-		// For now, just acknowledge the request was received
+		match crate::link::Link::validate_request(self, _data, _packet) {
+			Ok(link) => {
+				eprintln!("[DEST] incoming_link_request: link created, link_id={}", 
+					crate::hexrep(&link.link_id, false));
+				self.links.push(link);
+			}
+			Err(e) => {
+				eprintln!("[DEST] incoming_link_request: validate_request failed: {}", e);
+			}
+		}
+		
 		Ok(())
 	}
 	
@@ -866,12 +876,12 @@ impl Destination {
 				.unwrap_or(0);
 			
 			if now > self.latest_ratchet_time + self.ratchet_interval {
-				// Generate new ratchet - in full implementation: RNS.Identity._generate_ratchet()
-				let new_ratchet: Vec<u8> = (0..64).map(|i| ((now >> (i % 8)) & 0xFF) as u8).collect();
-				ratchets.insert(0, new_ratchet);
+				// Generate a proper X25519 private key (32 random bytes)
+				let ratchet_prv = crate::identity::get_random_hash();
+				ratchets.insert(0, ratchet_prv);
 				self.latest_ratchet_time = now;
 				self._clean_ratchets();
-				let _ = self._persist_ratchets(); // Persist after rotation
+				let _ = self._persist_ratchets();
 				return Ok(true);
 			}
 			Ok(false)
@@ -1047,21 +1057,27 @@ impl Destination {
 		match self.dest_type {
 			DestinationType::Plain => Ok(ciphertext.to_vec()),
 			DestinationType::Single => {
+				// First attempt: try with current ratchet keys
+				let dest_ratchets_clone = self.ratchets.clone();
+				let first_result = if let Some(identity) = self.identity.as_mut() {
+					let dr = dest_ratchets_clone.as_ref().map(|r| r.as_slice());
+					identity.decrypt_with_ratchets(ciphertext, dr)
+				} else {
+					return Err("No identity for decryption".to_string());
+				};
+
+				if first_result.is_ok() || self.ratchets.is_none() {
+					return first_result;
+				}
+
+				// Ratchet mismatch — try reloading from disk and retry
+				if let Some(ratchets_path) = self.ratchets_path.clone() {
+					let _ = self._reload_ratchets(&ratchets_path);
+				}
+				let dest_ratchets_clone = self.ratchets.clone();
 				if let Some(identity) = self.identity.as_mut() {
-					// Python: if self.ratchets, try decrypt with ratchets and fallback to reload
-					if self.ratchets.is_some() {
-						// In full implementation:
-						// let decrypted = identity.decrypt(ciphertext, ratchets=self.ratchets,
-						//                                  enforce_ratchets=self.enforce_ratchets,
-						//                                  ratchet_id_receiver=self);
-						// if decrypted.is_err() {
-						//     self._reload_ratchets(self.ratchets_path);
-						//     retry decrypt...
-						// }
-						identity.decrypt(ciphertext)
-					} else {
-						identity.decrypt(ciphertext)
-					}
+					let dr = dest_ratchets_clone.as_ref().map(|r| r.as_slice());
+					identity.decrypt_with_ratchets(ciphertext, dr)
 				} else {
 					Err("No identity for decryption".to_string())
 				}

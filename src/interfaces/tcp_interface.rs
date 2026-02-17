@@ -583,8 +583,12 @@ impl TcpClientInterface {
 
             loop {
                 match socket.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        eprintln!("[TCP-READ] socket read returned 0, connection closed");
+                        break;
+                    }
                     Ok(n) => {
+                        eprintln!("[TCP-READ] read {} bytes, frame_buffer_len={}", n, frame_buffer.len());
                         let data_in = &buf[..n];
 
                         if kiss_framing {
@@ -621,6 +625,7 @@ impl TcpClientInterface {
                             }
                         } else {
                             frame_buffer.extend_from_slice(data_in);
+                            eprintln!("[TCP-READ] HDLC frame_buffer now {} bytes", frame_buffer.len());
 
                             loop {
                                 if let Some(frame_start) = frame_buffer.iter().position(|&b| b == Hdlc::FLAG) {
@@ -646,23 +651,51 @@ impl TcpClientInterface {
                                         }
 
                                         const HEADER_MINSIZE: usize = 2;
+                                        eprintln!("[TCP-READ] extracted frame: {} raw bytes -> {} unescaped bytes (min={})", frame.len(), unescaped.len(), HEADER_MINSIZE);
                                         if unescaped.len() > HEADER_MINSIZE {
-                                            let _ = Transport::inbound(unescaped, interface_name.clone());
+                                            eprintln!("[TCP-READ] calling Transport::inbound with {} bytes", unescaped.len());
+                                            let _ = std::io::Write::flush(&mut std::io::stderr());
+                                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                Transport::inbound(unescaped.clone(), interface_name.clone())
+                                            }));
+                                            match &result {
+                                                Ok(v) => {
+                                                    eprintln!("[TCP-READ] Transport::inbound returned Ok({})", v);
+                                                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                                                }
+                                                Err(panic) => {
+                                                    let detail = if let Some(s) = panic.downcast_ref::<&str>() {
+                                                        s.to_string()
+                                                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                                                        s.clone()
+                                                    } else {
+                                                        "unknown panic".to_string()
+                                                    };
+                                                    eprintln!("[TCP-READ] Transport::inbound PANICKED: {}", detail);
+                                                }
+                                            }
                                         }
 
                                         frame_buffer.drain(..=frame_end);
+                                        eprintln!("[TCP-READ] drained frame, remaining buffer={} bytes", frame_buffer.len());
                                     } else {
+                                        eprintln!("[TCP-READ] no end flag yet, waiting for more data (buffer={})", frame_buffer.len());
                                         break;
                                     }
                                 } else {
+                                    eprintln!("[TCP-READ] no start flag in buffer (buffer={})", frame_buffer.len());
                                     break;
                                 }
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        eprintln!("[TCP-READ] socket read error: {}", e);
+                        break;
+                    }
                 }
             }
+            eprintln!("[TCP-READ] read loop exited!");
         });
     }
 

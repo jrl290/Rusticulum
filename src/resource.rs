@@ -243,19 +243,48 @@ impl Resource {
 
         let resource = Arc::new(Mutex::new(resource));
 
-        if let Ok(link) = resource.lock().unwrap().link.lock() {
-            if !link.has_incoming_resource(&resource) {
-                link.register_incoming_resource(resource.clone());
-            } else {
-                return None;
-            }
-        }
+        // NOTE: Do NOT register in incoming_resources here.
+        // The caller (handle_data_packet) registers after accept() returns,
+        // and incoming_resources is shared via Arc — registering here would
+        // cause double registration and duplicate receive_part calls.
 
+        // Populate hashmap but DON'T call request_next() yet — we may be
+        // inside a link lock (dispatch_runtime_packet) and request_next needs
+        // to encrypt via the same link → deadlock.  Instead, populate the
+        // hashmap synchronously and defer the network request to a thread.
         if let Ok(mut r) = resource.lock() {
             let hashmap_raw = r.hashmap_raw.clone();
-            r.hashmap_update(0, &hashmap_raw);
-            r.watchdog_job();
+            // Inline the hashmap population without calling request_next
+            r.status = ResourceStatus::Transferring;
+            let seg_len = ResourceAdvertisement::HASHMAP_MAX_LEN;
+            let hashes = hashmap_raw.len() / Resource::MAPHASH_LEN;
+            for i in 0..hashes {
+                let idx = i + 0 * seg_len; // segment=0
+                let slice = &hashmap_raw[i * Resource::MAPHASH_LEN..(i + 1) * Resource::MAPHASH_LEN];
+                let target_index = idx * Resource::MAPHASH_LEN;
+                if target_index + Resource::MAPHASH_LEN <= r.hashmap.len() {
+                    if r.hashmap[target_index..target_index + Resource::MAPHASH_LEN].iter().all(|b| *b == 0) {
+                        r.hashmap_height += 1;
+                    }
+                    r.hashmap[target_index..target_index + Resource::MAPHASH_LEN].copy_from_slice(slice);
+                }
+            }
+            r.waiting_for_hmu = false;
         }
+
+        // Spawn request_next in a separate thread so it runs after the caller
+        // releases the link lock (avoids encrypt→lock deadlock)
+        let resource_for_req = resource.clone();
+        thread::spawn(move || {
+            // Brief yield to allow the link lock to be released
+            thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(mut r) = resource_for_req.lock() {
+                r.request_next();
+            }
+        });
+
+        // Start watchdog with the real Arc so it always sees current state
+        Resource::start_watchdog(resource.clone());
 
         Some(resource)
     }
@@ -662,148 +691,175 @@ impl Resource {
     }
 
     pub fn watchdog_job(&mut self) {
+        // Legacy: only used for sender-side resources that already have their own Arc.
+        // For receiver-side resources, use start_watchdog() instead.
         let resource = Arc::new(Mutex::new(self.clone()));
-        thread::spawn(move || {
-            if let Ok(mut r) = resource.lock() {
-                r.watchdog_loop();
-            }
-        });
+        Resource::start_watchdog(resource);
     }
 
-    fn watchdog_loop(&mut self) {
-        self.watchdog_job_id += 1;
-        let this_job_id = self.watchdog_job_id;
+    /// Start the watchdog thread using a shared Arc so it always sees current
+    /// resource state. This avoids the stale-clone problem where the watchdog
+    /// operates on a frozen copy that never sees received parts.
+    pub fn start_watchdog(resource_arc: Arc<Mutex<Self>>) {
+        thread::spawn(move || {
+            // Assign a new watchdog job ID
+            let this_job_id = {
+                if let Ok(mut r) = resource_arc.lock() {
+                    r.watchdog_job_id += 1;
+                    r.watchdog_job_id
+                } else {
+                    return;
+                }
+            };
 
-        while (self.status as u8) < (ResourceStatus::Assembling as u8) && this_job_id == self.watchdog_job_id {
-            while self.watchog_lock {
-                thread::sleep(Duration::from_millis(25));
-            }
+            loop {
+                // Lock, read state, compute action, mutate if needed, then unlock before sleeping
+                let sleep_time = {
+                    let mut r = match resource_arc.lock() {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
 
-            let mut sleep_time: Option<f64> = None;
-            match self.status {
-                ResourceStatus::Advertised => {
-                    sleep_time = Some((self.adv_sent + self.timeout + Resource::PROCESSING_GRACE) - now());
-                    if let Some(st) = sleep_time {
-                        if st < 0.0 {
-                            if self.retries_left == 0 {
-                                self.cancel();
-                                sleep_time = Some(0.001);
+                    // Check termination conditions
+                    if (r.status as u8) >= (ResourceStatus::Assembling as u8) || this_job_id != r.watchdog_job_id {
+                        break;
+                    }
+
+                    // Wait if watchdog is locked (e.g. during receive_part)
+                    if r.watchog_lock {
+                        drop(r);
+                        thread::sleep(Duration::from_millis(25));
+                        continue;
+                    }
+
+                    match r.status {
+                        ResourceStatus::Advertised => {
+                            let st = (r.adv_sent + r.timeout + Resource::PROCESSING_GRACE) - now();
+                            if st < 0.0 {
+                                if r.retries_left == 0 {
+                                    r.cancel();
+                                    0.001
+                                } else {
+                                    r.retries_left -= 1;
+                                    let adv = ResourceAdvertisement::new_from_resource(&r);
+                                    let packed = adv.pack(0).unwrap_or_default();
+                                    let mut packet = Packet::new(
+                                        r.packet_destination(),
+                                        packed,
+                                        crate::packet::DATA,
+                                        RESOURCE_ADV,
+                                        BROADCAST,
+                                        crate::packet::HEADER_1,
+                                        None,
+                                        None,
+                                        false,
+                                        0,
+                                    );
+                                    let _ = packet.send();
+                                    r.last_activity = now();
+                                    r.adv_sent = r.last_activity;
+                                    0.001
+                                }
                             } else {
-                                self.retries_left -= 1;
-                                let adv = ResourceAdvertisement::new_from_resource(self);
-                                let packed = adv.pack(0).unwrap_or_default();
-                                let mut packet = Packet::new(
-                                    self.packet_destination(),
-                                    packed,
-                                    crate::packet::DATA,
-                                    RESOURCE_ADV,
-                                    BROADCAST,
-                                    crate::packet::HEADER_1,
-                                    None,
-                                    None,
-                                    false,
-                                    0,
-                                );
-                                let _ = packet.send();
-                                self.last_activity = now();
-                                self.adv_sent = self.last_activity;
-                                sleep_time = Some(0.001);
+                                st
                             }
                         }
-                    }
-                }
-                ResourceStatus::Transferring => {
-                    if !self.initiator {
-                        let retries_used = self.max_retries - self.retries_left;
-                        let extra_wait = retries_used as f64 * Resource::PER_RETRY_DELAY;
-                        self.update_eifr();
-                        let expected_tof_remaining = (self.outstanding_parts as f64 * self.sdu as f64 * 8.0) / self.eifr.unwrap_or(1.0);
+                        ResourceStatus::Transferring => {
+                            if !r.initiator {
+                                let retries_used = r.max_retries - r.retries_left;
+                                let extra_wait = retries_used as f64 * Resource::PER_RETRY_DELAY;
+                                r.update_eifr();
+                                let expected_tof_remaining = (r.outstanding_parts as f64 * r.sdu as f64 * 8.0) / r.eifr.unwrap_or(1.0);
 
-                        if self.req_resp_rtt_rate != 0.0 {
-                            sleep_time = Some(self.last_activity + self.part_timeout_factor * expected_tof_remaining + Resource::RETRY_GRACE_TIME + extra_wait - now());
-                        } else {
-                            sleep_time = Some(self.last_activity + self.part_timeout_factor * ((3.0 * self.sdu as f64) / self.eifr.unwrap_or(1.0)) + Resource::RETRY_GRACE_TIME + extra_wait - now());
-                        }
+                                let st = if r.req_resp_rtt_rate != 0.0 {
+                                    r.last_activity + r.part_timeout_factor * expected_tof_remaining + Resource::RETRY_GRACE_TIME + extra_wait - now()
+                                } else {
+                                    r.last_activity + r.part_timeout_factor * ((3.0 * r.sdu as f64) / r.eifr.unwrap_or(1.0)) + Resource::RETRY_GRACE_TIME + extra_wait - now()
+                                };
 
-                        if let Some(st) = sleep_time {
-                            if st < 0.0 {
-                                if self.retries_left > 0 {
-                                    if self.window > self.window_min {
-                                        self.window -= 1;
-                                        if self.window_max > self.window_min {
-                                            self.window_max -= 1;
-                                            if (self.window_max - self.window) > (self.window_flexibility - 1) {
-                                                self.window_max -= 1;
+                                if st < 0.0 {
+                                    if r.retries_left > 0 {
+                                        if r.window > r.window_min {
+                                            r.window -= 1;
+                                            if r.window_max > r.window_min {
+                                                r.window_max -= 1;
+                                                if (r.window_max - r.window) > (r.window_flexibility - 1) {
+                                                    r.window_max -= 1;
+                                                }
                                             }
                                         }
+                                        r.retries_left -= 1;
+                                        r.waiting_for_hmu = false;
+                                        r.request_next();
+                                        0.001
+                                    } else {
+                                        r.cancel();
+                                        0.001
                                     }
-                                    self.retries_left -= 1;
-                                    self.waiting_for_hmu = false;
-                                    self.request_next();
-                                    sleep_time = Some(0.001);
                                 } else {
-                                    self.cancel();
-                                    sleep_time = Some(0.001);
+                                    st
+                                }
+                            } else {
+                                let max_extra_wait = (0..r.max_retries).map(|x| (x + 1) as f64 * Resource::PER_RETRY_DELAY).sum::<f64>();
+                                let max_wait = r.rtt.unwrap_or(0.0) * r.timeout_factor * r.max_retries as f64 + r.sender_grace_time + max_extra_wait;
+                                let st = r.last_activity + max_wait - now();
+                                if st < 0.0 {
+                                    r.cancel();
+                                    0.001
+                                } else {
+                                    st
                                 }
                             }
                         }
-                    } else {
-                        let max_extra_wait = (0..self.max_retries).map(|r| (r + 1) as f64 * Resource::PER_RETRY_DELAY).sum::<f64>();
-                        let max_wait = self.rtt.unwrap_or(0.0) * self.timeout_factor * self.max_retries as f64 + self.sender_grace_time + max_extra_wait;
-                        sleep_time = Some(self.last_activity + max_wait - now());
-                        if let Some(st) = sleep_time {
+                        ResourceStatus::AwaitingProof => {
+                            r.timeout_factor = Resource::PROOF_TIMEOUT_FACTOR;
+                            let st = r.last_part_sent + (r.rtt.unwrap_or(0.0) * r.timeout_factor + r.sender_grace_time) - now();
                             if st < 0.0 {
-                                self.cancel();
-                                sleep_time = Some(0.001);
+                                if r.retries_left == 0 {
+                                    r.cancel();
+                                    0.001
+                                } else {
+                                    r.retries_left -= 1;
+                                    let mut expected_data = r.hash.clone();
+                                    expected_data.extend_from_slice(&r.expected_proof);
+                                    let mut expected_packet = Packet::new(
+                                        r.packet_destination(),
+                                        expected_data,
+                                        PROOF,
+                                        RESOURCE_PRF,
+                                        BROADCAST,
+                                        crate::packet::HEADER_1,
+                                        None,
+                                        None,
+                                        false,
+                                        0,
+                                    );
+                                    let _ = expected_packet.pack();
+                                    Transport::cache_request(expected_packet.packet_hash.clone().unwrap_or_default(), r.link.clone());
+                                    r.last_part_sent = now();
+                                    0.001
+                                }
+                            } else {
+                                st
                             }
                         }
+                        ResourceStatus::Rejected => 0.001,
+                        _ => break,
                     }
-                }
-                ResourceStatus::AwaitingProof => {
-                    self.timeout_factor = Resource::PROOF_TIMEOUT_FACTOR;
-                    let st = self.last_part_sent + (self.rtt.unwrap_or(0.0) * self.timeout_factor + self.sender_grace_time) - now();
-                    sleep_time = Some(st);
-                    if st < 0.0 {
-                        if self.retries_left == 0 {
-                            self.cancel();
-                            sleep_time = Some(0.001);
-                        } else {
-                            self.retries_left -= 1;
-                            let mut expected_data = self.hash.clone();
-                            expected_data.extend_from_slice(&self.expected_proof);
-                            let mut expected_packet = Packet::new(
-                                self.packet_destination(),
-                                expected_data,
-                                PROOF,
-                                RESOURCE_PRF,
-                                BROADCAST,
-                                crate::packet::HEADER_1,
-                                None,
-                                None,
-                                false,
-                                0,
-                            );
-                            let _ = expected_packet.pack();
-                            Transport::cache_request(expected_packet.packet_hash.clone().unwrap_or_default(), self.link.clone());
-                            self.last_part_sent = now();
-                            sleep_time = Some(0.001);
+                };
+
+                if sleep_time <= 0.0 {
+                    // Negative sleep means we already handled it (cancel, etc.)
+                    if let Ok(r) = resource_arc.lock() {
+                        if r.status == ResourceStatus::Failed {
+                            break;
                         }
                     }
-                }
-                ResourceStatus::Rejected => {
-                    sleep_time = Some(0.001);
-                }
-                _ => {}
-            }
-
-            if let Some(st) = sleep_time {
-                if st <= 0.0 {
-                    self.cancel();
                 } else {
-                    thread::sleep(Duration::from_secs_f64(st.min(Resource::WATCHDOG_MAX_SLEEP)));
+                    thread::sleep(Duration::from_secs_f64(sleep_time.min(Resource::WATCHDOG_MAX_SLEEP)));
                 }
             }
-        }
+        });
     }
 
     pub fn update_eifr(&mut self) {
@@ -824,16 +880,26 @@ impl Resource {
         }
     }
 
-    pub fn hashmap_update_packet(&mut self, plaintext: &[u8]) {
+    /// Process HMU packet and update hashmap. Returns true if request_next
+    /// should be called (caller must defer to avoid link-mutex deadlock).
+    pub fn hashmap_update_packet(&mut self, plaintext: &[u8]) -> bool {
         if self.status != ResourceStatus::Failed {
             self.last_activity = now();
             self.retries_left = self.max_retries;
             if plaintext.len() > identity::HASHLENGTH / 8 {
-                if let Ok(update) = from_slice::<(usize, Vec<u8>)>(&plaintext[identity::HASHLENGTH / 8..]) {
+                // Must use serde_bytes::ByteBuf so rmp-serde deserializes
+                // msgpack bin format (sent by Python) into Vec<u8>.
+                // Plain Vec<u8> expects msgpack array-of-ints which fails.
+                if let Ok(update) = from_slice::<(usize, serde_bytes::ByteBuf)>(&plaintext[identity::HASHLENGTH / 8..]) {
+                    eprintln!("[RESOURCE-HMU] parsed segment={} hashmap_len={}", update.0, update.1.len());
                     self.hashmap_update(update.0, &update.1);
+                    return true;
+                } else {
+                    eprintln!("[RESOURCE-HMU] from_slice FAILED, plaintext_len={}", plaintext.len());
                 }
             }
         }
+        false
     }
 
     pub fn hashmap_update(&mut self, segment: usize, hashmap: &[u8]) {
@@ -853,7 +919,9 @@ impl Resource {
                 }
             }
             self.waiting_for_hmu = false;
-            self.request_next();
+            // NOTE: Do NOT call self.request_next() here.
+            // The caller must defer request_next to a background thread
+            // to avoid deadlocking the link mutex.
         }
     }
 
@@ -909,6 +977,19 @@ impl Resource {
                 request_data.extend_from_slice(&self.hash);
                 request_data.extend_from_slice(&requested_hashes);
 
+                let requested_count = requested_hashes.len() / Resource::MAPHASH_LEN;
+                let wants_hmu = hashmap_exhausted == Resource::HASHMAP_IS_EXHAUSTED;
+                eprintln!(
+                    "[RESOURCE] request_next hash={} wants_hmu={} requested_count={} window={} outstanding={} recv_count={} total_parts={}",
+                    crate::hexrep(&self.hash, false),
+                    wants_hmu,
+                    requested_count,
+                    self.window,
+                    self.outstanding_parts,
+                    self.received_count,
+                    self.total_parts
+                );
+
                 let mut request_packet = Packet::new(
                     self.packet_destination(),
                     request_data,
@@ -958,17 +1039,21 @@ impl Resource {
                 map_hashes.push(map_hash);
             }
 
-            let search_start = self.receiver_min_consecutive_height;
-            let search_end = self.receiver_min_consecutive_height + ResourceAdvertisement::COLLISION_GUARD_SIZE;
-            for i in search_start..search_end.min(self.packets.len()) {
-                if let Some(map_hash) = &self.packets[i].map_hash {
+            let mut matched_packets = 0usize;
+            let mut fresh_sends = 0usize;
+            let mut resends = 0usize;
+
+            for packet in self.packets.iter_mut() {
+                if let Some(map_hash) = &packet.map_hash {
                     if map_hashes.iter().any(|h| h == map_hash) {
-                        let packet = &mut self.packets[i];
+                        matched_packets += 1;
                         if !packet.sent {
                             let _ = packet.send();
                             self.sent_parts += 1;
+                            fresh_sends += 1;
                         } else {
                             let _ = packet.resend();
+                            resends += 1;
                         }
                         self.last_activity = now();
                         self.last_part_sent = self.last_activity;
@@ -976,24 +1061,54 @@ impl Resource {
                 }
             }
 
+            eprintln!(
+                "[RESOURCE] handle_req hash={} wants_hmu={} requested_count={} matched={} fresh={} resend={} sent_parts={}/{}",
+                crate::hexrep(&self.hash, false),
+                wants_more_hashmap,
+                map_hashes.len(),
+                matched_packets,
+                fresh_sends,
+                resends,
+                self.sent_parts,
+                self.packets.len()
+            );
+
             if wants_more_hashmap {
                 let last_map_hash = request_data[1..Resource::MAPHASH_LEN + 1].to_vec();
-                let mut part_index = self.receiver_min_consecutive_height;
-                let search_end = self.receiver_min_consecutive_height + ResourceAdvertisement::COLLISION_GUARD_SIZE;
-                for i in self.receiver_min_consecutive_height..search_end.min(self.packets.len()) {
-                    if self.packets[i].map_hash.as_ref() == Some(&last_map_hash) {
-                        part_index = i + 1;
-                        break;
-                    }
-                }
+                let last_index = self
+                    .packets
+                    .iter()
+                    .rposition(|packet| packet.map_hash.as_ref() == Some(&last_map_hash));
 
-                self.receiver_min_consecutive_height = part_index.saturating_sub(1 + Resource::WINDOW_MAX);
-                if part_index % ResourceAdvertisement::HASHMAP_MAX_LEN != 0 {
+                let Some(last_index) = last_index else {
+                    eprintln!(
+                        "[RESOURCE] handle_req hash={} wants_hmu=true last_map_hash_not_found={}",
+                        crate::hexrep(&self.hash, false),
+                        crate::hexrep(&last_map_hash, false)
+                    );
                     self.cancel();
+                    return;
+                };
+
+                let part_index = last_index + 1;
+                self.receiver_min_consecutive_height = part_index.saturating_sub(1 + Resource::WINDOW_MAX);
+
+                let segment = if part_index % ResourceAdvertisement::HASHMAP_MAX_LEN == 0 {
+                    part_index / ResourceAdvertisement::HASHMAP_MAX_LEN
+                } else {
+                    (last_index / ResourceAdvertisement::HASHMAP_MAX_LEN) + 1
+                };
+
+                if segment >= self.hashmap_height {
+                    eprintln!(
+                        "[RESOURCE] handle_req hash={} wants_hmu=true no_next_segment segment={} hashmap_height={}",
+                        crate::hexrep(&self.hash, false),
+                        segment,
+                        self.hashmap_height
+                    );
                     return;
                 }
 
-                let segment = part_index / ResourceAdvertisement::HASHMAP_MAX_LEN;
                 let hashmap_start = segment * ResourceAdvertisement::HASHMAP_MAX_LEN;
                 let hashmap_end = std::cmp::min((segment + 1) * ResourceAdvertisement::HASHMAP_MAX_LEN, self.parts.len());
 
@@ -1022,6 +1137,12 @@ impl Resource {
 
                 if hmu_packet.send().is_ok() {
                     self.last_activity = now();
+                    eprintln!(
+                        "[RESOURCE] handle_req hash={} sent_hmu segment={} hashes={}",
+                        crate::hexrep(&self.hash, false),
+                        segment,
+                        hashmap_end.saturating_sub(hashmap_start)
+                    );
                 } else {
                     self.cancel();
                 }
@@ -1038,7 +1159,10 @@ impl Resource {
         }
     }
 
-    pub fn receive_part(&mut self, packet: &Packet) {
+    /// Returns (needs_request_next, needs_start_watchdog) so caller can defer
+    /// these operations to a background thread (they require link encryption
+    /// which would deadlock if called while the link lock is held).
+    pub fn receive_part(&mut self, packet: &Packet) -> (bool, bool) {
         let mut start_watchdog = false;
         let mut call_update_eifr = false;
         let mut call_request_next = false;
@@ -1048,6 +1172,10 @@ impl Resource {
             self.receiving_part = true;
             self.last_activity = now();
             self.retries_left = self.max_retries;
+            
+            eprintln!("[RESOURCE-RECV] receive_part data_len={} recv_count={}/{} hash={}", 
+                packet.data.len(), self.received_count, self.total_parts,
+                crate::hexrep(&self.hash, false));
 
             if self.req_resp.is_none() {
                 self.req_resp = Some(self.last_activity);
@@ -1081,10 +1209,14 @@ impl Resource {
                 self.status = ResourceStatus::Transferring;
                 let part_data = packet.data.clone();
                 let part_hash = self.get_map_hash(&part_data);
+                eprintln!("[RESOURCE-RECV] part_hash={} part_data_len={}", 
+                    crate::hexrep(&part_hash, false), part_data.len());
 
+                let mut matched = false;
                 let mut i = (self.consecutive_completed_height + 1).max(0) as usize;
                 for map_hash in self.hashmap_chunks(i, self.window) {
                     if map_hash == part_hash {
+                        matched = true;
                         if self.parts[i].is_none() {
                             self.parts[i] = Some(part_data.clone());
                             self.rtt_rxd_bytes += part_data.len();
@@ -1110,13 +1242,22 @@ impl Resource {
                 }
 
                 self.receiving_part = false;
+                
+                eprintln!("[RESOURCE-RECV] matched={} recv_count={}/{} assembly_lock={}", 
+                    matched, self.received_count, self.total_parts, self.assembly_lock);
 
                 if self.received_count == self.total_parts && !self.assembly_lock {
                     self.assembly_lock = true;
+                    eprintln!("[RESOURCE-RECV] spawning assembly thread");
                     let resource = Arc::new(Mutex::new(self.clone()));
                     thread::spawn(move || {
-                        if let Ok(mut r) = resource.lock() {
-                            r.assemble();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Ok(mut r) = resource.lock() {
+                                r.assemble();
+                            }
+                        }));
+                        if let Err(e) = result {
+                            eprintln!("[RESOURCE-ASM] ASSEMBLY THREAD PANICKED: {:?}", e);
                         }
                     });
                 } else if self.outstanding_parts == 0 {
@@ -1158,18 +1299,18 @@ impl Resource {
             }
         }
 
-        if start_watchdog {
-            self.watchdog_job();
-        }
+        // update_eifr is safe to call inline (no network I/O)
         if call_update_eifr {
             self.update_eifr();
         }
-        if call_request_next {
-            self.request_next();
-        }
+        // Return flags so caller can defer these to a background thread
+        // (they require link encryption which deadlocks if the link lock is held)
+        (call_request_next, start_watchdog)
     }
 
     pub fn assemble(&mut self) {
+        eprintln!("[RESOURCE-ASM] assemble start status={:?} encrypted={} compressed={} total_parts={}", 
+            self.status, self.encrypted, self.compressed, self.total_parts);
         if self.status != ResourceStatus::Failed {
             self.status = ResourceStatus::Assembling;
             let mut stream = Vec::new();
@@ -1178,9 +1319,20 @@ impl Resource {
                     stream.extend_from_slice(p);
                 }
             }
+            eprintln!("[RESOURCE-ASM] stream_len={}", stream.len());
 
             let mut data = if self.encrypted {
-                self.link.lock().unwrap().decrypt(&stream).unwrap_or(stream)
+                eprintln!("[RESOURCE-ASM] decrypting stream");
+                match self.link.lock().unwrap().decrypt(&stream) {
+                    Ok(d) => {
+                        eprintln!("[RESOURCE-ASM] decrypted to {} bytes", d.len());
+                        d
+                    },
+                    Err(e) => {
+                        eprintln!("[RESOURCE-ASM] decrypt FAILED: {}", e);
+                        stream
+                    }
+                }
             } else {
                 stream
             };
@@ -1188,17 +1340,27 @@ impl Resource {
             if data.len() >= Resource::RANDOM_HASH_SIZE {
                 data = data[Resource::RANDOM_HASH_SIZE..].to_vec();
             }
+            eprintln!("[RESOURCE-ASM] data_len_after_random_strip={}", data.len());
 
             if self.compressed {
                 let mut decoder = BzDecoder::new(&data[..]);
                 let mut decompressed = Vec::new();
                 if decoder.read_to_end(&mut decompressed).is_ok() {
+                    eprintln!("[RESOURCE-ASM] decompressed {} -> {} bytes", data.len(), decompressed.len());
                     data = decompressed;
+                } else {
+                    eprintln!("[RESOURCE-ASM] decompression FAILED");
                 }
             }
 
             let calculated_hash = identity::full_hash(&[data.clone(), self.random_hash.clone()].concat());
+            eprintln!("[RESOURCE-ASM] hash_match={} calc={} expected={}", 
+                calculated_hash == self.hash,
+                crate::hexrep(&calculated_hash, false),
+                crate::hexrep(&self.hash, false));
             if calculated_hash == self.hash {
+                // Set self.data to the assembled plaintext — needed by prove() and the callback
+                self.data = Some(data.clone());
                 let payload = if self.has_metadata && self.segment_index == 1 {
                     let metadata_size = ((data[0] as usize) << 16) | ((data[1] as usize) << 8) | data[2] as usize;
                     let packed_metadata = data[3..3 + metadata_size].to_vec();
@@ -1223,7 +1385,12 @@ impl Resource {
                 self.status = ResourceStatus::Corrupt;
             }
 
-            self.link.lock().unwrap().resource_concluded(Arc::new(Mutex::new(self.clone())));
+            eprintln!("[RESOURCE-ASM] calling link.resource_concluded, status={:?}", self.status);
+            let resource_arc = Arc::new(Mutex::new(self.clone()));
+            let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
+            if let Some(cb) = concluded_cb {
+                cb(resource_arc);
+            }
 
             if self.segment_index == self.total_segments {
                 if let Some(cb) = &self.callback {
@@ -1282,15 +1449,29 @@ impl Resource {
     }
 
     pub fn validate_proof(&mut self, proof_data: &[u8]) {
+        eprintln!("[RESOURCE-VP] validate_proof called hash={} status={:?} proof_len={}", crate::hexrep(&self.hash, false), self.status, proof_data.len());
         if self.status != ResourceStatus::Failed {
             if proof_data.len() == identity::HASHLENGTH / 8 * 2 {
                 if &proof_data[identity::HASHLENGTH / 8..] == self.expected_proof.as_slice() {
+                    eprintln!("[RESOURCE-VP] proof MATCHED, setting status=Complete");
                     self.status = ResourceStatus::Complete;
-                    self.link.lock().unwrap().resource_concluded(Arc::new(Mutex::new(self.clone())));
+                    eprintln!("[RESOURCE-VP] about to lock link for resource_concluded");
+                    let resource_arc = Arc::new(Mutex::new(self.clone()));
+                    let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
+                    if let Some(cb) = concluded_cb {
+                        eprintln!("[RESOURCE-VP] firing resource_concluded callback outside link lock");
+                        cb(resource_arc);
+                    }
+                    eprintln!("[RESOURCE-VP] resource_concluded done");
 
+                    eprintln!("[RESOURCE-VP] segment_index={} total_segments={}", self.segment_index, self.total_segments);
                     if self.segment_index == self.total_segments {
+                        let has_cb = self.callback.is_some();
+                        eprintln!("[RESOURCE-VP] has_callback={}", has_cb);
                         if let Some(cb) = &self.callback {
+                            eprintln!("[RESOURCE-VP] firing resource callback");
                             cb(Arc::new(Mutex::new(self.clone())));
+                            eprintln!("[RESOURCE-VP] resource callback returned");
                         }
 
                         if let Some(file) = &mut self.input_file {
@@ -1318,6 +1499,8 @@ impl Resource {
             } else {
                 eprintln!("[RESOURCE] unexpected proof length={} for hash={}", proof_data.len(), crate::hexrep(&self.hash, false));
             }
+        } else {
+            eprintln!("[RESOURCE-VP] skipping validate_proof: status is Failed");
         }
     }
 
@@ -1346,7 +1529,11 @@ impl Resource {
             }
 
             if let Some(cb) = &self.callback {
-                self.link.lock().unwrap().resource_concluded(Arc::new(Mutex::new(self.clone())));
+                let resource_arc = Arc::new(Mutex::new(self.clone()));
+                let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
+                if let Some(ccb) = concluded_cb {
+                    ccb(resource_arc.clone());
+                }
                 cb(Arc::new(Mutex::new(self.clone())));
             }
         }
@@ -1358,7 +1545,11 @@ impl Resource {
                 self.status = ResourceStatus::Rejected;
                 self.link.lock().unwrap().cancel_outgoing_resource(Arc::new(Mutex::new(self.clone())));
                 if let Some(cb) = &self.callback {
-                    self.link.lock().unwrap().resource_concluded(Arc::new(Mutex::new(self.clone())));
+                    let resource_arc = Arc::new(Mutex::new(self.clone()));
+                    let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
+                    if let Some(ccb) = concluded_cb {
+                        ccb(resource_arc.clone());
+                    }
                     cb(Arc::new(Mutex::new(self.clone())));
                 }
             }

@@ -669,6 +669,7 @@ impl Transport {
         ) {
             Ok(mut path_request_dest) => {
                 path_request_dest.set_packet_callback(None);
+                eprintln!("[TRANSPORT] path_request control hash = {}", crate::hexrep(&path_request_dest.hash, false));
                 state.control_hashes.push(path_request_dest.hash.clone());
                 state.control_destinations.push(path_request_dest);
             }
@@ -862,14 +863,19 @@ impl Transport {
     }
 
     pub fn path_request_handler(data: &[u8], packet: &Packet) {
+        use std::io::Write;
         // Path request handler for path request control destination
         // Parses incoming path requests and invokes path_request workflow
+        eprintln!("[PATH_REQ_HANDLER] enter, data_len={}", data.len());
+        let _ = std::io::stderr().flush();
         
         if data.len() < crate::reticulum::TRUNCATED_HASHLENGTH / 8 {
+            eprintln!("[PATH_REQ_HANDLER] data too short, returning");
             return;
         }
 
         let destination_hash = &data[0..crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+        eprintln!("[PATH_REQ_HANDLER] destination_hash={}", crate::hexrep(destination_hash, false));
         
         // Extract requesting transport instance ID if present
         let requesting_transport_instance = if data.len() > (crate::reticulum::TRUNCATED_HASHLENGTH / 8) * 2 {
@@ -896,18 +902,26 @@ impl Transport {
             }
         }
         
+        eprintln!("[PATH_REQ_HANDLER] has_tag={} has_transport_id={}", tag_bytes.is_some(), requesting_transport_instance.is_some());
+        let _ = std::io::stderr().flush();
+        
         if let Some(tag_bytes) = tag_bytes {
             let unique_tag = [destination_hash, tag_bytes.as_slice()].concat();
             
-            let state = TRANSPORT.lock().unwrap();
-            if !state.discovery_pr_tags.contains(&unique_tag) {
-                drop(state);
-                
+            let is_new = {
                 let mut state = TRANSPORT.lock().unwrap();
-                state.discovery_pr_tags.push(unique_tag);
+                if !state.discovery_pr_tags.contains(&unique_tag) {
+                    state.discovery_pr_tags.push(unique_tag);
+                    true
+                } else {
+                    false
+                }
+            };
+            
+            if is_new {
                 let is_from_local_client = Transport::from_local_client(packet);
-                drop(state);
                 
+                eprintln!("[PATH_REQ_HANDLER] calling path_request for {}", crate::hexrep(destination_hash, false));
                 Transport::path_request(
                     destination_hash.to_vec(),
                     is_from_local_client,
@@ -915,14 +929,15 @@ impl Transport {
                     requesting_transport_instance.map(|b| b.to_vec()),
                     Some(tag_bytes),
                 );
+                eprintln!("[PATH_REQ_HANDLER] path_request returned");
             } else {
-                drop(state);
-                log(&format!("Ignoring duplicate path request for {} with tag {}", 
-                    crate::hexrep(destination_hash, true), crate::hexrep(&unique_tag, true)), LOG_DEBUG, false, false);
+                eprintln!("[PATH_REQ_HANDLER] duplicate tag, ignoring");
             }
         } else {
-            log(&format!("Ignoring tagless path request for {}", crate::hexrep(destination_hash, true)), LOG_DEBUG, false, false);
+            eprintln!("[PATH_REQ_HANDLER] tagless path request, ignoring");
         }
+        eprintln!("[PATH_REQ_HANDLER] exit");
+        let _ = std::io::stderr().flush();
     }
     
     fn from_local_client(packet: &Packet) -> bool {
@@ -946,18 +961,15 @@ impl Transport {
             .map(|i| format!(" on {}", i))
             .unwrap_or_default();
 
-        log(
-            &format!(
-                "Path request for {}{}",
-                crate::hexrep(&destination_hash, true),
-                interface_str
-            ),
-            LOG_DEBUG,
-            false,
-            false,
+        eprintln!(
+            "[PATH_REQUEST] for {}{} is_from_local_client={}",
+            crate::hexrep(&destination_hash, false),
+            interface_str,
+            is_from_local_client
         );
 
         let mut state = TRANSPORT.lock().unwrap();
+        eprintln!("[PATH_REQUEST] num_destinations={} transport_enabled={}", state.destinations.len(), state.transport_enabled);
         let mut should_search_for_unknown = false;
         if let Some(attached_name) = attached_interface.as_ref() {
             if state.transport_enabled {
@@ -1001,20 +1013,17 @@ impl Transport {
             .destinations
             .iter()
             .position(|dest| dest.hash == destination_hash);
+        eprintln!("[PATH_REQUEST] local_dest_index={:?}", local_dest_index);
+        for (i, dest) in state.destinations.iter().enumerate() {
+            eprintln!("[PATH_REQUEST]   dest[{}] hash={}", i, crate::hexrep(&dest.hash, false));
+        }
         if let Some(idx) = local_dest_index {
-            log(
-                &format!(
-                    "Answering path request for {}{}, destination is local to this system",
-                    crate::hexrep(&destination_hash, true),
-                    interface_str
-                ),
-                LOG_DEBUG,
-                false,
-                false,
-            );
+            eprintln!("[PATH_REQUEST] answering - destination is local");
             if let Some(mut dest) = state.destinations.get(idx).cloned() {
                 drop(state);
-                let _ = dest.announce(None, true, attached_interface, tag, true);
+                eprintln!("[PATH_REQUEST] calling dest.announce(path_response=true)");
+                let result = dest.announce(None, true, attached_interface, tag, true);
+                eprintln!("[PATH_REQUEST] dest.announce returned: {:?}", result.is_ok());
                 let mut state = TRANSPORT.lock().unwrap();
                 if idx < state.destinations.len() {
                     state.destinations[idx] = dest;
@@ -1023,6 +1032,7 @@ impl Transport {
             return;
         }
 
+        eprintln!("[PATH_REQUEST] destination NOT local, checking path_table");
         if (state.transport_enabled || is_from_local_client)
             && state.path_table.contains_key(&destination_hash)
         {
@@ -2612,6 +2622,15 @@ impl Transport {
         }
     }
 
+    /// Update an already-registered destination (e.g. after ratchet rotation).
+    /// Replaces the existing entry with the same hash.
+    pub fn update_destination(destination: Destination) {
+        let mut state = TRANSPORT.lock().unwrap();
+        if let Some(existing) = state.destinations.iter_mut().find(|d| d.hash == destination.hash) {
+            *existing = destination;
+        }
+    }
+
     pub fn deregister_destination(destination_hash: &[u8]) {
         let mut state = TRANSPORT.lock().unwrap();
         state.destinations.retain(|d| d.hash != destination_hash);
@@ -2648,12 +2667,17 @@ impl Transport {
     }
 
     pub fn inbound(raw: Vec<u8>, receiving_interface: Option<String>) -> bool {
+        eprintln!("[INBOUND] raw={} bytes from {:?}", raw.len(), receiving_interface);
         let mut packet = Packet::new(None, Vec::new(), 0, 0, BROADCAST, crate::packet::HEADER_1, None, None, false, 0);
         packet.raw = raw;
         packet.receiving_interface = receiving_interface;
         if !packet.unpack() {
+            eprintln!("[INBOUND] unpack FAILED");
             return false;
         }
+        eprintln!("[INBOUND] unpacked ptype={} ctx={} hops={} dest_hash={:?}",
+            packet.packet_type, packet.context, packet.hops,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)));
         packet.hops = packet.hops.saturating_add(1);
 
         // Inline packet_filter + control destination check in a single lock acquisition
@@ -2692,9 +2716,13 @@ impl Transport {
             } else {
                 // --- control destination check (done while we already hold the lock) ---
                 let ctrl = packet.destination_hash.as_ref().and_then(|dh| {
-                    if state.control_hashes.contains(dh) {
+                    let in_control = state.control_hashes.contains(dh);
+                    eprintln!("[INBOUND] control check: dest_hash={} in_control_hashes={} num_control_hashes={}",
+                        crate::hexrep(dh, false), in_control, state.control_hashes.len());
+                    if in_control {
                         for control_dest in &state.control_destinations {
                             if &control_dest.hash == dh && control_dest.app_name == APP_NAME {
+                                eprintln!("[INBOUND] matched control dest aspects={:?}", control_dest.aspects);
                                 return Some(control_dest.aspects.clone());
                             }
                         }
@@ -2708,6 +2736,7 @@ impl Transport {
         };
 
         if !filter_pass {
+            eprintln!("[INBOUND] FILTERED OUT ptype={} ctx={}", packet.packet_type, packet.context);
             return false;
         }
 
@@ -3222,7 +3251,34 @@ impl Transport {
         }
 
         for (mut destination, destination_packet) in deferred_destination_receives {
-            let _ = destination.receive(&destination_packet);
+            match destination.receive(&destination_packet) {
+                Ok(handled) => {
+                    eprintln!("[TRANSPORT] destination.receive handled={} dest={} ptype={} ctx={}",
+                        handled, crate::hexrep(&destination.hash, false),
+                        destination_packet.packet_type, destination_packet.context);
+                    if handled {
+                        // Generate proof based on destination's proof strategy
+                        if destination.proof_strategy == crate::destination::PROVE_ALL {
+                            if let Err(e) = destination_packet.prove(Some(&destination)) {
+                                eprintln!("[TRANSPORT] proof generation failed: {}", e);
+                            }
+                        } else if destination.proof_strategy == crate::destination::PROVE_APP {
+                            if let Some(cb) = destination.callbacks.proof_requested.clone() {
+                                if cb(&destination_packet) {
+                                    if let Err(e) = destination_packet.prove(Some(&destination)) {
+                                        eprintln!("[TRANSPORT] proof generation failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[TRANSPORT] destination.receive FAILED dest={} ptype={} ctx={}: {}",
+                        crate::hexrep(&destination.hash, false),
+                        destination_packet.packet_type, destination_packet.context, e);
+                }
+            }
         }
 
         for link_packet in deferred_link_packets {

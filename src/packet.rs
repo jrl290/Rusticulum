@@ -207,10 +207,10 @@ impl Packet {
 
             let ciphertext: Result<Vec<u8>, String> = if self.packet_type == ANNOUNCE
                 || self.packet_type == LINKREQUEST
-                || (self.packet_type == PROOF && self.context == RESOURCE_PRF)
-                || (self.packet_type == PROOF && destination.dest_type == DestinationType::Link)
+                || self.packet_type == PROOF
                 || self.context == RESOURCE
                 || self.context == KEEPALIVE
+                || self.context == LINKIDENTIFY
                 || self.context == CACHE_REQUEST
             {
                 Ok(self.data.clone())
@@ -402,25 +402,71 @@ impl Packet {
         // In a full implementation, would also query reticulum.get_packet_q(packet_hash)
     }
 
-    /// Generate a proof for this packet
-    pub fn prove(&self, _destination: Option<&Destination>) -> Result<(), String> {
+    /// Generate a proof for this packet.
+    /// `proving_destination` is the local destination that received this packet
+    /// and has the identity private key needed to sign.
+    pub fn prove(&self, proving_destination: Option<&Destination>) -> Result<(), String> {
         if !self.from_packed {
             return Err("Can only prove packets constructed from raw data".to_string());
         }
 
-        if let Some(dest) = self.destination.as_ref() {
-            if let Some(_identity) = &dest.identity {
-                // Would check if identity has private key
-                // if identity.has_private_key() {
-                    // Would call identity.prove(self, destination)
-                    log("Proof generation not yet implemented", LOG_DEBUG, false, false);
-                    return Ok(());
-                // }
+        let packet_hash = self.packet_hash.as_ref()
+            .ok_or("Packet has no hash for proving")?;
+
+        // Get identity from the proving destination (preferred) or from self.destination
+        let identity = if let Some(dest) = proving_destination {
+            dest.identity.as_ref()
+        } else if let Some(dest) = self.destination.as_ref() {
+            dest.identity.as_ref()
+        } else {
+            None
+        }.ok_or("No identity available for proving packet")?;
+
+        // Sign the packet hash
+        let signature = identity.sign(packet_hash);
+
+        // Build proof data
+        let proof_data = if crate::reticulum::should_use_implicit_proof() {
+            signature
+        } else {
+            let mut data = packet_hash.clone();
+            data.extend_from_slice(&signature);
+            data
+        };
+
+        // ProofDestination: hash = truncated hash of this packet, dest_type = Single
+        let proof_dest_hash = self.get_truncated_hash();
+        let proof_destination = Destination {
+            hash: proof_dest_hash,
+            dest_type: DestinationType::Single,
+            ..Default::default()
+        };
+
+        // Create and send PROOF packet on same interface the original arrived on
+        let mut proof_packet = Packet::new(
+            Some(proof_destination),
+            proof_data,
+            PROOF,
+            NONE,
+            crate::transport::BROADCAST,
+            HEADER_1,
+            None,
+            self.receiving_interface.clone(),
+            false,
+            FLAG_UNSET,
+        );
+
+        match proof_packet.send() {
+            Ok(_) => {
+                eprintln!("[PROOF] sent proof for packet {}",
+                    crate::hexrep(self.packet_hash.as_ref().unwrap(), false));
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[PROOF] failed to send proof: {}", e);
+                Err(format!("Failed to send proof: {}", e))
             }
         }
-
-        // In full implementation, might also handle Link-based proofs
-        Err("Cannot prove packet without valid identity or link".to_string())
     }
 
     /// Generate a special proof destination for directing proofs back to sender
