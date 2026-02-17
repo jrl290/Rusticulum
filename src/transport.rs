@@ -2223,7 +2223,7 @@ impl Transport {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Some(target_hash) = decode_hex(name) {
+                    if let Some(target_hash) = crate::decode_hex(name) {
                         if !active_paths.contains(&target_hash) {
                             let _ = fs::remove_file(path);
                         }
@@ -3458,31 +3458,6 @@ fn ensure_paths() {
     }
     if !blackhole.exists() {
         let _ = fs::create_dir_all(&blackhole);
-    }
-}
-
-fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(value.len() / 2);
-    let bytes = value.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = from_hex_digit(bytes[i])?;
-        let lo = from_hex_digit(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Some(out)
-}
-
-fn from_hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
     }
 }
 

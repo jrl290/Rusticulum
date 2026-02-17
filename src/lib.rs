@@ -268,6 +268,34 @@ pub fn hexrep(data: &[u8], delimit: bool) -> String {
         .join(delimiter)
 }
 
+/// Decode a hex string into bytes. Returns `None` if the string has odd length
+/// or contains non-hex characters.
+pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = match bytes[i] {
+            b'0'..=b'9' => bytes[i] - b'0',
+            b'a'..=b'f' => bytes[i] - b'a' + 10,
+            b'A'..=b'F' => bytes[i] - b'A' + 10,
+            _ => return None,
+        };
+        let lo = match bytes[i + 1] {
+            b'0'..=b'9' => bytes[i + 1] - b'0',
+            b'a'..=b'f' => bytes[i + 1] - b'a' + 10,
+            b'A'..=b'F' => bytes[i + 1] - b'A' + 10,
+            _ => return None,
+        };
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
 pub fn prettyhexrep(data: &[u8]) -> String {
     format!("<{}>", hexrep(data, false))
 }
