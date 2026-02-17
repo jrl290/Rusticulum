@@ -13,5 +13,6 @@ pub mod rnode_interface;
 pub use interface::Interface;
 pub use local_interface::{LocalClientInterface, LocalServerInterface};
 pub use pipe_interface::PipeInterface;
+pub use rnode_interface::RNodeInterface;
 pub use tcp_interface::{TcpClientInterface, TcpServerInterface};
 pub use udp_interface::UdpInterface;

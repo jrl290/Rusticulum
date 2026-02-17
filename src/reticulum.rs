@@ -2,6 +2,7 @@ use crate::config::{default_config_lines, Config, ConfigSection};
 use crate::identity::Identity;
 use crate::interfaces::interface::InterfaceMode;
 use crate::interfaces::Interface;
+use crate::interfaces::RNodeInterface;
 use crate::{log, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING};
 use hkdf::Hkdf;
 use once_cell::sync::Lazy;
@@ -230,7 +231,7 @@ enum SystemInterface {
     BackboneClient(Arc<Mutex<crate::interfaces::backbone_interface::BackboneClientInterface>>),
     I2P(Arc<Mutex<crate::interfaces::i2p::I2PInterface>>),
     I2PPeer(Arc<Mutex<crate::interfaces::i2p::I2PInterfacePeer>>),
-    RNode(Arc<Mutex<crate::interfaces::rnode_interface::RNodeInterface>>),
+    RNode(Arc<Mutex<RNodeInterface>>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1733,7 +1734,7 @@ impl Reticulum {
                     let id_interval = config.get_int("id_interval").map(|v| Duration::from_secs(v as u64));
                     let id_callsign = config.get("id_callsign").map(|s| s.as_bytes().to_vec());
 
-                    match crate::interfaces::rnode_interface::RNodeInterface::new(
+                    match RNodeInterface::new(
                         name,
                         &port,
                         frequency,
@@ -1751,7 +1752,7 @@ impl Reticulum {
                             let interface = Arc::new(Mutex::new(interface));
 
                             // Start read loop FIRST so it can process detect/config responses
-                            crate::interfaces::rnode_interface::RNodeInterface::start_read_loop(
+                            RNodeInterface::start_read_loop(
                                 Arc::clone(&interface),
                                 Arc::new(Mutex::new(crate::transport::Transport)),
                             );
@@ -1759,7 +1760,7 @@ impl Reticulum {
                             // Configure the radio (detect, set params, go online)
                             // Uses _shared variant that releases the outer lock between
                             // steps so the read loop can process serial responses.
-                            if let Err(err) = crate::interfaces::rnode_interface::RNodeInterface::configure_device_shared(&interface) {
+                            if let Err(err) = RNodeInterface::configure_device_shared(&interface) {
                                 log(
                                     &format!("Failed to configure RNode device {}: {}", name, err),
                                     LOG_ERROR,
