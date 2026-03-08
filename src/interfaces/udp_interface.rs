@@ -178,6 +178,9 @@ impl UdpInterface {
 
     /// Process outgoing data - send via UDP
     pub fn process_outgoing(&mut self, data: Vec<u8>) -> Result<(), String> {
+        // Apply forced bitrate delay if set
+        self.base.enforce_bitrate(data.len());
+
         let forward_addr = format!("{}:{}", self.forward_ip, self.forward_port);
         let addr: SocketAddr = forward_addr.parse()
             .map_err(|e| format!("Invalid forward address {}: {}", forward_addr, e))?;

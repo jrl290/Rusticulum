@@ -3,7 +3,7 @@ use crate::identity::Identity;
 use crate::identity::{full_hash, truncated_hash, HASHLENGTH, SIGLENGTH};
 use crate::reticulum;
 use crate::transport::Transport;
-use crate::{log, LOG_DEBUG, LOG_ERROR};
+use crate::{log, LOG_ERROR};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -553,8 +553,8 @@ impl PacketReceipt {
     pub const IMPL_LENGTH: usize = SIGLENGTH / 8;
 
     pub fn new(packet: &Packet) -> Self {
-        let hash = packet.get_hash();
-        let truncated = packet.get_truncated_hash();
+        let _hash = packet.get_hash();
+        let _truncated = packet.get_truncated_hash();
         let destination = packet.destination.clone().unwrap_or_default();
         let timeout = if destination.dest_type == DestinationType::Link {
             destination
@@ -708,9 +708,12 @@ impl PacketReceipt {
 
     pub fn check_timeout(&mut self) {
         if self.status == PacketReceipt::SENT && self.is_timed_out() {
+            let age = now_seconds() - self.sent_at;
             if self.timeout == -1.0 {
                 self.status = PacketReceipt::CULLED;
             } else {
+                crate::log(&format!("Receipt TIMEOUT hash={} timeout={:.3}s age={:.3}s",
+                    crate::hexrep(&self.hash, false), self.timeout, age), crate::LOG_WARNING, false, false);
                 self.status = PacketReceipt::FAILED;
             }
             self.concluded_at = Some(now_seconds());

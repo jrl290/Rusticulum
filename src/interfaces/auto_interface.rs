@@ -1132,6 +1132,8 @@ pub struct AutoInterfacePeer {
     pub rxb: u64,
     pub txb: u64,
     pub parent: AutoInterfaceShared,
+    /// Experimental: force bitrate throttle on outgoing data
+    pub _force_bitrate: bool,
 }
 
 impl AutoInterfacePeer {
@@ -1152,6 +1154,7 @@ impl AutoInterfacePeer {
             rxb: 0,
             txb: 0,
             parent,
+            _force_bitrate: false,
         }
     }
 
@@ -1202,6 +1205,16 @@ impl AutoInterfacePeer {
     pub fn process_outgoing(&mut self, data: &[u8]) {
         if !self.online {
             return;
+        }
+
+        // Apply forced bitrate delay if set
+        if self._force_bitrate {
+            if let Some(bitrate) = self.parent.bitrate {
+                if bitrate > 0 {
+                    let delay_secs = (data.len() as f64 / bitrate as f64) * 8.0;
+                    std::thread::sleep(std::time::Duration::from_secs_f64(delay_secs));
+                }
+            }
         }
 
         let peer_ip = match self.addr.parse::<Ipv6Addr>() {

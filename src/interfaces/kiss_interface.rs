@@ -531,6 +531,9 @@ impl KissInterface {
             self.flow_control_locked = now();
         }
 
+        // Apply forced bitrate delay if set
+        self.base.enforce_bitrate(data.len());
+
         let escaped = Kiss::escape(&data);
         let mut frame = Vec::with_capacity(escaped.len() + 3);
         frame.push(Kiss::FEND);

@@ -215,6 +215,9 @@ impl PipeInterface {
             return Err("Pipe interface is offline".to_string());
         }
 
+        // Apply forced bitrate delay if set
+        self.base.enforce_bitrate(data.len());
+
         // Frame data: FLAG + escaped_data + FLAG
         let mut framed = vec![Hdlc::FLAG];
         framed.extend_from_slice(&Hdlc::escape(&data));

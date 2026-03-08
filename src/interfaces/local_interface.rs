@@ -52,7 +52,6 @@ pub struct LocalClientInterface {
     transmit_buffer: Vec<u8>,
     socket: Option<Box<dyn SocketTrait>>,
     writing: bool,
-    pub force_bitrate: bool,
 }
 
 // Socket trait to abstract over TCP and Unix sockets
@@ -118,7 +117,6 @@ impl LocalClientInterface {
             transmit_buffer: Vec::new(),
             socket: Some(Box::new(socket)),
             writing: false,
-            force_bitrate: false,
         }
     }
 
@@ -147,7 +145,6 @@ impl LocalClientInterface {
             transmit_buffer: Vec::new(),
             socket: Some(Box::new(socket)),
             writing: false,
-            force_bitrate: false,
         }
     }
 
@@ -192,7 +189,6 @@ impl LocalClientInterface {
             transmit_buffer: Vec::new(),
             socket: None,
             writing: false,
-            force_bitrate: false,
         }
     }
 
@@ -280,10 +276,7 @@ impl LocalClientInterface {
         self.writing = true;
 
         // Apply forced bitrate delay if set
-        if self.force_bitrate {
-            let delay_secs = (data.len() as f64 / self.base.bitrate as f64) * 8.0;
-            thread::sleep(Duration::from_secs_f64(delay_secs));
-        }
+        self.base.enforce_bitrate(data.len());
 
         // Frame data with HDLC
         let mut framed = vec![Hdlc::FLAG];

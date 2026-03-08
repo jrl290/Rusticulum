@@ -43,11 +43,11 @@ pub const LOG_CALLBACK: i32 = 0x93;
 
 pub const LOG_MAXSIZE: u64 = 5 * 1024 * 1024;
 
-struct LogState {
-    loglevel: i32,
-    logfile: Option<String>,
-    logdest: i32,
-    logcall: Option<Arc<dyn Fn(String) + Send + Sync>>,
+pub struct LogState {
+    pub loglevel: i32,
+    pub logfile: Option<String>,
+    pub logdest: i32,
+    pub logcall: Option<Arc<dyn Fn(String) + Send + Sync>>,
     logtimefmt: String,
     logtimefmt_p: String,
     compact_log_fmt: bool,
@@ -243,6 +243,7 @@ fn append_log(path: &str, line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn now_seconds() -> f64 {
     let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
     since.as_secs() as f64 + (since.subsec_nanos() as f64 / 1_000_000_000.0)

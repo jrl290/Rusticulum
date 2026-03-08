@@ -23,6 +23,7 @@ const KISS_CMD_DATA: u8 = 0x00;
 // I2P interface constants
 #[allow(dead_code)]
 const I2P_USER_TIMEOUT: u64 = 45;
+#[allow(dead_code)]
 const I2P_PROBE_AFTER: u64 = 10;
 #[allow(dead_code)]
 const I2P_PROBE_INTERVAL: u64 = 9;
@@ -62,6 +63,8 @@ pub struct I2PInterfacePeer {
     pub hw_mtu: usize,
     pub mode: InterfaceMode,
     pub bitrate: u64,
+    /// Experimental: force bitrate throttle on outgoing data
+    pub _force_bitrate: bool,
     pub ifac_size: Option<usize>,
     pub ifac_netname: Option<String>,
     pub ifac_netkey: Option<String>,
@@ -106,6 +109,7 @@ impl I2PInterfacePeer {
             hw_mtu: 1064,
             mode: InterfaceMode::Full,
             bitrate: 256 * 1000,
+            _force_bitrate: false,
             ifac_size,
             ifac_netname: ifac_netname.clone(),
             ifac_netkey: ifac_netkey.clone(),
@@ -164,6 +168,7 @@ impl I2PInterfacePeer {
             hw_mtu: 1064,
             mode: InterfaceMode::Full,
             bitrate: 256 * 1000,
+            _force_bitrate: false,
             ifac_size,
             ifac_netname: ifac_netname.clone(),
             ifac_netkey: ifac_netkey.clone(),
@@ -313,11 +318,13 @@ impl I2PInterfacePeer {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[allow(dead_code)]
     fn set_timeouts_linux(_socket: &TcpStream) -> io::Result<()> {
         Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[allow(dead_code)]
     fn set_timeouts_macos(_socket: &TcpStream) -> io::Result<()> {
         Ok(())
     }
@@ -352,6 +359,12 @@ impl I2PInterfacePeer {
     }
 
     pub fn process_outgoing(&self, data: &[u8], _transport: &Transport) -> io::Result<()> {
+        // Apply forced bitrate delay if set
+        if self._force_bitrate && self.bitrate > 0 {
+            let delay_secs = (data.len() as f64 / self.bitrate as f64) * 8.0;
+            thread::sleep(Duration::from_secs_f64(delay_secs));
+        }
+
         let mut inner = self.inner.lock().unwrap();
         
         if !inner.online {

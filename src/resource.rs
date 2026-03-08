@@ -211,7 +211,16 @@ impl Resource {
         resource.encrypted = adv.e;
         resource.compressed = adv.c;
         resource.initiator = false;
-        resource.total_parts = ((resource.size as f64) / (resource.sdu as f64)).ceil() as usize;
+        // Use the sender's advertised total_parts (adv.n) directly, NOT a
+        // local recalculation from size/sdu.  If our link's MTU differs from
+        // the sender's (e.g. because the cloned link fell back to the base
+        // MTU), a local ceil(size/sdu) would produce too many parts, causing
+        // the receiver to request a hashmap update at a non-boundary index.
+        // The Python sender treats that as a sequencing error and cancels.
+        resource.total_parts = adv.n as usize;
+        crate::log(&format!("[RESOURCE] accept size={} parts={} hash={}",
+            resource.size, resource.total_parts,
+            crate::hexrep(&resource.hash, false)), crate::LOG_DEBUG, false, false);
         resource.received_count = 0;
         resource.outstanding_parts = 0;
         resource.parts = vec![None; resource.total_parts];
@@ -387,15 +396,17 @@ impl Resource {
             receive_lock: Arc::new(Mutex::new(())),
         };
 
-        resource.prepare_metadata(metadata, sent_metadata_size)?;
-        resource.prepare_data(data, original_hash)?;
-
+        // Set SDU from link MTU BEFORE prepare_data, so total_parts is
+        // calculated with the same SDU that prepare_outgoing will use.
         let link_mtu = resource.link.lock().ok().and_then(|l| l.mtu());
         if let Some(mtu) = link_mtu {
             resource.sdu = mtu.saturating_sub(reticulum::HEADER_MAXSIZE + reticulum::IFAC_MIN_SIZE);
         } else {
             resource.sdu = Resource::SDU;
         }
+
+        resource.prepare_metadata(metadata, sent_metadata_size)?;
+        resource.prepare_data(data, original_hash)?;
 
         resource.max_retries = Resource::MAX_RETRIES;
         resource.max_adv_retries = Resource::MAX_ADV_RETRIES;
@@ -430,7 +441,8 @@ impl Resource {
 
     fn prepare_metadata(&mut self, metadata: Option<Vec<u8>>, sent_metadata_size: usize) -> Result<(), String> {
         if let Some(meta) = metadata {
-            let packed = to_vec_named(&meta).map_err(|e| e.to_string())?;
+            // Use ByteBuf to serialize as msgpack binary, matching Python's umsgpack behavior
+            let packed = to_vec_named(&serde_bytes::ByteBuf::from(meta)).map_err(|e| e.to_string())?;
             if packed.len() > Resource::METADATA_MAX_SIZE {
                 return Err("Resource metadata size exceeded".to_string());
             }
@@ -622,6 +634,14 @@ impl Resource {
         self.hashmap = hashmap;
         self.packets = packets;
 
+        // Set hashmap_height to the total number of hashmap segments so the
+        // sender correctly responds to hashmap-update requests from the
+        // receiver.  Without this, hashmap_height stays at 0 and every HMU
+        // request is silently rejected, stalling transfers that need more
+        // than HASHMAP_MAX_LEN (~74) parts.
+        self.hashmap_height = (self.total_parts + ResourceAdvertisement::HASHMAP_MAX_LEN - 1)
+            / ResourceAdvertisement::HASHMAP_MAX_LEN;
+
         if advertise {
             self.advertise();
         }
@@ -651,6 +671,97 @@ impl Resource {
                 }
             });
         }
+    }
+
+    /// Advertise using a shared Arc so that the registered outgoing resource,
+    /// the watchdog, and the advertise thread all operate on the SAME instance.
+    /// This avoids the stale-clone problem where disconnected copies diverge
+    /// in state, causing premature cancellation of large transfers.
+    pub fn advertise_shared(resource_arc: Arc<Mutex<Self>>) {
+        // Optionally prepare next segment in background
+        let needs_next = {
+            if let Ok(r) = resource_arc.lock() {
+                r.segment_index < r.total_segments
+            } else {
+                false
+            }
+        };
+        if needs_next {
+            let arc_for_prep = resource_arc.clone();
+            thread::spawn(move || {
+                if let Ok(mut r) = arc_for_prep.lock() {
+                    r.prepare_next_segment();
+                }
+            });
+        }
+
+        let arc_for_adv = resource_arc.clone();
+        thread::spawn(move || {
+            // Wait until the link is ready for a new resource
+            loop {
+                let ready = {
+                    if let Ok(r) = arc_for_adv.lock() {
+                        r.link.lock().map(|l| l.ready_for_new_resource()).unwrap_or(false)
+                    } else {
+                        return;
+                    }
+                };
+                if ready {
+                    break;
+                }
+                if let Ok(mut r) = arc_for_adv.lock() {
+                    r.status = ResourceStatus::Queued;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+
+            // Build and send advertisement
+            let send_ok = {
+                let mut r = match arc_for_adv.lock() {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let adv = ResourceAdvertisement::new_from_resource(&r);
+                let packed = adv.pack(0).unwrap_or_default();
+                let mut packet = Packet::new(
+                    r.packet_destination(),
+                    packed,
+                    crate::packet::DATA,
+                    RESOURCE_ADV,
+                    BROADCAST,
+                    crate::packet::HEADER_1,
+                    None,
+                    None,
+                    false,
+                    0,
+                );
+
+                if packet.send().is_ok() {
+                    r.last_activity = now();
+                    r.started_transferring = Some(r.last_activity);
+                    r.adv_sent = r.last_activity;
+                    r.rtt = None;
+                    r.status = ResourceStatus::Advertised;
+                    r.retries_left = r.max_adv_retries;
+                    true
+                } else {
+                    r.cancel();
+                    false
+                }
+            };
+
+            if !send_ok {
+                return;
+            }
+
+            // Register the SAME Arc with the link (not a clone)
+            if let Ok(r) = arc_for_adv.lock() {
+                r.link.lock().unwrap().register_outgoing_resource(arc_for_adv.clone());
+            }
+
+            // Start watchdog on the SAME Arc
+            Resource::start_watchdog(arc_for_adv);
+        });
     }
 
     fn advertise_job(&mut self) {
@@ -713,8 +824,12 @@ impl Resource {
             };
 
             loop {
-                // Lock, read state, compute action, mutate if needed, then unlock before sleeping
-                let sleep_time = {
+                // Lock, read state, compute action, mutate if needed, then unlock before sleeping.
+                // IMPORTANT: We must NOT call packet.send() while holding the resource lock,
+                // because send() acquires the link lock (via encrypt), and the TCP reader
+                // thread acquires locks in the opposite order (link → resource), causing deadlock.
+                // Instead, we prepare packets inside the lock and send them after dropping it.
+                let (sleep_time, pending_packet) = {
                     let mut r = match resource_arc.lock() {
                         Ok(r) => r,
                         Err(_) => break,
@@ -738,12 +853,12 @@ impl Resource {
                             if st < 0.0 {
                                 if r.retries_left == 0 {
                                     r.cancel();
-                                    0.001
+                                    (0.001, None)
                                 } else {
                                     r.retries_left -= 1;
                                     let adv = ResourceAdvertisement::new_from_resource(&r);
                                     let packed = adv.pack(0).unwrap_or_default();
-                                    let mut packet = Packet::new(
+                                    let packet = Packet::new(
                                         r.packet_destination(),
                                         packed,
                                         crate::packet::DATA,
@@ -755,13 +870,13 @@ impl Resource {
                                         false,
                                         0,
                                     );
-                                    let _ = packet.send();
+                                    // Don't send here — defer until lock is dropped
                                     r.last_activity = now();
                                     r.adv_sent = r.last_activity;
-                                    0.001
+                                    (0.001, Some(packet))
                                 }
                             } else {
-                                st
+                                (st, None)
                             }
                         }
                         ResourceStatus::Transferring => {
@@ -790,14 +905,14 @@ impl Resource {
                                         }
                                         r.retries_left -= 1;
                                         r.waiting_for_hmu = false;
-                                        r.request_next();
-                                        0.001
+                                        let packet = r.prepare_request_next();
+                                        (0.001, packet)
                                     } else {
                                         r.cancel();
-                                        0.001
+                                        (0.001, None)
                                     }
                                 } else {
-                                    st
+                                    (st, None)
                                 }
                             } else {
                                 let max_extra_wait = (0..r.max_retries).map(|x| (x + 1) as f64 * Resource::PER_RETRY_DELAY).sum::<f64>();
@@ -805,9 +920,9 @@ impl Resource {
                                 let st = r.last_activity + max_wait - now();
                                 if st < 0.0 {
                                     r.cancel();
-                                    0.001
+                                    (0.001, None)
                                 } else {
-                                    st
+                                    (st, None)
                                 }
                             }
                         }
@@ -817,7 +932,7 @@ impl Resource {
                             if st < 0.0 {
                                 if r.retries_left == 0 {
                                     r.cancel();
-                                    0.001
+                                    (0.001, None)
                                 } else {
                                     r.retries_left -= 1;
                                     let mut expected_data = r.hash.clone();
@@ -837,16 +952,34 @@ impl Resource {
                                     let _ = expected_packet.pack();
                                     Transport::cache_request(expected_packet.packet_hash.clone().unwrap_or_default(), r.link.clone());
                                     r.last_part_sent = now();
-                                    0.001
+                                    (0.001, None)
                                 }
                             } else {
-                                st
+                                (st, None)
                             }
                         }
-                        ResourceStatus::Rejected => 0.001,
+                        ResourceStatus::Rejected => (0.001, None),
                         _ => break,
                     }
                 };
+
+                // Send any pending packet OUTSIDE the resource lock to avoid
+                // deadlock with dispatch_runtime_packet (link → resource).
+                if let Some(mut packet) = pending_packet {
+                    match packet.send() {
+                        Ok(_) => {
+                            if let Ok(mut r) = resource_arc.lock() {
+                                r.record_request_sent(packet.raw.len());
+                            }
+                        }
+                        Err(e) => {
+                            crate::log(&format!("Watchdog packet send failed: {}", e), crate::LOG_ERROR, false, false);
+                            if let Ok(mut r) = resource_arc.lock() {
+                                r.cancel();
+                            }
+                        }
+                    }
+                }
 
                 if sleep_time <= 0.0 {
                     // Negative sleep means we already handled it (cancel, etc.)
@@ -925,7 +1058,14 @@ impl Resource {
         }
     }
 
-    pub fn request_next(&mut self) {
+    /// Prepare request_next data while holding the resource lock, but return
+    /// the packet so it can be sent OUTSIDE the lock.  This avoids deadlock
+    /// with dispatch_runtime_packet which holds the link lock and then tries
+    /// to lock the resource for receive_part.
+    ///
+    /// Returns Some(packet) if a REQ should be sent, None otherwise.
+    pub fn prepare_request_next(&mut self) -> Option<Packet> {
+
         while self.receiving_part {
             thread::sleep(Duration::from_millis(1));
         }
@@ -977,20 +1117,10 @@ impl Resource {
                 request_data.extend_from_slice(&self.hash);
                 request_data.extend_from_slice(&requested_hashes);
 
-                let requested_count = requested_hashes.len() / Resource::MAPHASH_LEN;
-                let wants_hmu = hashmap_exhausted == Resource::HASHMAP_IS_EXHAUSTED;
-                eprintln!(
-                    "[RESOURCE] request_next hash={} wants_hmu={} requested_count={} window={} outstanding={} recv_count={} total_parts={}",
-                    crate::hexrep(&self.hash, false),
-                    wants_hmu,
-                    requested_count,
-                    self.window,
-                    self.outstanding_parts,
-                    self.received_count,
-                    self.total_parts
-                );
+                let _requested_count = requested_hashes.len() / Resource::MAPHASH_LEN;
+                let _wants_hmu = hashmap_exhausted == Resource::HASHMAP_IS_EXHAUSTED;
 
-                let mut request_packet = Packet::new(
+                let request_packet = Packet::new(
                     self.packet_destination(),
                     request_data,
                     crate::packet::DATA,
@@ -1003,12 +1133,30 @@ impl Resource {
                     0,
                 );
 
-                if request_packet.send().is_ok() {
-                    self.last_activity = now();
-                    self.req_sent = self.last_activity;
-                    self.req_sent_bytes = request_packet.raw.len();
-                    self.req_resp = None;
-                } else {
+                return Some(request_packet);
+            }
+        }
+        None
+    }
+
+    /// Record a successful REQ send.
+    pub fn record_request_sent(&mut self, raw_len: usize) {
+        self.last_activity = now();
+        self.req_sent = self.last_activity;
+        self.req_sent_bytes = raw_len;
+        self.req_resp = None;
+    }
+
+    /// Legacy inline request_next — only safe when called from a context
+    /// where no link lock is held (e.g. the initial accept thread).
+    pub fn request_next(&mut self) {
+        if let Some(mut packet) = self.prepare_request_next() {
+            match packet.send() {
+                Ok(_) => {
+                    self.record_request_sent(packet.raw.len());
+                }
+                Err(e) => {
+                    crate::log(&format!("Resource REQ send failed: {}", e), crate::LOG_ERROR, false, false);
                     self.cancel();
                 }
             }
@@ -1024,7 +1172,15 @@ impl Resource {
 
             if self.status != ResourceStatus::Transferring {
                 self.status = ResourceStatus::Transferring;
-                self.watchdog_job();
+                // NOTE: Do NOT start a new watchdog here.  When the resource
+                // was advertised via advertise_shared(), the watchdog already
+                // runs on the same Arc and will naturally see this status
+                // transition.  Starting a second watchdog on a clone would
+                // create a stale copy that times out independently.
+                //
+                // For legacy callers that still use advertise() + advertise_job(),
+                // the old watchdog_job() clone chain is unchanged — this just
+                // prevents ADDITIONAL watchdog clones on each REQ.
             }
 
             self.retries_left = self.max_retries;
@@ -1061,9 +1217,9 @@ impl Resource {
                 }
             }
 
-            eprintln!(
-                "[RESOURCE] handle_req hash={} wants_hmu={} requested_count={} matched={} fresh={} resend={} sent_parts={}/{}",
-                crate::hexrep(&self.hash, false),
+            crate::log(&format!(
+                "[RESOURCE] REQ hash={} hmu={} req={} match={} fresh={} resend={} sent={}/{}",
+                crate::hexrep(&self.hash[..4.min(self.hash.len())], false),
                 wants_more_hashmap,
                 map_hashes.len(),
                 matched_packets,
@@ -1071,7 +1227,7 @@ impl Resource {
                 resends,
                 self.sent_parts,
                 self.packets.len()
-            );
+            ), crate::LOG_NOTICE, false, false);
 
             if wants_more_hashmap {
                 let last_map_hash = request_data[1..Resource::MAPHASH_LEN + 1].to_vec();
@@ -1081,11 +1237,9 @@ impl Resource {
                     .rposition(|packet| packet.map_hash.as_ref() == Some(&last_map_hash));
 
                 let Some(last_index) = last_index else {
-                    eprintln!(
-                        "[RESOURCE] handle_req hash={} wants_hmu=true last_map_hash_not_found={}",
-                        crate::hexrep(&self.hash, false),
-                        crate::hexrep(&last_map_hash, false)
-                    );
+                    crate::log(&format!(
+                        "[RESOURCE] HMU FAIL: last_map_hash not found in packets"
+                    ), crate::LOG_ERROR, false, false);
                     self.cancel();
                     return;
                 };
@@ -1099,13 +1253,16 @@ impl Resource {
                     (last_index / ResourceAdvertisement::HASHMAP_MAX_LEN) + 1
                 };
 
+                crate::log(&format!(
+                    "[RESOURCE] HMU check: part_idx={} segment={} hashmap_height={} parts={}",
+                    part_index, segment, self.hashmap_height, self.parts.len()
+                ), crate::LOG_NOTICE, false, false);
+
                 if segment >= self.hashmap_height {
-                    eprintln!(
-                        "[RESOURCE] handle_req hash={} wants_hmu=true no_next_segment segment={} hashmap_height={}",
-                        crate::hexrep(&self.hash, false),
-                        segment,
-                        self.hashmap_height
-                    );
+                    crate::log(&format!(
+                        "[RESOURCE] HMU FAIL: segment {} >= hashmap_height {}",
+                        segment, self.hashmap_height
+                    ), crate::LOG_ERROR, false, false);
                     return;
                 }
 
@@ -1119,7 +1276,10 @@ impl Resource {
                     hashmap.extend_from_slice(&self.hashmap[start..end]);
                 }
 
-                let update = to_vec_named(&(segment, hashmap)).unwrap_or_default();
+                // Must wrap Vec<u8> in ByteBuf so rmp-serde serializes as msgpack
+                // binary (bin) format instead of array-of-integers, matching Python's
+                // umsgpack.packb([segment, hashmap]) where hashmap is bytes.
+                let update = to_vec_named(&(segment, serde_bytes::ByteBuf::from(hashmap))).unwrap_or_default();
                 let mut hmu = self.hash.clone();
                 hmu.extend_from_slice(&update);
                 let mut hmu_packet = Packet::new(
@@ -1135,22 +1295,29 @@ impl Resource {
                     0,
                 );
 
-                if hmu_packet.send().is_ok() {
-                    self.last_activity = now();
-                    eprintln!(
-                        "[RESOURCE] handle_req hash={} sent_hmu segment={} hashes={}",
-                        crate::hexrep(&self.hash, false),
-                        segment,
-                        hashmap_end.saturating_sub(hashmap_start)
-                    );
-                } else {
-                    self.cancel();
+                match hmu_packet.send() {
+                    Ok(_) => {
+                        self.last_activity = now();
+                        crate::log(&format!(
+                            "[RESOURCE] sent HMU segment={} hashes={}",
+                            segment,
+                            hashmap_end.saturating_sub(hashmap_start)
+                        ), crate::LOG_NOTICE, false, false);
+                    }
+                    Err(e) => {
+                        crate::log(&format!("[RESOURCE] HMU send FAILED: {}", e), crate::LOG_ERROR, false, false);
+                        self.cancel();
+                    }
                 }
             }
 
             if self.sent_parts == self.packets.len() {
                 self.status = ResourceStatus::AwaitingProof;
                 self.retries_left = 3;
+                crate::log(&format!(
+                    "[RESOURCE] all parts sent, AwaitingProof sent={}",
+                    self.sent_parts
+                ), crate::LOG_NOTICE, false, false);
             }
 
             if let Some(cb) = &self.progress_callback {
@@ -1172,10 +1339,6 @@ impl Resource {
             self.receiving_part = true;
             self.last_activity = now();
             self.retries_left = self.max_retries;
-            
-            eprintln!("[RESOURCE-RECV] receive_part data_len={} recv_count={}/{} hash={}", 
-                packet.data.len(), self.received_count, self.total_parts,
-                crate::hexrep(&self.hash, false));
 
             if self.req_resp.is_none() {
                 self.req_resp = Some(self.last_activity);
@@ -1209,14 +1372,12 @@ impl Resource {
                 self.status = ResourceStatus::Transferring;
                 let part_data = packet.data.clone();
                 let part_hash = self.get_map_hash(&part_data);
-                eprintln!("[RESOURCE-RECV] part_hash={} part_data_len={}", 
-                    crate::hexrep(&part_hash, false), part_data.len());
 
-                let mut matched = false;
+                let mut _matched = false;
                 let mut i = (self.consecutive_completed_height + 1).max(0) as usize;
                 for map_hash in self.hashmap_chunks(i, self.window) {
                     if map_hash == part_hash {
-                        matched = true;
+                        _matched = true;
                         if self.parts[i].is_none() {
                             self.parts[i] = Some(part_data.clone());
                             self.rtt_rxd_bytes += part_data.len();
@@ -1242,13 +1403,13 @@ impl Resource {
                 }
 
                 self.receiving_part = false;
-                
-                eprintln!("[RESOURCE-RECV] matched={} recv_count={}/{} assembly_lock={}", 
-                    matched, self.received_count, self.total_parts, self.assembly_lock);
 
                 if self.received_count == self.total_parts && !self.assembly_lock {
                     self.assembly_lock = true;
-                    eprintln!("[RESOURCE-RECV] spawning assembly thread");
+                    // Set status to Assembling on the ORIGINAL resource so the
+                    // watchdog (which holds a ref to the original Arc) sees the
+                    // transition and exits its loop.  The clone inherits this.
+                    self.status = ResourceStatus::Assembling;
                     let resource = Arc::new(Mutex::new(self.clone()));
                     thread::spawn(move || {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1257,7 +1418,7 @@ impl Resource {
                             }
                         }));
                         if let Err(e) = result {
-                            eprintln!("[RESOURCE-ASM] ASSEMBLY THREAD PANICKED: {:?}", e);
+                            crate::log(&format!("Resource assembly thread panicked: {:?}", e), crate::LOG_ERROR, false, false);
                         }
                     });
                 } else if self.outstanding_parts == 0 {
@@ -1309,8 +1470,8 @@ impl Resource {
     }
 
     pub fn assemble(&mut self) {
-        eprintln!("[RESOURCE-ASM] assemble start status={:?} encrypted={} compressed={} total_parts={}", 
-            self.status, self.encrypted, self.compressed, self.total_parts);
+        crate::log(&format!("Resource assembly starting, {} parts",
+            self.total_parts), crate::LOG_DEBUG, false, false);
         if self.status != ResourceStatus::Failed {
             self.status = ResourceStatus::Assembling;
             let mut stream = Vec::new();
@@ -1319,19 +1480,11 @@ impl Resource {
                     stream.extend_from_slice(p);
                 }
             }
-            eprintln!("[RESOURCE-ASM] stream_len={}", stream.len());
 
             let mut data = if self.encrypted {
-                eprintln!("[RESOURCE-ASM] decrypting stream");
                 match self.link.lock().unwrap().decrypt(&stream) {
-                    Ok(d) => {
-                        eprintln!("[RESOURCE-ASM] decrypted to {} bytes", d.len());
-                        d
-                    },
-                    Err(e) => {
-                        eprintln!("[RESOURCE-ASM] decrypt FAILED: {}", e);
-                        stream
-                    }
+                    Ok(d) => d,
+                    Err(_e) => stream
                 }
             } else {
                 stream
@@ -1340,27 +1493,22 @@ impl Resource {
             if data.len() >= Resource::RANDOM_HASH_SIZE {
                 data = data[Resource::RANDOM_HASH_SIZE..].to_vec();
             }
-            eprintln!("[RESOURCE-ASM] data_len_after_random_strip={}", data.len());
 
             if self.compressed {
                 let mut decoder = BzDecoder::new(&data[..]);
                 let mut decompressed = Vec::new();
                 if decoder.read_to_end(&mut decompressed).is_ok() {
-                    eprintln!("[RESOURCE-ASM] decompressed {} -> {} bytes", data.len(), decompressed.len());
                     data = decompressed;
-                } else {
-                    eprintln!("[RESOURCE-ASM] decompression FAILED");
                 }
             }
 
             let calculated_hash = identity::full_hash(&[data.clone(), self.random_hash.clone()].concat());
-            eprintln!("[RESOURCE-ASM] hash_match={} calc={} expected={}", 
-                calculated_hash == self.hash,
-                crate::hexrep(&calculated_hash, false),
-                crate::hexrep(&self.hash, false));
             if calculated_hash == self.hash {
-                // Set self.data to the assembled plaintext — needed by prove() and the callback
+                // self.data is ALWAYS the full decompressed payload (including
+                // metadata prefix if any), matching Python's behavior.
+                // prove() hashes self.data+self.hash, so it MUST be complete.
                 self.data = Some(data.clone());
+
                 let payload = if self.has_metadata && self.segment_index == 1 {
                     let metadata_size = ((data[0] as usize) << 16) | ((data[1] as usize) << 8) | data[2] as usize;
                     let packed_metadata = data[3..3 + metadata_size].to_vec();
@@ -1381,15 +1529,45 @@ impl Resource {
 
                 self.status = ResourceStatus::Complete;
                 self.prove();
+
+                // For multi-segment (split) resources:
+                // - Non-final segments: clear self.data so the link-level
+                //   resource_concluded callback skips LXMF parsing
+                // - Final segment: replace self.data with the complete
+                //   combined file from disk
+                if self.split {
+                    if self.segment_index == self.total_segments {
+                        if let Some(path) = &self.storagepath {
+                            match File::open(path) {
+                                Ok(mut file) => {
+                                    let mut combined = Vec::new();
+                                    let _ = file.read_to_end(&mut combined);
+                                    self.data = Some(combined);
+                                }
+                                Err(e) => {
+                                    crate::log(&format!("Resource failed to read combined storagepath: {}", e), crate::LOG_ERROR, false, false);
+                                    self.data = None;
+                                }
+                            }
+                        } else {
+                            self.data = None;
+                        }
+                    } else {
+                        self.data = None;
+                    }
+                }
             } else {
                 self.status = ResourceStatus::Corrupt;
             }
 
-            eprintln!("[RESOURCE-ASM] calling link.resource_concluded, status={:?}", self.status);
+            crate::log(&format!("Resource assembly concluded status={:?} data_len={}",
+                self.status, self.data.as_ref().map(|d| d.len()).unwrap_or(0)), crate::LOG_DEBUG, false, false);
             let resource_arc = Arc::new(Mutex::new(self.clone()));
             let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
-            if let Some(cb) = concluded_cb {
+            if let Some(cb) = &concluded_cb {
                 cb(resource_arc);
+            } else {
+                crate::log("Resource concluded but no callback registered", crate::LOG_WARNING, false, false);
             }
 
             if self.segment_index == self.total_segments {
@@ -1449,29 +1627,25 @@ impl Resource {
     }
 
     pub fn validate_proof(&mut self, proof_data: &[u8]) {
-        eprintln!("[RESOURCE-VP] validate_proof called hash={} status={:?} proof_len={}", crate::hexrep(&self.hash, false), self.status, proof_data.len());
+        crate::log(&format!("[RESOURCE] validate_proof status={:?} seg={}/{} proof_len={} expected_len={}", self.status, self.segment_index, self.total_segments, proof_data.len(), identity::HASHLENGTH / 8 * 2), crate::LOG_NOTICE, false, false);
         if self.status != ResourceStatus::Failed {
             if proof_data.len() == identity::HASHLENGTH / 8 * 2 {
                 if &proof_data[identity::HASHLENGTH / 8..] == self.expected_proof.as_slice() {
-                    eprintln!("[RESOURCE-VP] proof MATCHED, setting status=Complete");
+                    crate::log("[RESOURCE] proof MATCHED, setting Complete", crate::LOG_NOTICE, false, false);
                     self.status = ResourceStatus::Complete;
-                    eprintln!("[RESOURCE-VP] about to lock link for resource_concluded");
                     let resource_arc = Arc::new(Mutex::new(self.clone()));
                     let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
                     if let Some(cb) = concluded_cb {
-                        eprintln!("[RESOURCE-VP] firing resource_concluded callback outside link lock");
                         cb(resource_arc);
                     }
-                    eprintln!("[RESOURCE-VP] resource_concluded done");
+                    crate::log(&format!("[RESOURCE] resource_concluded done, seg={}/{}", self.segment_index, self.total_segments), crate::LOG_NOTICE, false, false);
 
-                    eprintln!("[RESOURCE-VP] segment_index={} total_segments={}", self.segment_index, self.total_segments);
                     if self.segment_index == self.total_segments {
                         let has_cb = self.callback.is_some();
-                        eprintln!("[RESOURCE-VP] has_callback={}", has_cb);
+                        crate::log(&format!("[RESOURCE] final segment, has_callback={}", has_cb), crate::LOG_NOTICE, false, false);
                         if let Some(cb) = &self.callback {
-                            eprintln!("[RESOURCE-VP] firing resource callback");
                             cb(Arc::new(Mutex::new(self.clone())));
-                            eprintln!("[RESOURCE-VP] resource callback returned");
+                            crate::log("[RESOURCE] resource callback returned", crate::LOG_NOTICE, false, false);
                         }
 
                         if let Some(file) = &mut self.input_file {
@@ -1485,22 +1659,24 @@ impl Resource {
                             thread::sleep(Duration::from_millis(50));
                         }
                         if let Some(next) = &self.next_segment {
-                            next.lock().unwrap().advertise();
+                            Resource::advertise_shared(next.clone());
                         }
                     }
                 } else {
-                    eprintln!(
-                        "[RESOURCE] proof mismatch hash={} expected={} got={}",
-                        crate::hexrep(&self.hash, false),
-                        crate::hexrep(&self.expected_proof, false),
-                        crate::hexrep(&proof_data[identity::HASHLENGTH / 8..], false)
+                    crate::log(
+                        &format!(
+                            "[RESOURCE] proof MISMATCH hash={} expected={} got={}",
+                            crate::hexrep(&self.hash, false),
+                            crate::hexrep(&self.expected_proof, false),
+                            crate::hexrep(&proof_data[identity::HASHLENGTH / 8..], false)
+                        ), crate::LOG_WARNING, false, false,
                     );
                 }
             } else {
-                eprintln!("[RESOURCE] unexpected proof length={} for hash={}", proof_data.len(), crate::hexrep(&self.hash, false));
+                crate::log(&format!("[RESOURCE] unexpected proof length={} for hash={}", proof_data.len(), crate::hexrep(&self.hash, false)), crate::LOG_WARNING, false, false);
             }
         } else {
-            eprintln!("[RESOURCE-VP] skipping validate_proof: status is Failed");
+            crate::log("[RESOURCE] skipping validate_proof: status is Failed", crate::LOG_WARNING, false, false);
         }
     }
 

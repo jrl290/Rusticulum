@@ -317,6 +317,9 @@ impl SerialInterface {
             return Ok(());
         }
 
+        // Apply forced bitrate delay if set
+        self.base.enforce_bitrate(data.len());
+
         let mut framed = Vec::with_capacity(data.len() + 2);
         framed.push(Hdlc::FLAG);
         framed.extend_from_slice(&Hdlc::escape(&data));

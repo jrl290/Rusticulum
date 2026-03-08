@@ -1,6 +1,6 @@
 use super::interface::{Interface, InterfaceMode};
 use crate::transport::Transport;
-use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -180,7 +180,7 @@ impl TcpClientInterface {
         let mut base = Interface::new();
         base.name = Some(name);
         base.in_enabled = true;
-        base.out_enabled = false;
+        base.out_enabled = true;
         base.hw_mtu = Some(Self::HW_MTU);
         base.bitrate = Self::BITRATE_GUESS;
         base.online = true;
@@ -210,15 +210,18 @@ impl TcpClientInterface {
 
     /// Initial connection attempt
     fn initial_connect(&mut self) -> Result<(), String> {
+        crate::log(&format!("TCP connecting to {}:{}...", self.target_ip, self.target_port), crate::LOG_NOTICE, false, false);
         println!("Establishing TCP connection for {}...", self.to_string());
         
         match self.connect(true) {
             Ok(_) => {
+                crate::log(&format!("TCP connection established to {}:{}", self.target_ip, self.target_port), crate::LOG_NOTICE, false, false);
                 println!("TCP connection for {} established", self.to_string());
                 // TODO: Start read_loop in thread
                 Ok(())
             }
             Err(e) => {
+                crate::log(&format!("TCP connection failed to {}:{}: {}", self.target_ip, self.target_port, e), crate::LOG_ERROR, false, false);
                 eprintln!("Initial connection for {} could not be established: {}", self.to_string(), e);
                 eprintln!("Leaving unconnected and retrying connection in {} seconds", Self::RECONNECT_WAIT);
                 // TODO: Start reconnect thread
@@ -229,11 +232,18 @@ impl TcpClientInterface {
 
     /// Connect to target
     fn connect(&mut self, _initial: bool) -> Result<(), String> {
-        let addr = format!("{}:{}", self.target_ip, self.target_port);
+        use std::net::ToSocketAddrs;
+        let addr_str = format!("{}:{}", self.target_ip, self.target_port);
         
+        // Use ToSocketAddrs to support both hostnames and IP addresses
+        let sock_addr = addr_str
+            .to_socket_addrs()
+            .map_err(|e| format!("Failed to resolve {}: {}", addr_str, e))?
+            .next()
+            .ok_or_else(|| format!("No addresses found for {}", addr_str))?;
+
         let stream = TcpStream::connect_timeout(
-            &addr.parse::<SocketAddr>()
-                .map_err(|e| format!("Invalid address {}: {}", addr, e))?,
+            &sock_addr,
             Duration::from_secs(self.connect_timeout)
         ).map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -241,7 +251,7 @@ impl TcpClientInterface {
             .map_err(|e| format!("Failed to set TCP_NODELAY: {}", e))?;
 
         // Set keepalive and timeouts
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         self.set_socket_options_linux(&stream)?;
         
         #[cfg(target_os = "macos")]
@@ -255,11 +265,12 @@ impl TcpClientInterface {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn set_socket_options_linux(&self, stream: &TcpStream) -> Result<(), String> {
         use std::os::unix::io::AsRawFd;
         use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_USER_TIMEOUT};
         
+        let optlen = std::mem::size_of::<i32>();
         unsafe {
             let fd = stream.as_raw_fd();
             let keepalive: i32 = 1;
@@ -270,22 +281,22 @@ impl TcpClientInterface {
                 let keepintvl = Self::TCP_PROBE_INTERVAL as i32;
                 let keepcnt = Self::TCP_PROBES as i32;
                 
-                setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+                setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, optlen as _);
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, optlen as _);
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, optlen as _);
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, optlen as _);
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, optlen as _);
             } else {
                 let user_timeout = (Self::I2P_USER_TIMEOUT * 1000) as i32;
                 let keepidle = Self::I2P_PROBE_AFTER as i32;
                 let keepintvl = Self::I2P_PROBE_INTERVAL as i32;
                 let keepcnt = Self::I2P_PROBES as i32;
                 
-                setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, std::mem::size_of::<i32>() as u32);
-                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+                setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, optlen as _);
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, optlen as _);
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, optlen as _);
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, optlen as _);
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt as *const _ as *const _, optlen as _);
             }
         }
         
@@ -317,12 +328,14 @@ impl TcpClientInterface {
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[allow(dead_code)]
     fn set_socket_options_linux(&self, _stream: &TcpStream) -> Result<(), String> {
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[allow(dead_code)]
     fn set_socket_options_macos(&self, _stream: &TcpStream) -> Result<(), String> {
         Ok(())
     }
@@ -394,12 +407,16 @@ impl TcpClientInterface {
 
     /// Process outgoing data
     pub fn process_outgoing(&mut self, data: Vec<u8>) -> Result<(), String> {
+        crate::log(&format!("TCP outgoing {} bytes, online={}, detached={}", data.len(), self.base.online, self.detached), crate::LOG_NOTICE, false, false);
         eprintln!("[DEBUG] TcpClientInterface::process_outgoing start ({} bytes)", data.len());
         if !self.base.online || self.detached {
             return Err("Interface offline or detached".to_string());
         }
 
         self.writing = true;
+
+        // Apply forced bitrate delay if set
+        self.base.enforce_bitrate(data.len());
 
         let framed = if self.kiss_framing {
             let mut frame = vec![Kiss::FEND, Kiss::CMD_DATA];
@@ -415,10 +432,18 @@ impl TcpClientInterface {
 
         if let Some(ref mut socket) = self.socket {
             eprintln!("[DEBUG] TcpClientInterface::process_outgoing writing {} bytes", framed.len());
-            socket.write_all(&framed)
-                .map_err(|e| format!("Failed to send data: {}", e))?;
-            
-            self.base.txb += framed.len() as u64;
+            match socket.write_all(&framed) {
+                Ok(_) => {
+                    self.base.txb += framed.len() as u64;
+                }
+                Err(e) => {
+                    crate::log(&format!("TCP write failed, marking offline: {}", e), crate::LOG_ERROR, false, false);
+                    self.base.online = false;
+                    self.socket = None;
+                    self.writing = false;
+                    return Err(format!("Failed to send data: {}", e));
+                }
+            }
         } else {
             return Err("No socket connection".to_string());
         }
@@ -554,15 +579,23 @@ impl TcpClientInterface {
         Ok(())
     }
 
+    /// How long (seconds) to wait with no inbound data before declaring
+    /// the TCP connection dead and forcing a reconnect.  On backbone
+    /// servers traffic arrives every few seconds, so 75 s without a
+    /// single byte is a reliable indicator of a zombie connection.
+    const READ_WATCHDOG_TIMEOUT: u64 = 75;
+
     pub fn start_read_loop(interface: Arc<Mutex<TcpClientInterface>>) {
         thread::spawn(move || {
-            let (mut socket, interface_name, kiss_framing, hw_mtu) = {
+            let (mut socket, interface_name, kiss_framing, hw_mtu, is_initiator) = {
                 let iface = interface.lock().unwrap();
                 let Some(socket_ref) = iface.socket.as_ref() else {
+                    crate::log("TCP read loop: no socket, exiting", crate::LOG_ERROR, false, false);
                     return;
                 };
 
                 let Ok(cloned_socket) = socket_ref.try_clone() else {
+                    crate::log("TCP read loop: socket clone failed, exiting", crate::LOG_ERROR, false, false);
                     return;
                 };
 
@@ -571,8 +604,17 @@ impl TcpClientInterface {
                     iface.base.name.clone(),
                     iface.kiss_framing,
                     iface.base.hw_mtu.unwrap_or(Self::HW_MTU),
+                    iface.initiator,
                 )
             };
+            crate::log(&format!("TCP read loop started for {:?}", interface_name), crate::LOG_NOTICE, false, false);
+
+            // Set a read timeout so we can detect zombie / half-open
+            // connections that Android's TCP keepalive fails to catch.
+            let watchdog_duration = Duration::from_secs(Self::READ_WATCHDOG_TIMEOUT);
+            if let Err(e) = socket.set_read_timeout(Some(watchdog_duration)) {
+                crate::log(&format!("TCP read loop: set_read_timeout failed: {}", e), crate::LOG_WARNING, false, false);
+            }
 
             let mut in_frame = false;
             let mut escape = false;
@@ -581,13 +623,20 @@ impl TcpClientInterface {
             let mut command = Kiss::CMD_UNKNOWN;
             let mut buf = [0u8; 4096];
 
+            let mut read_count: u64 = 0;
+            let mut last_data_time = std::time::Instant::now();
+            crate::log("TCP read loop: entering blocking read", crate::LOG_NOTICE, false, false);
             loop {
                 match socket.read(&mut buf) {
                     Ok(0) => {
+                        crate::log("TCP read loop: connection closed (read 0)", crate::LOG_NOTICE, false, false);
                         eprintln!("[TCP-READ] socket read returned 0, connection closed");
                         break;
                     }
                     Ok(n) => {
+                        read_count += 1;
+                        last_data_time = std::time::Instant::now();
+                        crate::log(&format!("TCP inbound: {} bytes (read #{})", n, read_count), crate::LOG_NOTICE, false, false);
                         eprintln!("[TCP-READ] read {} bytes, frame_buffer_len={}", n, frame_buffer.len());
                         let data_in = &buf[..n];
 
@@ -653,6 +702,7 @@ impl TcpClientInterface {
                                         const HEADER_MINSIZE: usize = 2;
                                         eprintln!("[TCP-READ] extracted frame: {} raw bytes -> {} unescaped bytes (min={})", frame.len(), unescaped.len(), HEADER_MINSIZE);
                                         if unescaped.len() > HEADER_MINSIZE {
+                                            crate::log(&format!("TCP frame: {} bytes, passing to Transport::inbound", unescaped.len()), crate::LOG_NOTICE, false, false);
                                             eprintln!("[TCP-READ] calling Transport::inbound with {} bytes", unescaped.len());
                                             let _ = std::io::Write::flush(&mut std::io::stderr());
                                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -689,13 +739,80 @@ impl TcpClientInterface {
                             }
                         }
                     }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                        let idle_secs = last_data_time.elapsed().as_secs();
+                        if idle_secs >= Self::READ_WATCHDOG_TIMEOUT {
+                            crate::log(
+                                &format!(
+                                    "TCP watchdog: no data received for {}s (threshold {}s), connection appears dead — triggering reconnect",
+                                    idle_secs, Self::READ_WATCHDOG_TIMEOUT
+                                ),
+                                crate::LOG_WARNING,
+                                false, false,
+                            );
+                            break;
+                        }
+                        // Timeout fired but we haven't exceeded the watchdog threshold yet.
+                        // This can happen if the socket timeout fires slightly early; just retry.
+                        continue;
+                    }
                     Err(e) => {
+                        crate::log(&format!("TCP read loop: socket error: {}", e), crate::LOG_ERROR, false, false);
                         eprintln!("[TCP-READ] socket read error: {}", e);
                         break;
                     }
                 }
             }
-            eprintln!("[TCP-READ] read loop exited!");
+
+            // Read loop exited — mark interface offline and attempt reconnect
+            crate::log("TCP read loop exited, marking interface offline", crate::LOG_WARNING, false, false);
+            eprintln!("[TCP-READ] read loop exited, marking offline");
+            {
+                let mut iface = interface.lock().unwrap();
+                iface.base.online = false;
+                iface.socket = None;
+            }
+
+            if is_initiator {
+                crate::log("TCP read loop: initiator, attempting reconnect...", crate::LOG_NOTICE, false, false);
+                // Reconnect loop
+                let mut attempts = 0u32;
+                loop {
+                    thread::sleep(Duration::from_secs(Self::RECONNECT_WAIT));
+                    attempts += 1;
+
+                    let max_tries = {
+                        let iface = interface.lock().unwrap();
+                        if iface.detached {
+                            crate::log("TCP reconnect: interface detached, giving up", crate::LOG_NOTICE, false, false);
+                            break;
+                        }
+                        iface.max_reconnect_tries
+                    };
+
+                    if let Some(max) = max_tries {
+                        if attempts as usize > max {
+                            crate::log(&format!("TCP reconnect: max attempts ({}) reached, giving up", max), crate::LOG_ERROR, false, false);
+                            break;
+                        }
+                    }
+
+                    crate::log(&format!("TCP reconnect attempt {}...", attempts), crate::LOG_NOTICE, false, false);
+                    let reconnect_ok = {
+                        let mut iface = interface.lock().unwrap();
+                        iface.connect(false).is_ok()
+                    };
+
+                    if reconnect_ok {
+                        crate::log("TCP reconnected successfully, restarting read loop", crate::LOG_NOTICE, false, false);
+                        // Restart the read loop on the new socket (recursive spawn)
+                        Self::start_read_loop(Arc::clone(&interface));
+                        return;
+                    } else {
+                        crate::log(&format!("TCP reconnect attempt {} failed", attempts), crate::LOG_WARNING, false, false);
+                    }
+                }
+            }
         });
     }
 
@@ -960,6 +1077,7 @@ impl TcpServerInterface {
                     );
                     
                     let spawned_interface = Arc::new(Mutex::new(TcpClientInterface::from_socket(client_name, stream)));
+                    let iface_name;
                     {
                         let mut iface = spawned_interface.lock().unwrap();
                         spawn_config.apply_to_base(&mut iface.base);
@@ -970,8 +1088,21 @@ impl TcpServerInterface {
                             iface.target_port = addr.port();
                         }
 
+                        iface_name = iface.base.name.clone().unwrap_or_default();
                         println!("Spawned new TCPClient Interface: {}", iface.to_string());
                     }
+
+                    // Register the spawned interface with Transport so it can send outbound data
+                    // (path responses, announces, etc.) back to the connected client.
+                    let handler_iface = Arc::clone(&spawned_interface);
+                    crate::transport::Transport::register_outbound_handler(
+                        &iface_name,
+                        Arc::new(move |raw| {
+                            let mut iface = handler_iface.lock().unwrap();
+                            iface.process_outgoing(raw.to_vec()).is_ok()
+                        }),
+                    );
+                    crate::transport::Transport::register_interface_stub(&iface_name, "TCPClientInterface");
 
                     TcpClientInterface::start_read_loop(Arc::clone(&spawned_interface));
                     spawned.lock().unwrap().push(spawned_interface);

@@ -727,6 +727,8 @@ pub struct RNodeInterface {
 	pub mode: InterfaceMode,
 	pub bitrate: u64,
 	pub supports_discovery: bool,
+	/// Experimental: force bitrate throttle on outgoing data
+	pub _force_bitrate: bool,
 
 	pub rxb: Arc<Mutex<u64>>,
 	pub txb: Arc<Mutex<u64>>,
@@ -887,6 +889,7 @@ impl RNodeInterface {
 			mode: InterfaceMode::Full,
 			bitrate: 0,
 			supports_discovery: true,
+			_force_bitrate: false,
 			rxb: Arc::new(Mutex::new(0)),
 			txb: Arc::new(Mutex::new(0)),
 			inner: Arc::new(Mutex::new(inner)),
@@ -1490,6 +1493,12 @@ impl RNodeInterface {
 	}
 
 	pub fn process_outgoing(&self, data: Vec<u8>) -> io::Result<()> {
+		// Apply forced bitrate delay if set
+		if self._force_bitrate && self.bitrate > 0 {
+			let delay_secs = (data.len() as f64 / self.bitrate as f64) * 8.0;
+			std::thread::sleep(std::time::Duration::from_secs_f64(delay_secs));
+		}
+
 		let mut inner = self.inner.lock().unwrap();
 
 		if !inner.online {

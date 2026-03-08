@@ -26,8 +26,10 @@ static INCOMING_LINK_ARCS: Lazy<Mutex<Vec<Arc<Mutex<Link>>>>> =
 pub fn register_runtime_link(link: Arc<Mutex<Link>>) {
     if let Ok(link_guard) = link.lock() {
         let is_incoming = !link_guard.initiator;
+        let link_id_hex = crate::hexrep(&link_guard.link_id, false);
+        let strong = Arc::strong_count(&link);
         if let Ok(mut links) = RUNTIME_LINKS.lock() {
-            eprintln!("[LINK-RUNTIME] register {}", crate::hexrep(&link_guard.link_id, false));
+            crate::log(&format!("RUNTIME register link={} strong_count={} incoming={} total={}", link_id_hex, strong, is_incoming, links.len() + 1), crate::LOG_NOTICE, false, false);
             links.insert(link_guard.link_id.clone(), Arc::downgrade(&link));
         }
         drop(link_guard);
@@ -37,13 +39,26 @@ pub fn register_runtime_link(link: Arc<Mutex<Link>>) {
                 arcs.push(Arc::clone(&link));
             }
         }
+        // Start link watchdog (establishment timeout, keepalive, stale detection)
+        start_link_watchdog(Arc::clone(&link));
     }
 }
 
 pub fn unregister_runtime_link(link_id: &[u8]) {
     if let Ok(mut links) = RUNTIME_LINKS.lock() {
-        links.remove(link_id);
+        let removed = links.remove(link_id).is_some();
+        crate::log(&format!("RUNTIME unregister link={} removed={} remaining={}", crate::hexrep(link_id, false), removed, links.len()), crate::LOG_NOTICE, false, false);
     }
+}
+
+/// Returns (attached_interface, is_closed) for a link by its link_id.
+/// Used by Transport::outbound to filter link packets to only the correct interface,
+/// matching Python's `packet.destination.attached_interface` check.
+pub fn get_link_outbound_info(link_id: &[u8]) -> Option<(Option<String>, bool)> {
+    let links = RUNTIME_LINKS.lock().ok()?;
+    let link = links.get(link_id)?.upgrade()?;
+    let link_guard = link.lock().ok()?;
+    Some((link_guard.attached_interface.clone(), link_guard.state == STATE_CLOSED))
 }
 
 pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
@@ -51,7 +66,7 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
         Some(hash) => hash.clone(),
         None => return false,
     };
-    eprintln!("[LINK-RUNTIME] dispatch packet type={} ctx={} dst={}", packet.packet_type, packet.context, crate::hexrep(&destination_hash, false));
+    crate::log(&format!("[LINK-DISPATCH] packet type={} ctx={} dst={}", packet.packet_type, packet.context, crate::hexrep(&destination_hash, false)), crate::LOG_DEBUG, false, false);
 
     let link = {
         let mut links = match RUNTIME_LINKS.lock() {
@@ -74,15 +89,17 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
         }
     };
 
-    let (handled, should_fire_link_established) = if let Ok(mut link_guard) = link.lock() {
+    let (handled, should_fire_link_established, should_fire_remote_identified) = if let Ok(mut link_guard) = link.lock() {
         eprintln!("[LINK-RUNTIME] delivering to link {}", crate::hexrep(&link_guard.link_id, false));
         let was_pending = link_guard.state != STATE_ACTIVE;
         let ok = link_guard.receive(packet).is_ok();
         let now_active = link_guard.state == STATE_ACTIVE;
         let fire = was_pending && now_active && !link_guard.initiator && link_guard.callbacks.link_established.is_some();
-        (ok, fire)
+        let fire_remote = link_guard.pending_remote_identified;
+        if fire_remote { link_guard.pending_remote_identified = false; }
+        (ok, fire, fire_remote)
     } else {
-        (false, false)
+        (false, false, false)
     };
 
     // Fire link_established callback OUTSIDE the lock so the callback
@@ -93,6 +110,20 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
                 drop(link_guard);
                 eprintln!("[LINK-RUNTIME] firing link_established callback");
                 callback(Arc::clone(&link));
+            }
+        }
+    }
+
+    // Fire remote_identified callback OUTSIDE the lock, passing the ORIGINAL
+    // Arc so backchannel_links stores the same Arc as RUNTIME_LINKS (not a clone).
+    if should_fire_remote_identified {
+        if let Ok(link_guard) = link.lock() {
+            let identity = link_guard.remote_identity.lock().ok().and_then(|r| r.clone());
+            let callback = link_guard.callbacks.remote_identified.clone();
+            drop(link_guard);
+            if let (Some(identity), Some(callback)) = (identity, callback) {
+                eprintln!("[LINK-RUNTIME] firing remote_identified callback");
+                callback(Arc::clone(&link), identity);
             }
         }
     }
@@ -109,6 +140,8 @@ pub fn runtime_encrypt_for_destination(destination_hash: &[u8], plaintext: &[u8]
         match links.get(destination_hash).and_then(|w| w.upgrade()) {
             Some(link) => link,
             None => {
+                let known: Vec<String> = links.keys().map(|k| crate::hexrep(k, false)).collect();
+                crate::log(&format!("RUNTIME encrypt FAILED: no link for {} known=[{}]", crate::hexrep(destination_hash, false), known.join(", ")), crate::LOG_ERROR, false, false);
                 links.remove(destination_hash);
                 return Err("No runtime link found for destination".to_string());
             }
@@ -129,21 +162,39 @@ pub fn validate_runtime_proof_for_receipt(
     let link = {
         let mut links = match RUNTIME_LINKS.lock() {
             Ok(links) => links,
-            Err(_) => return false,
+            Err(_) => {
+                crate::log("validate_runtime_proof: RUNTIME_LINKS lock poisoned", crate::LOG_ERROR, false, false);
+                return false;
+            }
         };
 
         match links.get(destination_hash).and_then(|w| w.upgrade()) {
             Some(link) => link,
             None => {
+                crate::log(&format!("validate_runtime_proof: no link for {}",
+                    crate::hexrep(destination_hash, false)), crate::LOG_DEBUG, false, false);
                 links.remove(destination_hash);
                 return false;
             }
         }
     };
 
-    let validated = if let Ok(link_guard) = link.lock() {
-        receipt.validate_link_proof(proof, &link_guard)
+    let proof_hash_hex = if proof.len() >= 32 {
+        crate::hexrep(&proof[..32], false)
     } else {
+        format!("<short:{}>" , proof.len())
+    };
+
+    let validated = if let Ok(link_guard) = link.lock() {
+        let result = receipt.validate_link_proof(proof, &link_guard);
+        if result {
+            crate::log(&format!("validate_runtime_proof: MATCH proof_hash={} receipt_hash={} link={}",
+                proof_hash_hex, crate::hexrep(&receipt.hash, false),
+                crate::hexrep(&link_guard.link_id, false)), crate::LOG_NOTICE, false, false);
+        }
+        result
+    } else {
+        crate::log("validate_runtime_proof: link lock failed", crate::LOG_ERROR, false, false);
         false
     };
 
@@ -404,6 +455,132 @@ fn request_timeout_watchdog(
     }
 }
 
+/// Link watchdog thread — monitors link state and sends keepalives.
+/// Matches Python's __watchdog_job.
+pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
+    let link_weak = Arc::downgrade(&link);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(1));
+
+            let link_arc = match link_weak.upgrade() {
+                Some(l) => l,
+                None => break, // Link dropped
+            };
+
+            // Determine what action to take while holding the lock briefly
+            enum WatchdogAction {
+                Continue,
+                Exit,
+                SendKeepalive(Destination, Vec<u8>),
+                Teardown,
+            }
+
+            let action = {
+                let mut link_guard = match link_arc.lock() {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+
+                if link_guard.state == STATE_CLOSED {
+                    break;
+                }
+
+                if link_guard.watchdog_lock {
+                    WatchdogAction::Continue
+                } else {
+                    match link_guard.state {
+                        STATE_PENDING | STATE_HANDSHAKE => {
+                            if let Some(request_time) = link_guard.request_time {
+                                if now_seconds() >= request_time + link_guard.establishment_timeout {
+                                    let state_name = if link_guard.state == STATE_PENDING { "PENDING" } else { "HANDSHAKE" };
+                                    eprintln!("[LINK] watchdog: {} timeout for {}", state_name, crate::hexrep(&link_guard.link_id, false));
+                                    crate::log(&format!("Link establishment timed out ({}): {}", state_name, crate::hexrep(&link_guard.link_id, false)), crate::LOG_DEBUG, false, false);
+                                    link_guard.state = STATE_CLOSED;
+                                    link_guard.status = STATE_CLOSED;
+                                    link_guard.teardown_reason = REASON_TIMEOUT;
+                                    link_guard.link_closed();
+                                    WatchdogAction::Exit
+                                } else {
+                                    WatchdogAction::Continue
+                                }
+                            } else {
+                                WatchdogAction::Continue
+                            }
+                        }
+                        STATE_ACTIVE => {
+                            let activated_at = link_guard.activated_at.unwrap_or(0);
+                            let last_inbound = link_guard.last_inbound
+                                .max(link_guard.last_proof)
+                                .max(activated_at);
+                            let now = current_time().unwrap_or(0);
+                            let keepalive_secs = link_guard.keepalive as u64;
+
+                            if now >= last_inbound + keepalive_secs {
+                                // Check stale first
+                                let stale_secs = link_guard.stale_time as u64;
+                                if now >= last_inbound + stale_secs {
+                                    eprintln!("[LINK] watchdog: link {} going STALE (no inbound for {}s, stale_time={}s)", 
+                                        crate::hexrep(&link_guard.link_id, false),
+                                        now.saturating_sub(last_inbound), stale_secs);
+                                    link_guard.state = STATE_STALE;
+                                    link_guard.status = STATE_STALE;
+                                    WatchdogAction::Teardown
+                                } else if link_guard.initiator && now >= link_guard.last_keepalive + keepalive_secs {
+                                    // Send keepalive (initiator only)
+                                    if let Some(info) = link_guard.prepare_keepalive() {
+                                        WatchdogAction::SendKeepalive(info.0, info.1)
+                                    } else {
+                                        WatchdogAction::Continue
+                                    }
+                                } else {
+                                    WatchdogAction::Continue
+                                }
+                            } else {
+                                WatchdogAction::Continue
+                            }
+                        }
+                        STATE_STALE => {
+                            WatchdogAction::Teardown
+                        }
+                        _ => WatchdogAction::Continue,
+                    }
+                }
+            };
+
+            match action {
+                WatchdogAction::Exit => break,
+                WatchdogAction::SendKeepalive(dest, link_id) => {
+                    let mut keepalive_packet = Packet::new(
+                        Some(dest),
+                        vec![0xFF],
+                        DATA,
+                        crate::packet::KEEPALIVE,
+                        crate::transport::BROADCAST,
+                        packet::HEADER_1,
+                        None,
+                        None,
+                        false,
+                        0,
+                    );
+                    if let Err(e) = keepalive_packet.send() {
+                        eprintln!("[LINK] watchdog keepalive send failed for {}: {}", crate::hexrep(&link_id, false), e);
+                    }
+                }
+                WatchdogAction::Teardown => {
+                    if let Ok(mut link_guard) = link_arc.lock() {
+                        eprintln!("[LINK] watchdog: tearing down stale link {}", crate::hexrep(&link_guard.link_id, false));
+                        crate::log(&format!("Link timeout, tearing down {}", crate::hexrep(&link_guard.link_id, false)), crate::LOG_DEBUG, false, false);
+                        link_guard.teardown();
+                    }
+                    break;
+                }
+                WatchdogAction::Continue => {}
+            }
+        }
+    });
+}
+
 #[derive(Clone)]
 struct PendingRequest {
     request_id: Vec<u8>,
@@ -436,7 +613,7 @@ pub struct Link {
     pub rtt: Option<f64>,
     pub established_at: Option<u64>,
     pub activated_at: Option<u64>,
-    pub request_time: Option<u64>,
+    pub request_time: Option<f64>,
     pub last_inbound: u64,
     pub last_outbound: u64,
     pub last_keepalive: u64,
@@ -492,6 +669,11 @@ pub struct Link {
     pub establishment_timeout: f64,
     pub watchdog_lock: bool,
     pub track_phy_stats: bool,
+    
+    /// Flag set by handle_linkidentify_packet so dispatch_runtime_packet
+    /// can fire the remote_identified callback OUTSIDE the link lock,
+    /// passing the original Arc (not a clone).
+    pub pending_remote_identified: bool,
     
     // Channel support
     pub channel: Option<()>, // Placeholder for Channel integration
@@ -554,6 +736,7 @@ impl Clone for Link {
             establishment_timeout: self.establishment_timeout,
             watchdog_lock: self.watchdog_lock,
             track_phy_stats: self.track_phy_stats,
+            pending_remote_identified: false,
             channel: self.channel.clone(),
         }
     }
@@ -636,7 +819,8 @@ impl Link {
         link.prove_with_identity(identity)?;
         eprintln!("[LINK] validate_request: proof sent");
 
-        link.request_time = current_time();
+        link.request_time = Some(now_seconds());
+        link.had_inbound(true); // Initialize last_data/last_inbound before cloning
 
         // Register in Transport's active_links (incoming links go directly to active)
         crate::transport::Transport::register_link(link.clone());
@@ -644,8 +828,6 @@ impl Link {
         // Also register as runtime link so dispatch_runtime_packet can find it
         let link_arc = Arc::new(Mutex::new(link.clone()));
         register_runtime_link(Arc::clone(&link_arc));
-
-        link.last_inbound = current_time().unwrap_or(0);
 
         eprintln!("[LINK] validate_request: link registered, link_id={}", crate::hexrep(&link.link_id, false));
 
@@ -678,6 +860,31 @@ impl Link {
         request_data.extend_from_slice(&signalling_bytes(reticulum::MTU, self.mode)?);
 
         let destination = self.destination.lock().map_err(|_| "Destination lock poisoned")?.clone();
+
+        // Calculate establishment timeout based on hops and first hop latency (matches Python Link.__init__)
+        let dest_hash = destination.hash.clone();
+        let hops = crate::transport::Transport::hops_to(&dest_hash);
+        let first_hop_timeout = if let Some(ret) = reticulum::Reticulum::get_instance() {
+            if let Ok(ret_guard) = ret.lock() {
+                ret_guard.get_first_hop_timeout(&dest_hash)
+            } else {
+                crate::transport::Transport::first_hop_timeout(&dest_hash)
+            }
+        } else {
+            crate::transport::Transport::first_hop_timeout(&dest_hash)
+        };
+        self.establishment_timeout = first_hop_timeout + ESTABLISHMENT_TIMEOUT_PER_HOP * (hops.max(1) as f64);
+        self.expected_hops = Some(hops as usize);
+        crate::log(
+            &format!(
+                "Link establishment timeout {:.1}s (first_hop={:.1}s, hops={}, per_hop={:.1}s)",
+                self.establishment_timeout, first_hop_timeout, hops, ESTABLISHMENT_TIMEOUT_PER_HOP
+            ),
+            crate::LOG_NOTICE,
+            false,
+            false,
+        );
+
         let mut packet = Packet::new(
             Some(destination),
             request_data,
@@ -695,7 +902,7 @@ impl Link {
         self.establishment_cost += packet.raw.len();
         self.set_link_id_from_packet(&packet);
         eprintln!("[LINK] initiated link_id {}", crate::hexrep(&self.link_id, false));
-        self.request_time = current_time();
+        self.request_time = Some(now_seconds());
 
         crate::transport::Transport::register_link(self.clone());
         packet.send()?;
@@ -722,7 +929,7 @@ impl Link {
             rtt: None,
             established_at,
             activated_at: None,
-            request_time: established_at,
+            request_time: Some(now_seconds()),
             last_inbound: current_time().unwrap_or(0),
             last_outbound: current_time().unwrap_or(0),
             last_keepalive: 0,
@@ -764,6 +971,7 @@ impl Link {
             establishment_timeout: ESTABLISHMENT_TIMEOUT_PER_HOP,
             watchdog_lock: false,
             track_phy_stats: false,
+            pending_remote_identified: false,
             channel: None,
         })
     }
@@ -786,7 +994,7 @@ impl Link {
             rtt: None,
             established_at,
             activated_at: None,
-            request_time: established_at,
+            request_time: Some(now_seconds()),
             last_inbound: current_time().unwrap_or(0),
             last_outbound: current_time().unwrap_or(0),
             last_keepalive: 0,
@@ -828,6 +1036,7 @@ impl Link {
             establishment_timeout: ESTABLISHMENT_TIMEOUT_PER_HOP,
             watchdog_lock: false,
             track_phy_stats: false,
+            pending_remote_identified: false,
             channel: None,
         })
     }
@@ -960,8 +1169,13 @@ impl Link {
         let packet_hash = packet.get_hash();
         let signature = self.sign(&packet_hash)?;
 
-        let mut proof_data = packet_hash;
+        let mut proof_data = packet_hash.clone();
         proof_data.extend_from_slice(&signature);
+
+        crate::log(&format!("prove_packet hash={} link={} proof_len={}",
+            crate::hexrep(&packet_hash, false),
+            crate::hexrep(&self.link_id, false),
+            proof_data.len()), crate::LOG_DEBUG, false, false);
 
         let link_destination = {
             let dest = self.destination.lock()
@@ -1408,10 +1622,12 @@ impl Link {
     
     /// Tear down the link
     pub fn teardown(&mut self) {
+        crate::log(&format!("LINK teardown link={} state={}", crate::hexrep(&self.link_id, false), self.state), crate::LOG_NOTICE, false, false);
         if self.state != STATE_CLOSED && self.state != STATE_PENDING {
             // Send teardown packet
         }
         self.state = STATE_CLOSED;
+        self.status = STATE_CLOSED;
         unregister_runtime_link(&self.link_id);
         self.link_closed();
     }
@@ -1440,7 +1656,7 @@ impl Link {
         self.watchdog_lock = true;
         
         if !self.is_closed() {
-            self.last_inbound = current_time().unwrap_or(0);
+            self.had_inbound(packet.packet_type == DATA);
             self.rx += 1;
             self.rxbytes += packet.data.len() as u64;
             
@@ -1495,9 +1711,36 @@ impl Link {
                 if needs_request_next {
                     let r = resource_arc.clone();
                     std::thread::spawn(move || {
+                        // Brief delay so the caller can release the link lock.
+                        // Without this, the deferred thread would immediately
+                        // contend on the link lock that the TCP reader still holds.
                         std::thread::sleep(std::time::Duration::from_millis(5));
-                        if let Ok(mut guard) = r.lock() {
-                            guard.request_next();
+                        // Phase 1: Lock resource, prepare packet, then RELEASE lock
+                        let maybe_packet = match r.lock() {
+                            Ok(mut guard) => {
+                                guard.prepare_request_next()
+                            }
+                            Err(e) => {
+                                crate::log(&format!("Resource lock poisoned in deferred REQ: {}", e), crate::LOG_ERROR, false, false);
+                                None
+                            }
+                        };
+                        // Phase 2: Send packet WITHOUT holding resource lock (avoids deadlock with dispatch_runtime_packet)
+                        if let Some(mut packet) = maybe_packet {
+                            match packet.send() {
+                                Ok(_) => {
+                                    // Phase 3: Re-lock resource to record success
+                                    if let Ok(mut guard) = r.lock() {
+                                        guard.record_request_sent(packet.raw.len());
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::log(&format!("Deferred REQ send failed: {}", e), crate::LOG_ERROR, false, false);
+                                    if let Ok(mut guard) = r.lock() {
+                                        guard.cancel();
+                                    }
+                                }
+                            }
                         }
                     });
                 }
@@ -1643,26 +1886,46 @@ impl Link {
                     1
                 };
                 if plaintext.len() >= offset + hash_len {
-                    let resource_hash = &plaintext[offset..offset + hash_len];
+                    let resource_hash = plaintext[offset..offset + hash_len].to_vec();
                     let packet_hash = packet.packet_hash.clone();
-                    if let Ok(mut resources) = self.outgoing_resources.lock() {
-                        for resource in resources.iter_mut() {
-                            if let Ok(mut resource_guard) = resource.lock() {
-                                if resource_guard.hash == resource_hash {
-                                    if let Some(req_hash) = packet_hash.as_ref() {
-                                        if !resource_guard.req_hashlist.iter().any(|h| h == req_hash) {
-                                            resource_guard.req_hashlist.push(req_hash.clone());
-                                            if resource_guard.req_hashlist.len() > 64 {
-                                                let drop_count = resource_guard.req_hashlist.len().saturating_sub(64);
-                                                resource_guard.req_hashlist.drain(0..drop_count);
-                                            }
-                                        }
-                                    }
-                                    resource_guard.request(&plaintext);
+                    // Clone the list of outgoing resource Arcs WITHOUT locking
+                    // individual resources.  We must NOT lock any resource while
+                    // the link lock is held — request() sends RESOURCE_HMU
+                    // packets whose encrypt path needs the link lock, creating
+                    // an AB-BA deadlock (link→resource vs resource→link).
+                    let resources: Vec<Arc<Mutex<Resource>>> = if let Ok(resources) = self.outgoing_resources.lock() {
+                        resources.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    let pt = plaintext.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        // Find matching resource OUTSIDE the link lock
+                        let mut target_resource: Option<Arc<Mutex<Resource>>> = None;
+                        for resource in resources.iter() {
+                            if let Ok(guard) = resource.lock() {
+                                if guard.hash == resource_hash.as_slice() {
+                                    target_resource = Some(resource.clone());
+                                    break;
                                 }
                             }
                         }
-                    }
+                        if let Some(resource_arc) = target_resource {
+                            if let Ok(mut guard) = resource_arc.lock() {
+                                if let Some(req_hash) = packet_hash.as_ref() {
+                                    if !guard.req_hashlist.iter().any(|h| h == req_hash) {
+                                        guard.req_hashlist.push(req_hash.clone());
+                                        if guard.req_hashlist.len() > 64 {
+                                            let drop_count = guard.req_hashlist.len().saturating_sub(64);
+                                            guard.req_hashlist.drain(0..drop_count);
+                                        }
+                                    }
+                                }
+                                guard.request(&pt);
+                            }
+                        }
+                    });
                 }
             }
             return Ok(());
@@ -1690,8 +1953,31 @@ impl Link {
                 if let Some(r) = needs_request_next {
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(5));
-                        if let Ok(mut guard) = r.lock() {
-                            guard.request_next();
+                        // Phase 1: Lock resource, prepare packet, then RELEASE lock
+                        let maybe_packet = match r.lock() {
+                            Ok(mut guard) => {
+                                guard.prepare_request_next()
+                            }
+                            Err(e) => {
+                                crate::log(&format!("Resource lock poisoned in deferred HMU REQ: {}", e), crate::LOG_ERROR, false, false);
+                                None
+                            }
+                        };
+                        // Phase 2: Send packet WITHOUT holding resource lock
+                        if let Some(mut packet) = maybe_packet {
+                            match packet.send() {
+                                Ok(_) => {
+                                    if let Ok(mut guard) = r.lock() {
+                                        guard.record_request_sent(packet.raw.len());
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::log(&format!("Deferred HMU REQ send failed: {}", e), crate::LOG_ERROR, false, false);
+                                    if let Ok(mut guard) = r.lock() {
+                                        guard.cancel();
+                                    }
+                                }
+                            }
                         }
                     });
                 }
@@ -1702,16 +1988,24 @@ impl Link {
         if packet.context == crate::packet::RESOURCE_ICL {
             let hash_len = identity::HASHLENGTH / 8;
             if plaintext.len() >= hash_len {
-                let resource_hash = &plaintext[..hash_len];
-                if let Ok(mut resources) = self.incoming_resources.lock() {
-                    for resource in resources.iter_mut() {
+                let resource_hash = plaintext[..hash_len].to_vec();
+                // Clone the incoming resource list without locking individual
+                // resources — avoids deadlock with deferred request_next threads
+                // that hold the resource lock and need the link lock to send.
+                let resources: Vec<Arc<Mutex<Resource>>> = if let Ok(resources) = self.incoming_resources.lock() {
+                    resources.clone()
+                } else {
+                    Vec::new()
+                };
+                std::thread::spawn(move || {
+                    for resource in resources.iter() {
                         if let Ok(mut resource_guard) = resource.lock() {
-                            if resource_guard.hash == resource_hash {
+                            if resource_guard.hash == resource_hash.as_slice() {
                                 resource_guard.cancel();
                             }
                         }
                     }
-                }
+                });
             }
             return Ok(());
         }
@@ -1719,16 +2013,23 @@ impl Link {
         if packet.context == crate::packet::RESOURCE_RCL {
             let hash_len = identity::HASHLENGTH / 8;
             if plaintext.len() >= hash_len {
-                let resource_hash = &plaintext[..hash_len];
-                if let Ok(mut resources) = self.outgoing_resources.lock() {
-                    for resource in resources.iter_mut() {
+                let resource_hash = plaintext[..hash_len].to_vec();
+                // Clone without locking individual resources — same deadlock
+                // avoidance as RESOURCE_REQ handler.
+                let resources: Vec<Arc<Mutex<Resource>>> = if let Ok(resources) = self.outgoing_resources.lock() {
+                    resources.clone()
+                } else {
+                    Vec::new()
+                };
+                std::thread::spawn(move || {
+                    for resource in resources.iter() {
                         if let Ok(mut resource_guard) = resource.lock() {
-                            if resource_guard.hash == resource_hash {
+                            if resource_guard.hash == resource_hash.as_slice() {
                                 resource_guard.rejected();
                             }
                         }
                     }
-                }
+                });
             }
             return Ok(());
         }
@@ -1751,7 +2052,7 @@ impl Link {
 
         let measured_rtt = self
             .request_time
-            .and_then(|requested| current_time().map(|now| (now.saturating_sub(requested)) as f64))
+            .map(|requested| (now_seconds() - requested).max(0.001))
             .unwrap_or(0.0);
 
         let peer_rtt: f64 = from_slice(plaintext).map_err(|e| format!("Invalid LRRTT payload: {}", e))?;
@@ -1759,8 +2060,10 @@ impl Link {
         self.status = STATE_ACTIVE;
         self.state = STATE_ACTIVE;
         self.activated_at = current_time();
-        eprintln!("[LINK] LRRTT received, link ACTIVE rtt={:.1}ms link_id={}", 
-            self.rtt.unwrap_or(0.0), crate::hexrep(&self.link_id, false));
+        self.update_keepalive();
+
+        eprintln!("[LINK] LRRTT received, link ACTIVE rtt={:.1}ms keepalive={:.0}s link_id={}", 
+            self.rtt.unwrap_or(0.0), self.keepalive, crate::hexrep(&self.link_id, false));
 
         // NOTE: We do NOT fire the link_established callback here because we
         // are inside a Mutex lock. The callback would receive a clone Arc
@@ -1825,9 +2128,17 @@ impl Link {
         };
         let response_data = to_vec_named(&response_payload).map_err(|e| e.to_string())?;
 
-        let dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?.clone();
+        // Create a link-type destination so the response is encrypted via the link's shared key
+        let mut link_dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?.clone();
+        link_dest.dest_type = DestinationType::Link;
+        link_dest.hash = self.link_id.clone();
+        link_dest.hexhash = crate::hexrep(&link_dest.hash, false);
+
+        eprintln!("[LINK] sending RESPONSE for request path={} response_len={} link_id={}", 
+            payload.path, response_data.len(), crate::hexrep(&self.link_id, false));
+
         let mut response_packet = Packet::new(
-            Some(dest),
+            Some(link_dest),
             response_data,
             DATA,
             crate::packet::RESPONSE,
@@ -1839,6 +2150,7 @@ impl Link {
             0,
         );
         let _ = response_packet.send();
+        self.had_outbound(false);
         Ok(())
     }
 
@@ -1977,10 +2289,10 @@ impl Link {
                         *remote_id = Some(identity.clone());
                     }
 
-                    // Call remote_identified callback
-                    if let Some(callback) = &self.callbacks.remote_identified {
-                        callback(Arc::new(Mutex::new(self.clone())), identity);
-                    }
+                    // Signal that remote_identified callback should fire
+                    // OUTSIDE the link lock (in dispatch_runtime_packet)
+                    // so the callback receives the original Arc, not a clone.
+                    self.pending_remote_identified = true;
 
                     Ok(())
                 } else {
@@ -1997,36 +2309,41 @@ impl Link {
             let hash_len = identity::HASHLENGTH / 8;
             eprintln!("[LINK] RESOURCE_PRF received data_len={}", packet.data.len());
             if packet.data.len() >= hash_len {
-                let resource_hash = &packet.data[..hash_len];
-                let mut targets: Vec<Arc<Mutex<Resource>>> = Vec::new();
-                if let Ok(mut resources) = self.outgoing_resources.lock() {
-                    for resource in resources.iter_mut() {
-                        if let Ok(mut resource_guard) = resource.lock() {
-                            if resource_guard.hash == resource_hash {
-                                targets.push(resource.clone());
+                let resource_hash = packet.data[..hash_len].to_vec();
+                // Clone the list of outgoing resource Arcs WITHOUT locking
+                // individual resources — avoids AB-BA deadlock with deferred
+                // REQ handler thread (resource→link vs link→resource).
+                let resources: Vec<Arc<Mutex<Resource>>> = if let Ok(resources) = self.outgoing_resources.lock() {
+                    resources.clone()
+                } else {
+                    Vec::new()
+                };
+
+                let proof_data = packet.data.clone();
+                thread::spawn(move || {
+                    // Find matching resources and validate proof OUTSIDE the link lock
+                    for resource in resources.iter() {
+                        let matches = if let Ok(guard) = resource.lock() {
+                            guard.hash == resource_hash.as_slice()
+                        } else {
+                            false
+                        };
+                        if matches {
+                            let proof = proof_data.clone();
+                            let target = resource.clone();
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Ok(mut resource_guard) = target.lock() {
+                                    resource_guard.validate_proof(&proof);
+                                } else {
+                                    eprintln!("[LINK] RESOURCE_PRF thread: failed to lock resource");
+                                }
+                            }));
+                            if let Err(e) = result {
+                                eprintln!("[LINK] RESOURCE_PRF thread PANICKED: {:?}", e);
                             }
                         }
                     }
-                }
-
-                let proof_data = packet.data.clone();
-                let matched = targets.len();
-                for target in targets {
-                    let proof = proof_data.clone();
-                    thread::spawn(move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if let Ok(mut resource_guard) = target.lock() {
-                                resource_guard.validate_proof(&proof);
-                            } else {
-                                eprintln!("[LINK] RESOURCE_PRF thread: failed to lock resource");
-                            }
-                        }));
-                        if let Err(e) = result {
-                            eprintln!("[LINK] RESOURCE_PRF thread PANICKED: {:?}", e);
-                        }
-                    });
-                }
-                eprintln!("[LINK] RESOURCE_PRF matched_outgoing_resources={}", matched);
+                });
             }
             return Ok(());
         }
@@ -2078,12 +2395,14 @@ impl Link {
         }
 
         let now = current_time().unwrap_or(0);
+        let now_precise = now_seconds();
         if let Some(request_time) = self.request_time {
-            self.rtt = Some((now.saturating_sub(request_time)) as f64);
+            self.rtt = Some((now_precise - request_time).max(0.001));
         }
         self.state = STATE_ACTIVE;
         self.status = STATE_ACTIVE;
         self.activated_at = Some(now);
+        self.attached_interface = packet.receiving_interface.clone();
         self.last_proof = now;
         self.last_inbound = now;
         self.last_outbound = now;
@@ -2092,7 +2411,10 @@ impl Link {
             self.update_mdu();
         }
 
-        eprintln!("[LINK] proof accepted, link activated {}", crate::hexrep(&self.link_id, false));
+        self.update_keepalive();
+
+        eprintln!("[LINK] proof accepted, link activated {} keepalive={:.0}s", crate::hexrep(&self.link_id, false), self.keepalive);
+        crate::log(&format!("Link activated {} rtt={:.3}s keepalive={:.0}s", crate::hexrep(&self.link_id, false), self.rtt.unwrap_or(0.0), self.keepalive), crate::LOG_NOTICE, false, false);
 
         if let Some(rtt) = self.rtt {
             let rtt_data = to_vec_named(&rtt).map_err(|e| format!("Failed to encode LRRTT payload: {}", e))?;
@@ -2135,9 +2457,50 @@ impl Link {
         Ok(())
     }
     
-    /// Send keep-alive packet
-    pub fn send_keepalive(&mut self) -> Result<(), String> {
+    /// Update keepalive interval based on measured RTT (matches Python __update_keepalive)
+    pub fn update_keepalive(&mut self) {
+        if let Some(rtt) = self.rtt {
+            self.keepalive = (rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT)).min(KEEPALIVE_MAX).max(KEEPALIVE_MIN);
+            self.stale_time = self.keepalive * STALE_FACTOR;
+        }
+    }
+
+    /// Prepare keepalive info so the caller can send the packet outside the link lock.
+    /// Returns (destination, link_id) if a keepalive should be sent.
+    pub fn prepare_keepalive(&mut self) -> Option<(Destination, Vec<u8>)> {
+        let mut link_destination = match self.destination.lock() {
+            Ok(d) => d.clone(),
+            Err(_) => return None,
+        };
+        link_destination.dest_type = DestinationType::Link;
+        link_destination.hash = self.link_id.clone();
+        link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
         self.had_outbound(true);
+        Some((link_destination, self.link_id.clone()))
+    }
+
+    /// Send keep-alive packet (called when link lock is NOT held externally)
+    pub fn send_keepalive(&mut self) -> Result<(), String> {
+        let info = self.prepare_keepalive();
+        if let Some((link_destination, link_id)) = info {
+            thread::spawn(move || {
+                let mut keepalive_packet = Packet::new(
+                    Some(link_destination),
+                    vec![0xFF],
+                    DATA,
+                    crate::packet::KEEPALIVE,
+                    crate::transport::BROADCAST,
+                    packet::HEADER_1,
+                    None,
+                    None,
+                    false,
+                    0,
+                );
+                if let Err(e) = keepalive_packet.send() {
+                    eprintln!("[LINK] keepalive send failed for {}: {}", crate::hexrep(&link_id, false), e);
+                }
+            });
+        }
         Ok(())
     }
 
@@ -2214,48 +2577,87 @@ impl Link {
 
     /// Check if incoming resource is already registered
     pub fn has_incoming_resource(&self, resource: &Arc<Mutex<Resource>>) -> bool {
+        let target_hash = resource.lock().ok().map(|r| r.hash.clone()).unwrap_or_default();
         if let Ok(resources) = self.incoming_resources.lock() {
-            resources.iter().any(|r| Arc::ptr_eq(r, resource))
+            resources.iter().any(|r| {
+                r.try_lock().ok().map(|r| r.hash == target_hash).unwrap_or(false)
+            })
         } else {
             false
         }
     }
 
-    /// Cancel outgoing resource and remove from tracking
+    /// Cancel outgoing resource and remove from tracking.
+    /// Uses try_lock on individual resources to avoid deadlock when called
+    /// from validate_proof (which already holds the resource lock).
+    /// If a resource can't be locked, deferred cleanup runs after 100ms.
     pub fn cancel_outgoing_resource(&self, resource: Arc<Mutex<Resource>>) {
+        let target_hash = resource.lock().ok().map(|r| r.hash.clone()).unwrap_or_default();
+        if target_hash.is_empty() { return; }
+        let mut need_deferred = false;
         match self.outgoing_resources.try_lock() {
             Ok(mut resources) => {
-                resources.retain(|r| !Arc::ptr_eq(r, &resource));
-            }
-            Err(_) => {
-                let outgoing = Arc::clone(&self.outgoing_resources);
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    if let Ok(mut resources) = outgoing.lock() {
-                        resources.retain(|r| !Arc::ptr_eq(r, &resource));
+                let before = resources.len();
+                resources.retain(|r| {
+                    match r.try_lock() {
+                        Ok(guard) => guard.hash != target_hash,
+                        Err(_) => true, // can't lock (possibly held by us), keep for deferred
                     }
                 });
+                if resources.len() == before {
+                    need_deferred = true; // nothing removed, schedule retry
+                }
             }
+            Err(_) => {
+                need_deferred = true;
+            }
+        }
+        if need_deferred {
+            let outgoing = Arc::clone(&self.outgoing_resources);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(mut resources) = outgoing.lock() {
+                    resources.retain(|r| {
+                        r.lock().ok().map(|r| r.hash != target_hash).unwrap_or(true)
+                    });
+                }
+            });
         }
     }
 
-    /// Cancel incoming resource and remove from tracking
+    /// Cancel incoming resource and remove from tracking.
+    /// Uses try_lock to avoid deadlock (same pattern as cancel_outgoing_resource).
     pub fn cancel_incoming_resource(&self, resource: Arc<Mutex<Resource>>) {
+        let target_hash = resource.lock().ok().map(|r| r.hash.clone()).unwrap_or_default();
+        if target_hash.is_empty() { return; }
+        let mut need_deferred = false;
         match self.incoming_resources.try_lock() {
             Ok(mut resources) => {
-                resources.retain(|r| !Arc::ptr_eq(r, &resource));
-            }
-            Err(_) => {
-                // incoming_resources is contended (likely held by handle_data_packet
-                // while we're in the assembly thread callback). Defer cleanup.
-                let incoming = Arc::clone(&self.incoming_resources);
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    if let Ok(mut resources) = incoming.lock() {
-                        resources.retain(|r| !Arc::ptr_eq(r, &resource));
+                let before = resources.len();
+                resources.retain(|r| {
+                    match r.try_lock() {
+                        Ok(guard) => guard.hash != target_hash,
+                        Err(_) => true,
                     }
                 });
+                if resources.len() == before {
+                    need_deferred = true;
+                }
             }
+            Err(_) => {
+                need_deferred = true;
+            }
+        }
+        if need_deferred {
+            let incoming = Arc::clone(&self.incoming_resources);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(mut resources) = incoming.lock() {
+                    resources.retain(|r| {
+                        r.lock().ok().map(|r| r.hash != target_hash).unwrap_or(true)
+                    });
+                }
+            });
         }
     }
 

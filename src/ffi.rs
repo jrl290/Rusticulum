@@ -60,6 +60,16 @@ pub fn destroy_handle(id: u64) -> bool {
     HANDLES.lock().unwrap().remove(&id).is_some()
 }
 
+/// Return the number of handles currently stored.
+pub fn handle_count() -> usize {
+    HANDLES.lock().unwrap().len()
+}
+
+/// Return all handle IDs currently stored.
+pub fn handle_keys() -> Vec<u64> {
+    HANDLES.lock().unwrap().keys().cloned().collect()
+}
+
 /// Save an error message (thread-local).
 pub fn set_error(msg: String) {
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(msg));
@@ -82,20 +92,43 @@ pub fn take_error() -> Option<String> {
 /// Returns `Ok(())` on success.
 pub fn init(config_dir: &str, loglevel: i32) -> Result<(), String> {
     let lvl = if loglevel < 0 { None } else { Some(loglevel) };
-    Reticulum::init(
-        Some(config_dir.into()),
-        lvl,
-        None,  // logdest
-        None,  // verbosity
-        false, // require_shared_instance
-        None,  // shared_instance_type
-    )
+    let dir = config_dir.to_string();
+    match std::panic::catch_unwind(move || {
+        Reticulum::init(
+            Some(dir.into()),
+            lvl,
+            None,  // logdest
+            None,  // verbosity
+            false, // require_shared_instance
+            None,  // shared_instance_type
+        )
+    }) {
+        Ok(result) => result,
+        Err(panic) => {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic during init".to_string()
+            };
+            Err(format!("Reticulum init panicked: {}", msg))
+        }
+    }
 }
 
 /// Shut down Reticulum (best-effort).
 pub fn shutdown() -> Result<(), String> {
     crate::reticulum::exit_handler();
     Ok(())
+}
+
+/// Set the log destination to LOG_CALLBACK and install the given closure.
+pub fn set_log_callback<F: Fn(String) + Send + Sync + 'static>(callback: F) {
+    let mut state = crate::LOG_STATE.lock().unwrap();
+    state.logdest = crate::LOG_CALLBACK;
+    state.logcall = Some(std::sync::Arc::new(callback));
+    state.always_override_destination = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,4 +241,35 @@ pub fn transport_request_path(dest_hash: &[u8]) -> Result<(), String> {
 pub fn transport_hops_to(dest_hash: &[u8]) -> i32 {
     let h = Transport::hops_to(dest_hash);
     if h == 255 { -1 } else { h as i32 }
+}
+
+// ---------------------------------------------------------------------------
+// Announce filtering
+// ---------------------------------------------------------------------------
+
+/// Enable or disable early-dropping of inbound announce packets at the
+/// transport layer.  When `true`, all ANNOUNCE packets are silently
+/// discarded except PATH_RESPONSE replies to our own path requests.
+/// This is opt-in (default: `false`).
+pub fn set_drop_announces(enabled: bool) {
+    Transport::set_drop_announces(enabled);
+}
+
+/// Query whether announce dropping is currently enabled.
+pub fn get_drop_announces() -> bool {
+    Transport::drop_announces_enabled()
+}
+
+// ---------------------------------------------------------------------------
+// Keepalive tuning
+// ---------------------------------------------------------------------------
+
+/// Adjust the keepalive interval (in seconds) for all active links and TCP
+/// backbone connections.  Pass `0.0` to restore compiled-in defaults.
+pub fn set_keepalive_interval(secs: f64) -> Result<(), String> {
+    let instance = Reticulum::get_instance()
+        .ok_or_else(|| "Reticulum not initialised".to_string())?;
+    let reticulum = instance.lock().unwrap();
+    reticulum.set_keepalive_interval(secs);
+    Ok(())
 }

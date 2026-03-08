@@ -93,6 +93,7 @@ pub struct LinkInfo {
 	pub traffic_timeout_factor: f64,
 	pub status_closed: bool,
 	pub mtu: Option<usize>,
+	pub attached_interface: Option<String>,
 }
 
 pub struct Destination {
@@ -604,20 +605,14 @@ impl Destination {
 		// Determine context and context_flag
 		let identity = self.identity.as_ref()
 			.ok_or("Cannot announce destination without identity")?;
-		let public_key = identity.get_public_key()?;
-		
-		// Check if ratchet is present by examining announce_data structure
-		// announce_data = public_key + name_hash + random_hash + ratchet + signature + app_data
-		let pub_key_len = public_key.len();
-		let name_hash_len = self.name_hash.len();
-		let random_hash_len = 10; // 5 random + 5 timestamp bytes
-		let signature_len = crate::identity::SIGLENGTH / 8;
-		
-		// Calculate expected length without ratchet
-		let min_len = pub_key_len + name_hash_len + random_hash_len + signature_len;
-		let has_ratchet = announce_data.len() > min_len;
+		let _public_key = identity.get_public_key()?;
 		
 		let context = if path_response { PATHRESPONSE } else { NONE };
+		// The context_flag indicates whether the announce contains a ratchet.
+		// We must check the ratchets field directly rather than inferring
+		// from announce_data length, because app_data can also increase
+		// the length and would be misidentified as a ratchet.
+		let has_ratchet = self.ratchets.as_ref().map_or(false, |r| !r.is_empty());
 		let context_flag = if has_ratchet { FLAG_SET } else { FLAG_UNSET };
 		
 		// Create announce packet

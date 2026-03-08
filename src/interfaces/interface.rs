@@ -100,6 +100,10 @@ pub struct Interface {
     pub ifac_identity: Option<Identity>,
     pub ifac_signature: Option<Vec<u8>>,
 
+    // Forced bitrate throttle (sleep to simulate slower link)
+    // Prefixed with underscore to indicate this is an experimental/unsupported feature
+    pub _force_bitrate: bool,
+
     // Discovery fields
     pub discovery_announce_interval: Option<f64>,
     pub discovery_publish_ifac: bool,
@@ -189,6 +193,8 @@ impl Interface {
             ifac_identity: None,
             ifac_signature: None,
 
+            _force_bitrate: false,
+
             discovery_announce_interval: None,
             discovery_publish_ifac: false,
             reachable_on: None,
@@ -208,6 +214,16 @@ impl Interface {
     pub fn get_hash(&self) -> Vec<u8> {
         let interface_str = self.name.as_ref().map(|n| n.as_str()).unwrap_or("unnamed");
         Identity::full_hash(interface_str.as_bytes())
+    }
+
+    /// If `_force_bitrate` is enabled, sleep proportionally to the data size
+    /// to simulate the configured bitrate. This is an experimental feature
+    /// and may not be fully supported on all interface types.
+    pub fn enforce_bitrate(&self, data_len: usize) {
+        if self._force_bitrate && self.bitrate > 0 {
+            let delay_secs = (data_len as f64 / self.bitrate as f64) * 8.0;
+            std::thread::sleep(std::time::Duration::from_secs_f64(delay_secs));
+        }
     }
 
     /// Determine if ingress limiting should be active

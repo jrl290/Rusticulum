@@ -516,18 +516,24 @@ impl BackboneClientInterface {
 
     #[cfg(target_os = "linux")]
     fn set_timeouts_linux(stream: &TcpStream) -> Result<(), String> {
+        Self::apply_tcp_keepalive(stream, Self::TCP_PROBE_AFTER, Self::TCP_PROBE_INTERVAL, Self::TCP_PROBES, Self::TCP_USER_TIMEOUT)
+    }
+
+    /// Apply TCP keepalive parameters to a raw socket.
+    #[cfg(target_os = "linux")]
+    fn apply_tcp_keepalive(stream: &TcpStream, probe_after: u64, probe_interval: u64, probes: u64, user_timeout: u64) -> Result<(), String> {
         use std::os::unix::io::AsRawFd;
         use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_USER_TIMEOUT};
 
         unsafe {
             let fd = stream.as_raw_fd();
-            let user_timeout = (Self::TCP_USER_TIMEOUT * 1000) as i32;
+            let user_timeout_ms = (user_timeout * 1000) as i32;
             let keepalive: i32 = 1;
-            let keepidle = Self::TCP_PROBE_AFTER as i32;
-            let keepintvl = Self::TCP_PROBE_INTERVAL as i32;
-            let keepcnt = Self::TCP_PROBES as i32;
+            let keepidle = probe_after as i32;
+            let keepintvl = probe_interval as i32;
+            let keepcnt = probes as i32;
 
-            setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+            setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms as *const _ as *const _, std::mem::size_of::<i32>() as u32);
             setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive as *const _ as *const _, std::mem::size_of::<i32>() as u32);
             setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle as *const _ as *const _, std::mem::size_of::<i32>() as u32);
             setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl as *const _ as *const _, std::mem::size_of::<i32>() as u32);
@@ -536,6 +542,28 @@ impl BackboneClientInterface {
 
         Ok(())
     }
+
+    /// Re-apply TCP keepalive settings on the live socket with a custom probe-after interval.
+    /// Uses `probe_after_secs` as the idle time before first probe, derives other values proportionally.
+    #[cfg(target_os = "linux")]
+    pub fn set_tcp_keepalive(&self, probe_after_secs: u64) {
+        if let Some(ref sock) = self.socket {
+            let stream = sock.lock().unwrap();
+            // Scale user_timeout proportionally: default ratio is 24/5 ≈ 4.8x probe_after
+            let user_timeout = probe_after_secs * 5;
+            let probe_interval = std::cmp::max(probe_after_secs / 5, 1);
+            let probes = Self::TCP_PROBES;
+            if let Err(e) = Self::apply_tcp_keepalive(&stream, probe_after_secs, probe_interval, probes, user_timeout) {
+                crate::log(&format!("Failed to update TCP keepalive: {}", e), crate::LOG_ERROR, false, false);
+            } else {
+                crate::log(&format!("TCP keepalive updated: probe_after={}s interval={}s timeout={}s", probe_after_secs, probe_interval, user_timeout), crate::LOG_DEBUG, false, false);
+            }
+        }
+    }
+
+    /// Stub for non-Linux platforms.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_tcp_keepalive(&self, _probe_after_secs: u64) {}
 
     pub fn start_read_loop(iface: Arc<Mutex<BackboneClientInterface>>) {
         thread::spawn(move || {
@@ -646,6 +674,9 @@ impl BackboneClientInterface {
         if !self.base.online {
             return Ok(());
         }
+
+        // Apply forced bitrate delay if set
+        self.base.enforce_bitrate(data.len());
 
         let escaped = Hdlc::escape(&data);
         let mut framed = Vec::with_capacity(escaped.len() + 2);

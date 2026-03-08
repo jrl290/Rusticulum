@@ -3,7 +3,7 @@ use crate::discovery::{InterfaceAnnounceHandler, InterfaceAnnouncer, InterfaceDi
 use crate::interfaces::interface::Interface;
 use crate::identity::Identity;
 use crate::packet::{Packet, ANNOUNCE, DATA, LINKREQUEST, PROOF, CACHE_REQUEST};
-use crate::{log, LOG_DEBUG, LOG_ERROR, LOG_EXTREME};
+use crate::{log, LOG_DEBUG, LOG_ERROR, LOG_EXTREME, LOG_NOTICE, LOG_WARNING};
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -305,6 +305,7 @@ pub struct TransportState {
     pub network_identity: Option<Identity>,
     pub is_connected_to_shared_instance: bool,
     pub transport_enabled: bool,
+    pub drop_announces: bool,
     pub discovery_announcer: Option<InterfaceAnnouncer>,
     pub interface_discovery: Option<InterfaceDiscovery>,
     pub interface_announce_handler: Option<Arc<InterfaceAnnounceHandler>>,
@@ -420,7 +421,7 @@ pub struct CachedPacketEntry {
     pub interface_name: Option<String>,
 }
 
-static TRANSPORT: Lazy<Mutex<TransportState>> = Lazy::new(|| Mutex::new(TransportState {
+pub(crate) static TRANSPORT: Lazy<Mutex<TransportState>> = Lazy::new(|| Mutex::new(TransportState {
     max_pr_tags: 32000,
     hashlist_maxsize: 1_000_000,
     job_interval: 0.250,
@@ -652,6 +653,50 @@ impl Transport {
             }
         }
 
+        // Load previously cached destination/path table from disk
+        if !state.is_connected_to_shared_instance {
+            let dest_table_path = crate::reticulum::storage_path().join("destination_table");
+            if dest_table_path.exists() {
+                if let Ok(mut file) = File::open(&dest_table_path) {
+                    let mut buf = Vec::new();
+                    if file.read_to_end(&mut buf).is_ok() {
+                        if let Ok(entries) = from_slice::<Vec<SerializedPathEntry>>(&buf) {
+                            let now_ts = now();
+                            let mut loaded = 0usize;
+                            for entry in entries {
+                                // Skip expired paths
+                                if entry.expires > 0.0 && entry.expires < now_ts {
+                                    continue;
+                                }
+                                let interface_name = if entry.interface_hash.is_empty() {
+                                    None
+                                } else {
+                                    Some(String::from_utf8_lossy(&entry.interface_hash).to_string())
+                                };
+                                let path_entry = vec![
+                                    PathEntryValue::Timestamp(entry.timestamp),
+                                    PathEntryValue::NextHop(entry.received_from),
+                                    PathEntryValue::Hops(entry.hops),
+                                    PathEntryValue::Expires(entry.expires),
+                                    PathEntryValue::RandomBlobs(entry.random_blobs),
+                                    PathEntryValue::ReceivingInterface(interface_name),
+                                    PathEntryValue::PacketHash(entry.packet_hash),
+                                ];
+                                state.path_table.insert(entry.destination_hash, path_entry);
+                                loaded += 1;
+                            }
+                            log(
+                                &format!("Loaded {} cached path entries from disk", loaded),
+                                LOG_NOTICE,
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         drop(state);
 
         let _ = thread::spawn(|| Transport::jobloop());
@@ -819,6 +864,24 @@ impl Transport {
     pub fn transport_enabled() -> bool {
         let state = TRANSPORT.lock().unwrap();
         state.transport_enabled
+    }
+
+    /// Enable or disable early-dropping of inbound announce packets.
+    /// When enabled, all ANNOUNCE packets are silently discarded at the
+    /// transport layer except PATH_RESPONSE replies to our own path requests.
+    /// This is an opt-in setting (default: false).
+    pub fn set_drop_announces(enabled: bool) {
+        let mut state = TRANSPORT.lock().unwrap();
+        state.drop_announces = enabled;
+        crate::log(
+            &format!("Transport: drop_announces set to {}", enabled),
+            crate::LOG_NOTICE, false, false,
+        );
+    }
+
+    pub fn drop_announces_enabled() -> bool {
+        let state = TRANSPORT.lock().unwrap();
+        state.drop_announces
     }
 
     pub fn is_connected_to_shared_instance() -> bool {
@@ -2024,6 +2087,20 @@ impl Transport {
             }
         } else {
             let mut packet_hashes: Vec<Vec<u8>> = Vec::new();
+
+            // For link-type destinations, get the link's attached_interface and status
+            // from the packet's destination LinkInfo (avoiding a RUNTIME_LINKS lock that
+            // could deadlock if the link Mutex is already held by this thread).
+            // Matches Python Transport.outbound: only transmit on the link's attached_interface,
+            // and don't transmit if the link is closed.
+            let link_outbound_info = if packet.destination_type == Some(crate::destination::DestinationType::Link) {
+                packet.destination.as_ref()
+                    .and_then(|d| d.link.as_ref())
+                    .map(|li| (li.attached_interface.clone(), li.status_closed))
+            } else {
+                None
+            };
+
             for interface in &mut state.interfaces {
                 // For announces, broadcast to ALL interfaces even if out_enabled=false
                 // For other packets, only send on interfaces with out_enabled=true
@@ -2035,6 +2112,19 @@ impl Transport {
 
                 if should_send_on_interface {
                     let mut should_transmit = true;
+
+                    // Link-destination filtering (Python: packet.destination.type == LINK)
+                    if let Some((ref link_attached_iface, is_closed)) = link_outbound_info {
+                        if is_closed {
+                            should_transmit = false;
+                        }
+                        if let Some(link_iface) = link_attached_iface {
+                            if &interface.name != link_iface {
+                                should_transmit = false;
+                            }
+                        }
+                    }
+
                     if let Some(attached) = &packet.attached_interface {
                         if &interface.name != attached {
                             should_transmit = false;
@@ -2102,11 +2192,13 @@ impl Transport {
             };
 
             let receipt = crate::packet::PacketReceipt::new_with_timeout(packet, timeout);
+            crate::log(&format!("Receipt created timeout={:.3}s hash={}", timeout, crate::hexrep(&receipt.hash, false)), crate::LOG_NOTICE, false, false);
             packet.receipt = Some(receipt.clone());
             state.receipts.push(receipt);
         }
 
         eprintln!("[DEBUG] Transport::outbound prepared {} transmissions", transmissions.len());
+        crate::log(&format!("Transport::outbound {} transmissions, sent={}", transmissions.len(), sent), crate::LOG_NOTICE, false, false);
         let outbound_held_ms = outbound_lock_held_started.elapsed().as_millis();
         if outbound_held_ms > 500 {
             eprintln!(
@@ -2667,14 +2759,45 @@ impl Transport {
     }
 
     pub fn inbound(raw: Vec<u8>, receiving_interface: Option<String>) -> bool {
+        // Log raw packet type from header byte before any processing
+        let raw_ptype = if raw.len() > 2 { raw[0] & 0x03 } else { 0xFF };
+        let raw_ptype_str = match raw_ptype { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
+        crate::log(&format!("inbound_raw len={} ptype_byte={} ({})", raw.len(), raw_ptype, raw_ptype_str), crate::LOG_NOTICE, false, false);
         eprintln!("[INBOUND] raw={} bytes from {:?}", raw.len(), receiving_interface);
+        // IFAC flag check: if interface doesn't have IFAC, drop packets with IFAC flag
+        if raw.len() > 2 && (raw[0] & 0x80) == 0x80 {
+            // IFAC flag set but we don't have IFAC configured - drop
+            crate::log(&format!("inbound_raw IFAC drop len={} ptype={}", raw.len(), raw_ptype_str), crate::LOG_NOTICE, false, false);
+            return false;
+        }
+        if raw.len() <= 2 {
+            return false;
+        }
         let mut packet = Packet::new(None, Vec::new(), 0, 0, BROADCAST, crate::packet::HEADER_1, None, None, false, 0);
         packet.raw = raw;
         packet.receiving_interface = receiving_interface;
         if !packet.unpack() {
+            crate::log(&format!("inbound unpack FAILED len={} raw_ptype={}", packet.raw.len(), raw_ptype_str), crate::LOG_NOTICE, false, false);
             eprintln!("[INBOUND] unpack FAILED");
             return false;
         }
+
+        // Early-drop: when drop_announces is enabled, silently discard
+        // announce packets before any logging or processing. PATH_RESPONSE
+        // replies to our own request_path() calls are always kept.
+        if packet.packet_type == ANNOUNCE {
+            let should_drop = {
+                let state = TRANSPORT.lock().unwrap();
+                state.drop_announces
+            };
+            if should_drop && packet.context != crate::packet::PATH_RESPONSE {
+                return false;
+            }
+        }
+
+        let ptype_str = match packet.packet_type { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
+        crate::log(&format!("Inbound {} hops={} dest={}", ptype_str, packet.hops,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
         eprintln!("[INBOUND] unpacked ptype={} ctx={} hops={} dest_hash={:?}",
             packet.packet_type, packet.context, packet.hops,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)));
@@ -2685,6 +2808,7 @@ impl Transport {
             let state = TRANSPORT.lock().unwrap();
 
             // --- packet_filter logic (inlined to avoid separate lock) ---
+            // Must match Python's Transport.packet_filter() exactly
             let filter_ok = if state.is_connected_to_shared_instance {
                 true
             } else if packet.transport_id.is_some() && packet.packet_type != ANNOUNCE {
@@ -2694,17 +2818,37 @@ impl Transport {
                     false
                 }
             } else if packet.context == crate::packet::KEEPALIVE
-                || (packet.context >= crate::packet::RESOURCE && packet.context <= crate::packet::RESOURCE_RCL)
+                || packet.context == crate::packet::RESOURCE_REQ
+                || packet.context == crate::packet::RESOURCE_PRF
+                || packet.context == crate::packet::RESOURCE
                 || packet.context == crate::packet::CACHE_REQUEST
                 || packet.context == crate::packet::CHANNEL
             {
                 true
-            } else if packet.destination_type == Some(crate::destination::DestinationType::Plain) && packet.packet_type != ANNOUNCE {
-                packet.hops <= 1
-            } else if packet.destination_type == Some(crate::destination::DestinationType::Group) && packet.packet_type != ANNOUNCE {
-                packet.hops <= 1
+            } else if packet.destination_type == Some(crate::destination::DestinationType::Plain) {
+                if packet.packet_type != ANNOUNCE {
+                    packet.hops <= 1
+                } else {
+                    false // Drop invalid PLAIN announce
+                }
+            } else if packet.destination_type == Some(crate::destination::DestinationType::Group) {
+                if packet.packet_type != ANNOUNCE {
+                    packet.hops <= 1
+                } else {
+                    false // Drop invalid GROUP announce
+                }
             } else if let Some(hash) = &packet.packet_hash {
-                !state.packet_hashlist.contains(hash) && !state.packet_hashlist_prev.contains(hash)
+                if !state.packet_hashlist.contains(hash) && !state.packet_hashlist_prev.contains(hash) {
+                    true
+                } else if packet.packet_type == ANNOUNCE
+                    && packet.destination_type == Some(crate::destination::DestinationType::Single)
+                {
+                    // ANNOUNCE packets for SINGLE destinations always pass,
+                    // even if the hash is already in the hashlist
+                    true
+                } else {
+                    false
+                }
             } else if packet.packet_type == ANNOUNCE {
                 packet.destination_type != Some(crate::destination::DestinationType::Link)
             } else {
@@ -2736,6 +2880,7 @@ impl Transport {
         };
 
         if !filter_pass {
+            crate::log(&format!("Inbound FILTERED ptype={} ctx={}", packet.packet_type, packet.context), crate::LOG_NOTICE, false, false);
             eprintln!("[INBOUND] FILTERED OUT ptype={} ctx={}", packet.packet_type, packet.context);
             return false;
         }
@@ -2774,9 +2919,11 @@ impl Transport {
                     Some(&pub_key),
                     packet.context_flag,
                 ) {
+                    crate::log(&format!("Announce INVALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
                     eprintln!("[ANNOUNCE] Validation FAILED");
                     announce_should_add = false;
                 } else {
+                    crate::log(&format!("Announce VALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
                     eprintln!("[ANNOUNCE] Validation SUCCESS");
                 }
             }
@@ -2970,6 +3117,7 @@ impl Transport {
                         PathEntryValue::PacketHash(packet.packet_hash.clone().unwrap_or_default()),
                     ];
                     state.path_table.insert(destination_hash.clone(), entry);
+                    crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
 
                     if state.transport_enabled && packet.transport_id.is_some() {
                         let block_rebroadcasts = packet.context == crate::packet::PATH_RESPONSE;
@@ -3282,24 +3430,53 @@ impl Transport {
         }
 
         for link_packet in deferred_link_packets {
+            let is_link_proof = link_packet.packet_type == PROOF
+                && link_packet.destination_type == Some(crate::destination::DestinationType::Link);
+            if is_link_proof {
+                let proof_hash_hex = if link_packet.data.len() >= 32 {
+                    crate::hexrep(&link_packet.data[..32], false)
+                } else {
+                    format!("<short:{}>", link_packet.data.len())
+                };
+                log(&format!("Inbound link PROOF proof_hash={} link={} data_len={}",
+                    proof_hash_hex,
+                    link_packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+                    link_packet.data.len()), LOG_NOTICE, false, false);
+            }
             let handled = crate::link::dispatch_runtime_packet(&link_packet);
-            if handled
-                && link_packet.packet_type == PROOF
-                && link_packet.destination_type == Some(crate::destination::DestinationType::Link)
-            {
+            if handled && is_link_proof && link_packet.context != crate::packet::LRPROOF {
                 if let Some(destination_hash) = link_packet.destination_hash.as_ref() {
                     if let Ok(mut state) = TRANSPORT.lock() {
+                        let receipt_count = state.receipts.len();
+                        let mut matched = false;
                         for receipt in &mut state.receipts {
                             if crate::link::validate_runtime_proof_for_receipt(
                                 destination_hash,
                                 &link_packet.data,
                                 receipt,
                             ) {
+                                matched = true;
                                 break;
+                            }
+                        }
+                        if !matched {
+                            let proof_hash_hex = if link_packet.data.len() >= 32 {
+                                crate::hexrep(&link_packet.data[..32], false)
+                            } else {
+                                "?".to_string()
+                            };
+                            log(&format!("Link PROOF no matching receipt proof_hash={} checked={} receipts",
+                                proof_hash_hex, receipt_count), LOG_WARNING, false, false);
+                            // Log all receipt hashes for debugging
+                            for r in &state.receipts {
+                                log(&format!("  receipt hash={} status={}", crate::hexrep(&r.hash, false), r.status), LOG_DEBUG, false, false);
                             }
                         }
                     }
                 }
+            } else if is_link_proof && !handled {
+                log(&format!("Link PROOF dispatch FAILED (link not found) link={}",
+                    link_packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), LOG_WARNING, false, false);
             }
         }
 

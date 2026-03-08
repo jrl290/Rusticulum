@@ -2,6 +2,7 @@ use crate::config::{default_config_lines, Config, ConfigSection};
 use crate::identity::Identity;
 use crate::interfaces::interface::InterfaceMode;
 use crate::interfaces::Interface;
+#[cfg(feature = "serial")]
 use crate::interfaces::RNodeInterface;
 use crate::{log, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING};
 use hkdf::Hkdf;
@@ -225,12 +226,15 @@ enum SystemInterface {
     TcpClient(Arc<Mutex<crate::interfaces::tcp_interface::TcpClientInterface>>),
     Pipe(Arc<Mutex<crate::interfaces::pipe_interface::PipeInterface>>),
     Auto(Arc<crate::interfaces::auto_interface::AutoInterface>),
+    #[cfg(feature = "serial")]
     Serial(Arc<Mutex<crate::interfaces::serial_interface::SerialInterface>>),
+    #[cfg(feature = "serial")]
     Kiss(Arc<Mutex<crate::interfaces::kiss_interface::KissInterface>>),
     Backbone(Arc<Mutex<crate::interfaces::backbone_interface::BackboneInterface>>),
     BackboneClient(Arc<Mutex<crate::interfaces::backbone_interface::BackboneClientInterface>>),
     I2P(Arc<Mutex<crate::interfaces::i2p::I2PInterface>>),
     I2PPeer(Arc<Mutex<crate::interfaces::i2p::I2PInterfacePeer>>),
+    #[cfg(feature = "serial")]
     RNode(Arc<Mutex<RNodeInterface>>),
 }
 
@@ -1182,7 +1186,7 @@ impl Reticulum {
                     client.base.out_enabled = true;
                     if let Some(bitrate) = crate::transport::Transport::forced_shared_bitrate() {
                         client.base.bitrate = bitrate;
-                        client.force_bitrate = true;
+                        client.base._force_bitrate = true;
                         client.base.optimise_mtu();
                     }
                     self.is_shared_instance = false;
@@ -1232,7 +1236,7 @@ impl Reticulum {
                 client.base.out_enabled = true;
                 if let Some(bitrate) = crate::transport::Transport::forced_shared_bitrate() {
                     client.base.bitrate = bitrate;
-                    client.force_bitrate = true;
+                    client.base._force_bitrate = true;
                     client.base.optimise_mtu();
                 }
                 self.is_shared_instance = false;
@@ -1569,7 +1573,7 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create UDP interface");
                             }
                         }
@@ -1591,7 +1595,7 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create TCP server interface");
                             }
                         }
@@ -1622,7 +1626,7 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create TCP client interface");
                             }
                         }
@@ -1652,13 +1656,14 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create pipe interface");
                             }
                         }
                     }
                     crate::transport::Transport::register_interface_stub_config(stub_config);
                 }
+                #[cfg(feature = "serial")]
                 "SerialInterface" => {
                     match crate::interfaces::serial_interface::SerialInterface::new(&config_map) {
                         Ok(mut interface) => {
@@ -1683,13 +1688,14 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create serial interface");
                             }
                         }
                     }
                     crate::transport::Transport::register_interface_stub_config(stub_config);
                 }
+                #[cfg(feature = "serial")]
                 "KISSInterface" => {
                     match crate::interfaces::kiss_interface::KissInterface::new(&config_map) {
                         Ok(mut interface) => {
@@ -1714,13 +1720,14 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create KISS interface");
                             }
                         }
                     }
                     crate::transport::Transport::register_interface_stub_config(stub_config);
                 }
+                #[cfg(feature = "serial")]
                 "RNodeInterface" => {
                     let port = config.get("port").unwrap_or("/dev/ttyUSB0").to_string();
                     let frequency = config.get_int("frequency").unwrap_or(0) as u64;
@@ -1767,7 +1774,7 @@ impl Reticulum {
                                     false,
                                     false,
                                 );
-                                if instance_init {
+                                if instance_init && panic_on_interface_error_enabled() {
                                     panic!("Failed to configure RNode device");
                                 }
                             }
@@ -1791,7 +1798,7 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create RNode interface");
                             }
                         }
@@ -1813,7 +1820,7 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create Backbone interface");
                             }
                         }
@@ -1844,7 +1851,7 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create BackboneClient interface");
                             }
                         }
@@ -1889,7 +1896,7 @@ impl Reticulum {
                                 false,
                                 false,
                             );
-                            if instance_init {
+                            if instance_init && panic_on_interface_error_enabled() {
                                 panic!("Failed to create AutoInterface");
                             }
                         }
@@ -1921,11 +1928,89 @@ impl Reticulum {
             }
         }
     }
+
+    /// Adjust the keepalive interval (in seconds) for all active links and
+    /// TCP backbone connections.  Pass `0.0` to restore the compiled-in
+    /// defaults.
+    ///
+    /// This is intended to be called when the host application transitions
+    /// between foreground and background modes so that power usage can be
+    /// reduced while the app is not actively in use.
+    pub fn set_keepalive_interval(&self, secs: f64) {
+        let link_keepalive;
+        let link_stale_time;
+        let tcp_probe_after: u64;
+
+        if secs <= 0.0 {
+            // Restore defaults
+            link_keepalive = crate::link::KEEPALIVE;
+            link_stale_time = crate::link::STALE_TIME;
+            tcp_probe_after = crate::interfaces::backbone_interface::BackboneClientInterface::TCP_PROBE_AFTER;
+        } else {
+            link_keepalive = secs;
+            link_stale_time = secs * crate::link::STALE_FACTOR;
+            tcp_probe_after = secs as u64;
+        }
+
+        // --- Update active + pending links ---
+        {
+            let mut transport = crate::transport::TRANSPORT.lock().unwrap();
+            let mut updated = 0usize;
+            for link in transport.active_links.iter_mut() {
+                link.keepalive = link_keepalive;
+                link.stale_time = link_stale_time;
+                updated += 1;
+            }
+            for link in transport.pending_links.iter_mut() {
+                link.keepalive = link_keepalive;
+                link.stale_time = link_stale_time;
+                updated += 1;
+            }
+            if updated > 0 {
+                log(
+                    &format!("Updated keepalive to {}s on {} link(s)", link_keepalive, updated),
+                    LOG_DEBUG,
+                    false,
+                    false,
+                );
+            }
+        }
+
+        // --- Update TCP backbone connections ---
+        for iface in &self.system_interfaces {
+            if let SystemInterface::BackboneClient(ref arc) = iface {
+                let guard = arc.lock().unwrap();
+                guard.set_tcp_keepalive(tcp_probe_after);
+            }
+        }
+
+        log(
+            &format!("Keepalive interval set to {}s (link={}s stale={}s tcp_probe={}s)",
+                secs, link_keepalive, link_stale_time, tcp_probe_after),
+            LOG_VERBOSE,
+            false,
+            false,
+        );
+    }
 }
 
 fn ensure_dir(path: &Path) -> Result<(), String> {
     if !path.exists() {
-        fs::create_dir_all(path).map_err(|err| format!("Failed to create {}: {}", path.display(), err))?;
+        if let Err(e) = fs::create_dir_all(path) {
+            // On Docker hosts with userns-remap (e.g. Synology NAS), the
+            // container's root uid is remapped and may lack permission to
+            // create directories inside bind mounts.  If the path appeared
+            // between our exists-check and now (race), or the create failed
+            // but the dir is somehow present, carry on.
+            if !path.is_dir() {
+                return Err(format!(
+                    "Failed to create {}: {}\n\
+                     Hint: pre-create this directory on the Docker host and chmod 777.",
+                    path.display(),
+                    e
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1954,6 +2039,11 @@ pub fn exit_handler() {
         crate::Profiler::results();
     }
     crate::set_loglevel(-1);
+
+    // Clear the singleton so init() can be called again (needed for Android service restart)
+    if let Ok(mut instance) = INSTANCE.lock() {
+        *instance = None;
+    }
 }
 
 pub fn should_use_implicit_proof() -> bool {
