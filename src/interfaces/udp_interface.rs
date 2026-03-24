@@ -255,15 +255,15 @@ mod tests {
     fn test_udp_interface_display() {
         let mut config = HashMap::new();
         config.insert("name".to_string(), "MyUDP".to_string());
-        config.insert("listen_ip".to_string(), "192.168.1.1".to_string());
-        config.insert("port".to_string(), "8080".to_string());
-        config.insert("forward_ip".to_string(), "192.168.1.255".to_string());
+        // Use loopback + ephemeral port (0) so no real NIC address is required
+        config.insert("listen_ip".to_string(), "127.0.0.1".to_string());
+        config.insert("port".to_string(), "0".to_string());
+        config.insert("forward_ip".to_string(), "127.0.0.1".to_string());
 
         let interface = UdpInterface::new(None, &config).unwrap();
         let display = format!("{}", interface);
         assert!(display.contains("UDPInterface"));
         assert!(display.contains("MyUDP"));
-        assert!(display.contains("192.168.1.1"));
-        assert!(display.contains("8080"));
+        assert!(display.contains("127.0.0.1"));
     }
 }

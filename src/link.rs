@@ -3,7 +3,7 @@ use crate::packet::{self, Packet, DATA, PROOF, LINKIDENTIFY};
 use crate::identity::{Identity, Token};
 use once_cell::sync::Lazy;
 use rand::RngCore;
-use rmp_serde::{decode::from_slice, encode::to_vec_named};
+use rmp_serde::{decode::from_slice, encode::to_vec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -77,12 +77,6 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
         match links.get(&destination_hash).and_then(|w| w.upgrade()) {
             Some(link) => link,
             None => {
-                eprintln!("[LINK-RUNTIME] no runtime link for {}", crate::hexrep(&destination_hash, false));
-                let known: Vec<String> = links
-                    .keys()
-                    .map(|k| crate::hexrep(k, false))
-                    .collect();
-                eprintln!("[LINK-RUNTIME] known links: {:?}", known);
                 links.remove(&destination_hash);
                 return false;
             }
@@ -90,7 +84,6 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
     };
 
     let (handled, should_fire_link_established, should_fire_remote_identified) = if let Ok(mut link_guard) = link.lock() {
-        eprintln!("[LINK-RUNTIME] delivering to link {}", crate::hexrep(&link_guard.link_id, false));
         let was_pending = link_guard.state != STATE_ACTIVE;
         let ok = link_guard.receive(packet).is_ok();
         let now_active = link_guard.state == STATE_ACTIVE;
@@ -108,7 +101,6 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
         if let Ok(mut link_guard) = link.lock() {
             if let Some(callback) = link_guard.callbacks.link_established.take() {
                 drop(link_guard);
-                eprintln!("[LINK-RUNTIME] firing link_established callback");
                 callback(Arc::clone(&link));
             }
         }
@@ -122,7 +114,6 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
             let callback = link_guard.callbacks.remote_identified.clone();
             drop(link_guard);
             if let (Some(identity), Some(callback)) = (identity, callback) {
-                eprintln!("[LINK-RUNTIME] firing remote_identified callback");
                 callback(Arc::clone(&link), identity);
             }
         }
@@ -336,10 +327,6 @@ pub fn mode_from_lp_packet(data: &[u8]) -> u8 {
 /// Derive link ID from a link request packet
 pub fn link_id_from_lr_packet(packet: &Packet) -> Vec<u8> {
     let mut hashable_part = packet.get_hashable_part();
-    eprintln!("[LINK-ID] raw_len={} data_len={} header_type={} hashable_len={} hashable_head={}", 
-        packet.raw.len(), packet.data.len(), packet.header_type,
-        hashable_part.len(),
-        crate::hexrep(&hashable_part[..hashable_part.len().min(20)], false));
     if packet.data.len() > ECPUBSIZE {
         let diff = packet.data.len() - ECPUBSIZE;
         if hashable_part.len() >= diff {
@@ -347,7 +334,6 @@ pub fn link_id_from_lr_packet(packet: &Packet) -> Vec<u8> {
         }
     }
     let result = identity::truncated_hash(&hashable_part);
-    eprintln!("[LINK-ID] final hashable_len={} link_id={}", hashable_part.len(), crate::hexrep(&result, false));
     result
 }
 
@@ -363,18 +349,15 @@ pub struct LinkCallbacks {
     pub remote_identified: Option<Arc<dyn Fn(Arc<Mutex<Link>>, Identity) + Send + Sync>>,
 }
 
+/// Python RNS wire format for a REQUEST packet payload:
+/// msgpack array [timestamp_f64, path_hash_16bytes, data_bytes]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct RequestPayload {
-    path: String,
-    data: Vec<u8>,
-    request_id: Vec<u8>,
-}
+struct RequestPayload(f64, serde_bytes::ByteBuf, serde_bytes::ByteBuf);
 
+/// Python RNS wire format for a RESPONSE packet payload:
+/// msgpack array [request_id_16bytes, response_bytes]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ResponsePayload {
-    request_id: Vec<u8>,
-    response: Vec<u8>,
-}
+struct ResponsePayload(serde_bytes::ByteBuf, serde_bytes::ByteBuf);
 
 #[derive(Clone)]
 pub struct RequestReceipt {
@@ -494,7 +477,6 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
                             if let Some(request_time) = link_guard.request_time {
                                 if now_seconds() >= request_time + link_guard.establishment_timeout {
                                     let state_name = if link_guard.state == STATE_PENDING { "PENDING" } else { "HANDSHAKE" };
-                                    eprintln!("[LINK] watchdog: {} timeout for {}", state_name, crate::hexrep(&link_guard.link_id, false));
                                     crate::log(&format!("Link establishment timed out ({}): {}", state_name, crate::hexrep(&link_guard.link_id, false)), crate::LOG_DEBUG, false, false);
                                     link_guard.state = STATE_CLOSED;
                                     link_guard.status = STATE_CLOSED;
@@ -520,9 +502,6 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
                                 // Check stale first
                                 let stale_secs = link_guard.stale_time as u64;
                                 if now >= last_inbound + stale_secs {
-                                    eprintln!("[LINK] watchdog: link {} going STALE (no inbound for {}s, stale_time={}s)", 
-                                        crate::hexrep(&link_guard.link_id, false),
-                                        now.saturating_sub(last_inbound), stale_secs);
                                     link_guard.state = STATE_STALE;
                                     link_guard.status = STATE_STALE;
                                     WatchdogAction::Teardown
@@ -550,7 +529,7 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
 
             match action {
                 WatchdogAction::Exit => break,
-                WatchdogAction::SendKeepalive(dest, link_id) => {
+                WatchdogAction::SendKeepalive(dest, _link_id) => {
                     let mut keepalive_packet = Packet::new(
                         Some(dest),
                         vec![0xFF],
@@ -563,13 +542,10 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
                         false,
                         0,
                     );
-                    if let Err(e) = keepalive_packet.send() {
-                        eprintln!("[LINK] watchdog keepalive send failed for {}: {}", crate::hexrep(&link_id, false), e);
-                    }
+                    let _ = keepalive_packet.send();
                 }
                 WatchdogAction::Teardown => {
                     if let Ok(mut link_guard) = link_arc.lock() {
-                        eprintln!("[LINK] watchdog: tearing down stale link {}", crate::hexrep(&link_guard.link_id, false));
                         crate::log(&format!("Link timeout, tearing down {}", crate::hexrep(&link_guard.link_id, false)), crate::LOG_DEBUG, false, false);
                         link_guard.teardown();
                     }
@@ -754,7 +730,6 @@ impl Link {
             return Err(format!("Invalid link request data length: {} (expected {} or {})", data.len(), ECPUBSIZE, ECPUBSIZE + LINK_MTU_SIZE));
         }
 
-        eprintln!("[LINK] validate_request: data_len={} from packet hops={}", data.len(), packet.hops);
 
         // Extract peer's public keys
         let peer_pub_bytes = data[..ECPUBSIZE / 2].to_vec();         // X25519 (32 bytes)
@@ -772,7 +747,6 @@ impl Link {
 
         // Set link_id from packet
         link.set_link_id_from_packet(packet);
-        eprintln!("[LINK] validate_request: link_id={}", crate::hexrep(&link.link_id, false));
 
         // Parse MTU and mode from signalling bytes
         if data.len() == ECPUBSIZE + LINK_MTU_SIZE {
@@ -811,13 +785,11 @@ impl Link {
 
         // Perform ECDH handshake
         link.handshake()?;
-        eprintln!("[LINK] validate_request: handshake complete");
 
         link.attached_interface = packet.receiving_interface.clone();
 
         // Generate and send the link proof
         link.prove_with_identity(identity)?;
-        eprintln!("[LINK] validate_request: proof sent");
 
         link.request_time = Some(now_seconds());
         link.had_inbound(true); // Initialize last_data/last_inbound before cloning
@@ -829,7 +801,6 @@ impl Link {
         let link_arc = Arc::new(Mutex::new(link.clone()));
         register_runtime_link(Arc::clone(&link_arc));
 
-        eprintln!("[LINK] validate_request: link registered, link_id={}", crate::hexrep(&link.link_id, false));
 
         Ok(link)
     }
@@ -901,7 +872,6 @@ impl Link {
         packet.pack()?;
         self.establishment_cost += packet.raw.len();
         self.set_link_id_from_packet(&packet);
-        eprintln!("[LINK] initiated link_id {}", crate::hexrep(&self.link_id, false));
         self.request_time = Some(now_seconds());
 
         crate::transport::Transport::register_link(self.clone());
@@ -1312,8 +1282,6 @@ impl Link {
 
         // Sign with the destination's identity Ed25519 key
         let signature = identity.sign(&signed_data);
-        eprintln!("[LINK] prove_with_identity: signature={} bytes, signed_data={} bytes",
-            signature.len(), signed_data.len());
 
         let mut proof_data = signature;
         if let Some(pub_bytes) = &self.pub_bytes {
@@ -1321,7 +1289,6 @@ impl Link {
         }
         proof_data.extend_from_slice(&sig_bytes);
 
-        eprintln!("[LINK] prove_with_identity: proof_data={} bytes (sig64 + pub32 + sig3 = 99)", proof_data.len());
 
         // Create a Link destination with dest_type=Link and hash=link_id for the proof packet
         let mut link_destination = self.destination.lock()
@@ -1345,7 +1312,6 @@ impl Link {
             0,
         );
         proof_packet.send()?;
-        eprintln!("[LINK] prove_with_identity: proof packet sent ({} raw bytes)", proof_packet.raw.len());
 
         self.last_proof = current_time().unwrap_or(0);
         self.establishment_cost += proof_packet.raw.len();
@@ -1672,7 +1638,6 @@ impl Link {
                 }
                 PROOF => {
                     if let Err(err) = self.handle_proof_packet(packet) {
-						eprintln!("[LINK] proof handling error: {}", err);
 						return Err(err);
 					}
                 }
@@ -1686,8 +1651,6 @@ impl Link {
     
     /// Handle DATA packets
     fn handle_data_packet(&mut self, packet: &Packet) -> Result<(), String> {
-        eprintln!("[LINK-DATA] ctx={} data_len={} state={} resource_strategy={}", 
-            packet.context, packet.data.len(), self.state, self.resource_strategy);
         
         if packet.context == crate::packet::RESOURCE {
             let mut deferred_actions: Vec<(Arc<Mutex<Resource>>, bool, bool)> = Vec::new();
@@ -1751,30 +1714,15 @@ impl Link {
         if packet.context == crate::packet::RESOURCE_ADV {
             let plaintext = match self.decrypt(&packet.data) {
                 Ok(plaintext) => plaintext,
-                Err(e) => {
-                    eprintln!("[LINK-DATA] RESOURCE_ADV decrypt failed: {}", e);
+                Err(_) => {
                     return Ok(());
                 }
             };
-            eprintln!("[LINK-DATA] RESOURCE_ADV decrypted {} bytes, is_request={} is_response={}", 
-                plaintext.len(),
-                {
-                    let mut adv_packet = packet.clone();
-                    adv_packet.plaintext = Some(plaintext.clone());
-                    crate::resource::ResourceAdvertisement::is_request(&adv_packet)
-                },
-                {
-                    let mut adv_packet = packet.clone();
-                    adv_packet.plaintext = Some(plaintext.clone());
-                    crate::resource::ResourceAdvertisement::is_response(&adv_packet)
-                }
-            );
 
             let mut advertisement_packet = packet.clone();
             advertisement_packet.plaintext = Some(plaintext);
 
             if crate::resource::ResourceAdvertisement::is_request(&advertisement_packet) {
-                eprintln!("[LINK-DATA] RESOURCE_ADV is_request, accepting");
                 if let Some(resource) = Resource::accept(
                     &advertisement_packet,
                     Arc::new(Mutex::new(self.clone())),
@@ -1789,7 +1737,6 @@ impl Link {
             }
 
             if crate::resource::ResourceAdvertisement::is_response(&advertisement_packet) {
-                eprintln!("[LINK-DATA] RESOURCE_ADV is_response, accepting");
                 if let Some(resource) = Resource::accept(
                     &advertisement_packet,
                     Arc::new(Mutex::new(self.clone())),
@@ -1802,13 +1749,10 @@ impl Link {
                 return Ok(());
             }
 
-            eprintln!("[LINK-DATA] RESOURCE_ADV strategy={}", self.resource_strategy);
             match self.resource_strategy {
                 ACCEPT_NONE => {
-                    eprintln!("[LINK-DATA] RESOURCE_ADV REJECTED (strategy=ACCEPT_NONE)");
                 }
                 ACCEPT_APP => {
-                    eprintln!("[LINK-DATA] RESOURCE_ADV accepting (strategy=ACCEPT_APP)");
                     if let Some(resource) = Resource::accept(
                         &advertisement_packet,
                         Arc::new(Mutex::new(self.clone())),
@@ -1816,14 +1760,12 @@ impl Link {
                         None,
                         None,
                     ) {
-                        eprintln!("[LINK-DATA] Resource::accept returned Some");
                         // Register on real link so RESOURCE data packets find it
                         self.register_incoming_resource(resource.clone());
                         if let Some(callback) = &self.callbacks.resource {
                             callback(resource);
                         }
                     } else {
-                        eprintln!("[LINK-DATA] Resource::accept returned None, rejecting");
                         Resource::reject(&advertisement_packet);
                     }
                 }
@@ -1848,8 +1790,7 @@ impl Link {
             // LRRTT packets are encrypted over the link, decrypt first
             let plaintext = match self.decrypt(&packet.data) {
                 Ok(pt) => pt,
-                Err(e) => {
-                    eprintln!("[LINK] LRRTT decrypt failed: {}", e);
+                Err(_) => {
                     return Ok(());
                 }
             };
@@ -1858,12 +1799,17 @@ impl Link {
         }
 
         let plaintext = match self.decrypt(&packet.data) {
-            Ok(plaintext) => plaintext,
-            Err(_) => return Ok(()),
+            Ok(plaintext) => {
+                plaintext
+            },
+            Err(_) => {
+                return Ok(());
+            },
         };
 
         if packet.context == crate::packet::REQUEST {
-            self.handle_request_packet(&plaintext)?;
+            let request_id = packet.get_truncated_hash();
+            self.handle_request_packet(request_id, &plaintext)?;
             return Ok(());
         }
 
@@ -2036,9 +1982,7 @@ impl Link {
 
         if let Some(callback) = &self.callbacks.packet {
             // Prove the packet (sign hash and send PROOF back to sender)
-            if let Err(e) = self.prove_packet(packet) {
-                eprintln!("[LINK] prove_packet failed: {}", e);
-            }
+            let _ = self.prove_packet(packet);
             callback(&plaintext, packet);
         }
         
@@ -2062,8 +2006,6 @@ impl Link {
         self.activated_at = current_time();
         self.update_keepalive();
 
-        eprintln!("[LINK] LRRTT received, link ACTIVE rtt={:.1}ms keepalive={:.0}s link_id={}", 
-            self.rtt.unwrap_or(0.0), self.keepalive, crate::hexrep(&self.link_id, false));
 
         // NOTE: We do NOT fire the link_established callback here because we
         // are inside a Mutex lock. The callback would receive a clone Arc
@@ -2073,15 +2015,20 @@ impl Link {
         Ok(())
     }
 
-    fn handle_request_packet(&mut self, plaintext: &[u8]) -> Result<(), String> {
+    fn handle_request_packet(&mut self, request_id: Vec<u8>, plaintext: &[u8]) -> Result<(), String> {
+        // Python RNS wire format: msgpack array [timestamp_f64, path_hash_16bytes, data_bytes]
         let payload: RequestPayload = match from_slice(plaintext) {
             Ok(parsed) => parsed,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                return Ok(());
+            }
         };
+
+        let path_hash: Vec<u8> = payload.1.to_vec();
+        let request_data: Vec<u8> = payload.2.to_vec();
 
         let handler = {
             let dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?;
-            let path_hash = identity::truncated_hash(payload.path.as_bytes());
             dest.request_handlers.get(&path_hash).cloned()
         };
 
@@ -2108,12 +2055,13 @@ impl Link {
             if !allowed {
                 Vec::new()
             } else if let Some(callback) = handler.callback {
+                let path_hex = crate::hexrep(&path_hash, false);
                 callback(
-                    &payload.path,
-                    &payload.data,
-                    &payload.request_id,
+                    &path_hex,
+                    &request_data,
+                    &request_id,
                     remote_identity_ref,
-                    0.0,
+                    payload.0,
                 )
             } else {
                 Vec::new()
@@ -2122,50 +2070,65 @@ impl Link {
             Vec::new()
         };
 
-        let response_payload = ResponsePayload {
-            request_id: payload.request_id,
-            response,
-        };
-        let response_data = to_vec_named(&response_payload).map_err(|e| e.to_string())?;
-
-        // Create a link-type destination so the response is encrypted via the link's shared key
-        let mut link_dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?.clone();
-        link_dest.dest_type = DestinationType::Link;
-        link_dest.hash = self.link_id.clone();
-        link_dest.hexhash = crate::hexrep(&link_dest.hash, false);
-
-        eprintln!("[LINK] sending RESPONSE for request path={} response_len={} link_id={}", 
-            payload.path, response_data.len(), crate::hexrep(&self.link_id, false));
-
-        let mut response_packet = Packet::new(
-            Some(link_dest),
-            response_data,
-            DATA,
-            crate::packet::RESPONSE,
-            crate::transport::BROADCAST,
-            crate::packet::HEADER_1,
-            None,
-            None,
-            false,
-            0,
+        // Python RNS response wire format: msgpack array [request_id_bytes, response_bytes]
+        let response_payload = ResponsePayload(
+            serde_bytes::ByteBuf::from(request_id.clone()),
+            serde_bytes::ByteBuf::from(response),
         );
-        let _ = response_packet.send();
+        let response_data = to_vec(&response_payload).map_err(|e| e.to_string())?;
+
+
+        // Encrypt directly via self (we already hold the link lock, so we MUST NOT
+        // go through runtime_encrypt_for_destination which would try to re-acquire
+        // the same mutex → deadlock).
+        let ciphertext = match self.encrypt(&response_data) {
+            Ok(ct) => ct,
+            Err(_) => {
+                return Ok(());
+            }
+        };
+
+        // Build wire bytes manually: [flags(1), hops(1), link_id(16), context(1), ciphertext]
+        // flags = HEADER_1(0)<<6 | BROADCAST(0)<<4 | Link(3)<<2 | DATA(0) = 0x0C
+        let flags: u8 = (DestinationType::Link as u8) << 2;
+        let mut raw = vec![flags, 0u8]; // flags, hops=0
+        raw.extend_from_slice(&self.link_id);
+        raw.push(crate::packet::RESPONSE);
+        raw.extend_from_slice(&ciphertext);
+
+        // Send directly on the link's attached interface (no need to acquire link lock again).
+        // Using dispatch_outbound bypasses Packet::pack()'s encryption which would deadlock.
+        let sent = if let Some(ref iface) = self.attached_interface {
+            crate::transport::Transport::dispatch_outbound(iface, &raw)
+        } else {
+            false
+        };
+
+        if !sent {
+        }
+
         self.had_outbound(false);
         Ok(())
     }
 
     fn handle_response_packet(&mut self, plaintext: &[u8]) -> Result<(), String> {
+        // Python RNS wire format: msgpack array [request_id_bytes, response_bytes]
         let payload: ResponsePayload = match from_slice(plaintext) {
             Ok(parsed) => parsed,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                return Ok(());
+            }
         };
 
+        let request_id: Vec<u8> = payload.0.to_vec();
+        let response_bytes: Vec<u8> = payload.1.to_vec();
+
         let mut pending = self.pending_requests.lock().map_err(|_| "Pending request lock poisoned")?;
-        if let Some(index) = pending.iter().position(|p| p.request_id == payload.request_id) {
+        if let Some(index) = pending.iter().position(|p| p.request_id == request_id) {
             let request = pending.remove(index);
             let receipt = RequestReceipt {
-                request_id: payload.request_id,
-                response: Some(payload.response),
+                request_id: request_id.clone(),
+                response: Some(response_bytes),
                 link: Arc::new(Mutex::new(self.clone())),
                 sent_at: request.sent_at,
                 received_at: Some(current_time().unwrap_or(0) as f64),
@@ -2173,8 +2136,12 @@ impl Link {
             };
 
             if let Some(callback) = request.response_callback {
-                callback(receipt);
+                // Spawn a thread so the callback can re-lock the link
+                // (e.g. for teardown) without deadlocking the TCP reader thread
+                // that currently holds the link mutex.
+                thread::spawn(move || { callback(receipt); });
             }
+        } else {
         }
 
         Ok(())
@@ -2188,18 +2155,40 @@ impl Link {
         failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
         progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
     ) -> Result<Vec<u8>, String> {
-        let request_id = identity::get_random_hash();
-        let payload = RequestPayload {
-            path,
-            data,
-            request_id: request_id.clone(),
-        };
+        // Python RNS wire format: [timestamp_f64, path_hash_16bytes, data_bytes]
+        let path_hash = identity::truncated_hash(path.as_bytes());
+        let timestamp = current_time().unwrap_or(0) as f64;
+        let payload = RequestPayload(
+            timestamp,
+            serde_bytes::ByteBuf::from(path_hash),
+            serde_bytes::ByteBuf::from(data),
+        );
 
-        let payload_data = to_vec_named(&payload).map_err(|e| e.to_string())?;
-        let dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?.clone();
+        let payload_data = to_vec(&payload).map_err(|e| e.to_string())?;
+        // Encrypt the payload using the link session key directly (via self.encrypt),
+        // avoiding the self-deadlock that would occur if we went through
+        // DestinationType::Link → runtime_encrypt_for_destination → link.lock()
+        // while the caller already holds link_arc.lock().
+        let ciphertext = self.encrypt(&payload_data)?;
+
+        // Build a Link-type destination (hash = link_id) to get correct routing
+        // and link-interface filtering in Transport::outbound. We skip
+        // destination.encrypt() by pre-setting packet.ciphertext below.
+        let mut dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?.clone();
+        dest.dest_type = DestinationType::Link;
+        dest.hash = self.link_id.clone();
+        dest.hexhash = crate::hexrep(&dest.hash, false);
+        // Attach link routing info so Transport::outbound knows the interface.
+        dest.link = Some(crate::destination::LinkInfo {
+            rtt: self.rtt,
+            traffic_timeout_factor: self.traffic_timeout_factor,
+            status_closed: self.state == STATE_CLOSED,
+            mtu: Some(self.mtu),
+            attached_interface: self.attached_interface.clone(),
+        });
         let mut packet = Packet::new(
             Some(dest),
-            payload_data,
+            vec![], // data unused — we supply ciphertext manually below
             DATA,
             crate::packet::REQUEST,
             crate::transport::BROADCAST,
@@ -2209,6 +2198,25 @@ impl Link {
             false,
             0,
         );
+        // Inject the pre-encrypted ciphertext and mark packet as packed so
+        // send() won't call pack() and attempt to re-encrypt.
+        packet.ciphertext = Some(ciphertext);
+        // pack() manually: build raw = flags + hops + link_id + context + ciphertext.
+        {
+            let mut raw = Vec::new();
+            raw.push(packet.flags);
+            raw.push(packet.hops);
+            raw.extend_from_slice(&self.link_id);
+            raw.push(packet.context);
+            raw.extend_from_slice(packet.ciphertext.as_ref().unwrap());
+            packet.destination_hash = Some(self.link_id.clone());
+            packet.raw = raw;
+            packet.packed = true;
+            packet.update_hash();
+        }
+        // Python computes request_id = truncated_hash(packet.get_hashable_part())
+        // We must compute this BEFORE send() since send() doesn't change the hash
+        let request_id = packet.get_truncated_hash();
 
         let sent_at = current_time().unwrap_or(0) as f64;
         let receipt = RequestReceipt {
@@ -2307,7 +2315,6 @@ impl Link {
     fn handle_proof_packet(&mut self, packet: &Packet) -> Result<(), String> {
         if packet.context == crate::packet::RESOURCE_PRF {
             let hash_len = identity::HASHLENGTH / 8;
-            eprintln!("[LINK] RESOURCE_PRF received data_len={}", packet.data.len());
             if packet.data.len() >= hash_len {
                 let resource_hash = packet.data[..hash_len].to_vec();
                 // Clone the list of outgoing resource Arcs WITHOUT locking
@@ -2335,12 +2342,9 @@ impl Link {
                                 if let Ok(mut resource_guard) = target.lock() {
                                     resource_guard.validate_proof(&proof);
                                 } else {
-                                    eprintln!("[LINK] RESOURCE_PRF thread: failed to lock resource");
                                 }
                             }));
-                            if let Err(e) = result {
-                                eprintln!("[LINK] RESOURCE_PRF thread PANICKED: {:?}", e);
-                            }
+                            let _ = result;
                         }
                     }
                 });
@@ -2348,7 +2352,6 @@ impl Link {
             return Ok(());
         }
 
-        eprintln!("[LINK] handle_proof_packet state={} initiator={} data_len={}", self.state, self.initiator, packet.data.len());
         if !self.initiator || self.state != STATE_PENDING {
             return Ok(());
         }
@@ -2362,7 +2365,6 @@ impl Link {
 
         let mode = mode_from_lp_packet(data);
         if mode != self.mode {
-            eprintln!("[LINK] proof mode mismatch local={} remote={}", self.mode, mode);
             return Err("Invalid link mode in proof packet".to_string());
         }
 
@@ -2390,7 +2392,6 @@ impl Link {
         }
 
         if !destination_identity.validate(&signature, &signed_data) {
-            eprintln!("[LINK] proof signature validation failed");
             return Err("Invalid link proof signature".to_string());
         }
 
@@ -2413,11 +2414,10 @@ impl Link {
 
         self.update_keepalive();
 
-        eprintln!("[LINK] proof accepted, link activated {} keepalive={:.0}s", crate::hexrep(&self.link_id, false), self.keepalive);
         crate::log(&format!("Link activated {} rtt={:.3}s keepalive={:.0}s", crate::hexrep(&self.link_id, false), self.rtt.unwrap_or(0.0), self.keepalive), crate::LOG_NOTICE, false, false);
 
         if let Some(rtt) = self.rtt {
-            let rtt_data = to_vec_named(&rtt).map_err(|e| format!("Failed to encode LRRTT payload: {}", e))?;
+            let rtt_data = to_vec(&rtt).map_err(|e| format!("Failed to encode LRRTT payload: {}", e))?;
 
             let mut link_destination = self
                 .destination
@@ -2482,7 +2482,7 @@ impl Link {
     /// Send keep-alive packet (called when link lock is NOT held externally)
     pub fn send_keepalive(&mut self) -> Result<(), String> {
         let info = self.prepare_keepalive();
-        if let Some((link_destination, link_id)) = info {
+        if let Some((link_destination, _link_id)) = info {
             thread::spawn(move || {
                 let mut keepalive_packet = Packet::new(
                     Some(link_destination),
@@ -2496,9 +2496,7 @@ impl Link {
                     false,
                     0,
                 );
-                if let Err(e) = keepalive_packet.send() {
-                    eprintln!("[LINK] keepalive send failed for {}: {}", crate::hexrep(&link_id, false), e);
-                }
+                let _ = keepalive_packet.send();
             });
         }
         Ok(())

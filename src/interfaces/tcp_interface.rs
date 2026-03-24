@@ -767,10 +767,25 @@ impl TcpClientInterface {
             // Read loop exited — mark interface offline and attempt reconnect
             crate::log("TCP read loop exited, marking interface offline", crate::LOG_WARNING, false, false);
             eprintln!("[TCP-READ] read loop exited, marking offline");
-            {
+            let iface_name = {
                 let mut iface = interface.lock().unwrap();
                 iface.base.online = false;
                 iface.socket = None;
+                iface.base.name.clone()
+            };
+
+            // For server-side (accepted) connections, deregister the interface stub
+            // and its outbound handler so Transport::outbound sees no live interface
+            // and treats any pending fanout delivery as missed → deferred_queue.
+            if !is_initiator {
+                if let Some(ref name) = iface_name {
+                    crate::transport::Transport::deregister_interface_stub(name);
+                    crate::transport::Transport::unregister_outbound_handler(name);
+                    crate::log(
+                        &format!("TCP server client disconnected, deregistered interface {}", name),
+                        crate::LOG_NOTICE, false, false,
+                    );
+                }
             }
 
             if is_initiator {
@@ -1071,10 +1086,10 @@ impl TcpServerInterface {
                     println!("Accepting incoming TCP connection");
                     
                     let peer_addr = stream.peer_addr().ok();
-                    let client_name = format!(
-                        "Client on {}",
-                        server_name.as_ref().unwrap_or(&"Server".to_string())
-                    );
+                    let client_name = match &peer_addr {
+                        Some(addr) => format!("Client on {} [{}]", server_name.as_ref().unwrap_or(&"Server".to_string()), addr),
+                        None => format!("Client on {}", server_name.as_ref().unwrap_or(&"Server".to_string())),
+                    };
                     
                     let spawned_interface = Arc::new(Mutex::new(TcpClientInterface::from_socket(client_name, stream)));
                     let iface_name;

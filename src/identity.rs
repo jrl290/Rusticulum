@@ -744,6 +744,20 @@ impl Identity {
         Identity::from_public_key(&entry.public_key).ok()
     }
 
+    /// Recall identity by identity hash (not destination hash).
+    /// Scans all known destinations for a matching public-key hash — O(n) but
+    /// only called on subscribe/fanout paths, not hot paths.
+    pub fn recall_from_identity_hash(identity_hash: &[u8]) -> Option<Identity> {
+        Self::load_known_destinations_if_needed();
+        let destinations = KNOWN_DESTINATIONS.lock().unwrap();
+        for entry in destinations.values() {
+            if truncated_hash(&entry.public_key) == identity_hash {
+                return Identity::from_public_key(&entry.public_key).ok();
+            }
+        }
+        None
+    }
+
     pub fn recall_app_data(destination_hash: &[u8]) -> Option<Vec<u8>> {
         Self::load_known_destinations_if_needed();
         let destinations = KNOWN_DESTINATIONS.lock().unwrap();

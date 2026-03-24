@@ -147,10 +147,14 @@ mod tests {
     
     #[test]
     fn test_stamp_value() {
-        let workblock = vec![0u8; 32];
-        let stamp = vec![0u8; 32];
-        
+        // Generate a real stamp and verify stamp_value agrees with it
+        let data = b"test value data";
+        let required = 8u32;
+        let (stamp, _) = LXStamper::generate_stamp(data, required, 2);
+        let workblock = LXStamper::stamp_workblock(data, 2);
+
         let value = LXStamper::stamp_value(&workblock, &stamp);
-        assert!(value > 0);
+        // A properly generated stamp must satisfy the required difficulty
+        assert!(value >= required, "stamp_value {} should be >= {}", value, required);
     }
 }

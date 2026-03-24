@@ -1,6 +1,6 @@
 use crate::identity::{Identity, full_hash, truncated_hash, Token};
 use crate::packet::{Packet, LINKREQUEST, DATA, PATH_RESPONSE as PATHRESPONSE, NONE, FLAG_SET, FLAG_UNSET};
-use rmp_serde::{decode::from_slice, encode::to_vec_named};
+use rmp_serde::{decode::from_slice, encode::to_vec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::thread;
@@ -67,18 +67,15 @@ pub struct RequestHandler {
 	pub callback: Option<RequestHandlerCallback>,
 }
 
+/// Python RNS wire format for a REQUEST packet payload:
+/// msgpack array [timestamp_f64, path_hash_16bytes, data_bytes]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct RequestPayload {
-	path: String,
-	data: Vec<u8>,
-	request_id: Vec<u8>,
-}
+struct RequestPayload(f64, serde_bytes::ByteBuf, serde_bytes::ByteBuf);
 
+/// Python RNS wire format for a RESPONSE packet payload:
+/// msgpack array [request_id_16bytes, response_bytes]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ResponsePayload {
-	request_id: Vec<u8>,
-	response: Vec<u8>,
-}
+struct ResponsePayload(serde_bytes::ByteBuf, serde_bytes::ByteBuf);
 
 #[derive(Clone, Default)]
 pub struct Callbacks {
@@ -750,37 +747,44 @@ impl Destination {
 	}
 
 	fn handle_request_packet(&self, packet: &Packet, plaintext: &[u8]) -> Result<(), String> {
+		// Python RNS wire format: [timestamp_f64, path_hash_16bytes, data_bytes]
 		let payload: RequestPayload = match from_slice(plaintext) {
 			Ok(parsed) => parsed,
-			Err(_) => return Ok(()),
+			Err(e) => {
+				eprintln!("[DEST] handle_request_packet: failed to decode payload: {} len={}", e, plaintext.len());
+				return Ok(());
+			}
 		};
 
-		let path_hash = truncated_hash(payload.path.as_bytes());
+		let path_hash: Vec<u8> = payload.1.to_vec();
+		let request_data: Vec<u8> = payload.2.to_vec();
+		// request_id = truncated hash of the raw packet (Python: packet.getTruncatedHash())
+		let request_id = packet.get_truncated_hash();
+
 		let handler = match self.request_handlers.get(&path_hash) {
 			Some(handler) => handler,
 			None => return Ok(()),
 		};
 
 		let callback = handler.callback.clone();
-		let path = payload.path.clone();
-		let data = payload.data.clone();
-		let request_id = payload.request_id.clone();
+		let path_hex = crate::hexrep(&path_hash, false);
 		let destination = packet.destination.clone();
 
 		thread::spawn(move || {
 			let response = if let Some(callback) = callback {
 				let remote_identity: Option<&Identity> = None;
-				callback(&path, &data, &request_id, remote_identity, 0.0)
+				callback(&path_hex, &request_data, &request_id, remote_identity, payload.0)
 			} else {
 				Vec::new()
 			};
 
-			let response_payload = ResponsePayload {
-				request_id,
-				response,
-			};
+			// Python RNS response wire format: [request_id_bytes, response_bytes]
+			let response_payload = ResponsePayload(
+				serde_bytes::ByteBuf::from(request_id),
+				serde_bytes::ByteBuf::from(response),
+			);
 
-			let response_data = match to_vec_named(&response_payload) {
+			let response_data = match to_vec(&response_payload) {
 				Ok(data) => data,
 				Err(_) => return,
 			};

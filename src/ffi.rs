@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
+    Arc,
     Mutex,
 };
 
@@ -272,4 +273,195 @@ pub fn set_keepalive_interval(secs: f64) -> Result<(), String> {
     let reticulum = instance.lock().unwrap();
     reticulum.set_keepalive_interval(secs);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Callback-based interface (for Android BLE bridge)
+// ---------------------------------------------------------------------------
+
+/// Register a callback-based transport interface.
+///
+/// `name`     – human-readable name (e.g. "AndroidBLE").
+/// `send_fn`  – called when Reticulum wants to send raw bytes out.
+/// `bitrate`  – link bitrate in bits/sec (e.g. 12500 for LoRa SF7/125kHz).
+///
+/// Returns an opaque interface ID for use with [`callback_interface_receive`].
+pub fn register_callback_interface(
+    name: &str,
+    send_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+    bitrate: Option<u64>,
+) -> Result<u64, String> {
+    use crate::transport::InterfaceStubConfig;
+
+    let mut config = InterfaceStubConfig::default();
+    config.name = name.to_string();
+    config.mode = crate::transport::InterfaceStub::MODE_FULL;
+    config.out = true;
+    config.bitrate = bitrate;
+    config.announce_cap = Some(crate::reticulum::ANNOUNCE_CAP / 100.0);
+    Transport::register_interface_stub_config(config);
+    Transport::register_outbound_handler(name, send_fn);
+
+    Ok(store_handle(name.to_string()))
+}
+
+/// Deregister a callback-based interface.
+pub fn deregister_callback_interface(iface_handle: u64) -> Result<(), String> {
+    let name: String =
+        take_handle(iface_handle).ok_or_else(|| "invalid interface handle".to_string())?;
+    Transport::unregister_outbound_handler(&name);
+    Transport::deregister_interface_stub(&name);
+    Ok(())
+}
+
+/// Feed received data into a callback interface (from BLE, etc.).
+///
+/// `iface_handle` – handle returned by [`register_callback_interface`].
+/// `data`         – raw Reticulum packet bytes (already de-KISS-framed).
+pub fn callback_interface_receive(iface_handle: u64, data: &[u8]) -> Result<(), String> {
+    let name: String =
+        get_handle(iface_handle).ok_or_else(|| "invalid interface handle".to_string())?;
+    Transport::inbound(data.to_vec(), Some(name));
+    Ok(())
+}
+
+/// Update the RSSI / SNR / Q stats on a registered interface stub.
+pub fn callback_interface_set_stats(
+    iface_handle: u64,
+    rssi: Option<f64>,
+    snr: Option<f64>,
+    q: Option<f64>,
+) -> Result<(), String> {
+    let name: String =
+        get_handle(iface_handle).ok_or_else(|| "invalid interface handle".to_string())?;
+    let mut state = crate::transport::TRANSPORT.lock().unwrap();
+    if let Some(iface) = state.interfaces.iter_mut().find(|i| i.name == name) {
+        iface.r_stat_rssi = rssi;
+        iface.r_stat_snr = snr;
+        iface.r_stat_q = q;
+        Ok(())
+    } else {
+        Err(format!("interface '{}' not found", name))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Packet creation & sending
+// ---------------------------------------------------------------------------
+
+/// Create a DATA packet to an outbound destination.
+///
+/// `dest_handle` – destination handle from [`destination_create_outbound`].
+/// `data`        – payload bytes.
+/// `create_receipt` – if true, a `PacketReceipt` is generated for RTT tracking.
+///
+/// Returns a packet handle.
+pub fn packet_create(
+    dest_handle: u64,
+    data: &[u8],
+    create_receipt: bool,
+) -> Result<u64, String> {
+    let dest: Destination =
+        get_handle(dest_handle).ok_or_else(|| "invalid destination handle".to_string())?;
+    let packet = crate::packet::Packet::new(
+        Some(dest),
+        data.to_vec(),
+        crate::packet::DATA,
+        crate::packet::NONE,
+        crate::transport::BROADCAST,
+        crate::packet::HEADER_1,
+        None,
+        None,
+        create_receipt,
+        crate::packet::FLAG_UNSET,
+    );
+    Ok(store_handle(packet))
+}
+
+/// Send a packet.  Returns the receipt handle (0 if no receipt).
+pub fn packet_send(packet_handle: u64) -> Result<u64, String> {
+    let mut packet: crate::packet::Packet =
+        take_handle(packet_handle).ok_or_else(|| "invalid packet handle".to_string())?;
+    match packet.send() {
+        Ok(Some(receipt)) => Ok(store_handle(receipt)),
+        Ok(None) => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Packet receipt queries
+// ---------------------------------------------------------------------------
+
+/// Get the RTT (round-trip time) of a delivered receipt, in seconds.
+/// Returns `None` if the receipt hasn't been proved yet.
+pub fn receipt_get_rtt(receipt_handle: u64) -> Option<f64> {
+    let receipt: crate::packet::PacketReceipt = get_handle(receipt_handle)?;
+    receipt.get_rtt()
+}
+
+/// Get the receipt status: 0 = FAILED, 1 = SENT, 2 = DELIVERED.
+pub fn receipt_get_status(receipt_handle: u64) -> Option<u8> {
+    let receipt: crate::packet::PacketReceipt = get_handle(receipt_handle)?;
+    Some(receipt.status)
+}
+
+/// Get the receipt's packet hash (for matching with Transport callbacks).
+pub fn receipt_get_hash(receipt_handle: u64) -> Option<Vec<u8>> {
+    let receipt: crate::packet::PacketReceipt = get_handle(receipt_handle)?;
+    Some(receipt.hash.clone())
+}
+
+/// Set delivery and timeout callbacks on a receipt.
+///
+/// The callbacks receive (rtt_seconds,) and () respectively.
+/// They are called from the Transport job thread.
+pub fn receipt_set_callbacks(
+    receipt_hash: &[u8],
+    delivery_cb: Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync>,
+    timeout_cb: Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync>,
+) {
+    Transport::set_receipt_delivery_callback(receipt_hash, delivery_cb);
+    Transport::set_receipt_timeout_callback(receipt_hash, timeout_cb);
+}
+
+/// Destroy a receipt handle.
+pub fn receipt_destroy(receipt_handle: u64) -> bool {
+    destroy_handle(receipt_handle)
+}
+
+// ---------------------------------------------------------------------------
+// Destination helpers (inbound)
+// ---------------------------------------------------------------------------
+
+/// Register a local "inbound" destination so that packets addressed to it
+/// are accepted and proved.
+pub fn destination_create_inbound(
+    identity_handle: u64,
+    app_name: &str,
+    aspects: Vec<String>,
+) -> Result<u64, String> {
+    let id: Identity =
+        get_handle(identity_handle).ok_or_else(|| "invalid identity handle".to_string())?;
+    let dest = Destination::new_inbound(
+        Some(id),
+        DestinationType::Single,
+        app_name.to_string(),
+        aspects,
+    )?;
+    Ok(store_handle(dest))
+}
+
+/// Announce a destination so that remote peers can discover it.
+pub fn destination_announce(dest_handle: u64, app_data: Option<&[u8]>) -> Result<(), String> {
+    let mut dest: Destination =
+        take_handle(dest_handle).ok_or_else(|| "invalid destination handle".to_string())?;
+    dest.announce(app_data, false, None, None, true)?;
+    store_handle(dest);
+    Ok(())
+}
+
+/// Destroy a destination handle.
+pub fn destination_destroy(dest_handle: u64) -> bool {
+    destroy_handle(dest_handle)
 }

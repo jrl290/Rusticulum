@@ -268,7 +268,7 @@ impl Interface {
                 131072
             } else if self.bitrate > 200_000_000 {
                 65536
-            } else if self.bitrate > 100_000_000 {
+            } else if self.bitrate >= 100_000_000 {
                 32768
             } else if self.bitrate > 10_000_000 {
                 16384
@@ -276,7 +276,7 @@ impl Interface {
                 8192
             } else if self.bitrate > 2_000_000 {
                 4096
-            } else if self.bitrate > 1_000_000 {
+            } else if self.bitrate >= 1_000_000 {
                 2048
             } else if self.bitrate > 62_500 {
                 1024
