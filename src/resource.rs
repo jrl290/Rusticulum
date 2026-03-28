@@ -2080,7 +2080,13 @@ impl ResourceAdvertisement {
     }
 
     pub fn unpack(data: &[u8]) -> Result<ResourceAdvertisement, String> {
-        let mut adv = from_slice::<ResourceAdvertisementData>(data).map_err(|e| e.to_string())?;
+        let mut adv = from_slice::<ResourceAdvertisementData>(data).map_err(|e| {
+            crate::log(&format!("[RESOURCE-ADV-UNPACK] failed: {} first_bytes={}",
+                e,
+                if data.len() >= 8 { crate::hexrep(&data[..8], false) } else { crate::hexrep(data, false) }
+            ), crate::LOG_NOTICE, false, false);
+            e.to_string()
+        })?;
         adv.apply_flags();
         Ok(ResourceAdvertisement {
             t: adv.t,

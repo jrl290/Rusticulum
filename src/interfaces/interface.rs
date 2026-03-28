@@ -301,11 +301,16 @@ impl Interface {
     }
 
     /// Process held announces and release when safe
-    pub fn process_held_announces(&mut self) {
+    /// Checks if a held announce is ready to be released, removes it from the
+    /// held queue, and returns the raw packet bytes + interface name so the
+    /// caller can pass them to `Transport::inbound` *after* releasing the
+    /// TRANSPORT lock (calling `Transport::inbound` while holding the TRANSPORT
+    /// lock causes a re-entrant deadlock).
+    pub fn take_held_announce(&mut self) -> Option<(Vec<u8>, Option<String>)> {
         let now = current_time();
-        
+
         if self.should_ingress_limit() || self.held_announces.is_empty() || now <= self.ic_held_release {
-            return;
+            return None;
         }
 
         let freq_threshold = if self.age() < self.ic_new_time {
@@ -321,12 +326,21 @@ impl Interface {
             if let Some((dest_hash, _packet)) = self.held_announces.iter().next() {
                 let dest_hash = dest_hash.clone();
                 self.ic_held_release = now + self.ic_held_release_interval;
-                
-                if let Some(_announce) = self.held_announces.remove(&dest_hash) {
-                    let interface_name = self.name.clone();
-                    let _ = Transport::inbound(_announce, interface_name);
+
+                if let Some(announce) = self.held_announces.remove(&dest_hash) {
+                    return Some((announce, self.name.clone()));
                 }
             }
+        }
+        None
+    }
+
+    /// Process a held announce by re-injecting it into Transport::inbound.
+    /// Do NOT call this while the TRANSPORT mutex is held; use `take_held_announce`
+    /// and defer the `Transport::inbound` call until after releasing the lock.
+    pub fn process_held_announces(&mut self) {
+        if let Some((announce, interface_name)) = self.take_held_announce() {
+            let _ = Transport::inbound(announce, interface_name);
         }
     }
 

@@ -876,8 +876,10 @@ impl Destination {
 			
 			if now > self.latest_ratchet_time + self.ratchet_interval {
 				// Generate a proper X25519 private key (32 random bytes)
-				let ratchet_prv = crate::identity::get_random_hash();
-				ratchets.insert(0, ratchet_prv);
+				let mut ratchet_prv = [0u8; 32];
+				use rand::RngCore;
+				rand::rngs::OsRng.fill_bytes(&mut ratchet_prv);
+				ratchets.insert(0, ratchet_prv.to_vec());
 				self.latest_ratchet_time = now;
 				self._clean_ratchets();
 				let _ = self._persist_ratchets();
@@ -900,50 +902,95 @@ impl Destination {
 	
 	/// Persist ratchets to file with signature (Python: _persist_ratchets)
 	fn _persist_ratchets(&self) -> Result<(), String> {
-		if let Some(_ratchets_path) = &self.ratchets_path {
-			if let Some(_ratchets) = &self.ratchets {
-				// In full implementation: serialize ratchets with umsgpack/msgpack
-				// Sign the packed ratchets, create {"signature": sig, "ratchets": packed}
-				// Write to .tmp file, then atomic rename
-				// For now, just indicate success
-				// let packed_ratchets = serialize(ratchets);
-				// let signature = self.sign(&packed_ratchets);
-				// let persisted_data = {"signature": signature, "ratchets": packed_ratchets};
-				// atomic_write(ratchets_path, pack(persisted_data));
-				Ok(())
-			} else {
-				Err("No ratchets to persist".to_string())
-			}
+		let ratchets_path = self.ratchets_path.as_ref().ok_or("No ratchets path set")?;
+		let ratchets = self.ratchets.as_ref().ok_or("No ratchets to persist")?;
+
+		// Serialize the ratchet private keys list as msgpack
+		let packed_ratchets = to_vec(ratchets)
+			.map_err(|e| format!("Failed to serialize ratchets: {}", e))?;
+
+		// Sign the packed ratchets with our identity
+		let signature = if let Some(identity) = &self.identity {
+			identity.sign(&packed_ratchets)
 		} else {
-			Err("No ratchets path set".to_string())
+			return Err("No identity for signing ratchets".to_string());
+		};
+
+		// Create persisted data: {"signature": <bytes>, "ratchets": <bytes>}
+		let persisted: HashMap<String, serde_bytes::ByteBuf> = [
+			("signature".to_string(), serde_bytes::ByteBuf::from(signature)),
+			("ratchets".to_string(), serde_bytes::ByteBuf::from(packed_ratchets)),
+		].into_iter().collect();
+		let file_data = to_vec(&persisted)
+			.map_err(|e| format!("Failed to serialize persisted ratchets: {}", e))?;
+
+		// Atomic write: write to .tmp then rename
+		let tmp_path = format!("{}.tmp", ratchets_path);
+		std::fs::write(&tmp_path, &file_data)
+			.map_err(|e| format!("Failed to write ratchet file: {}", e))?;
+		if std::path::Path::new(ratchets_path).exists() {
+			let _ = std::fs::remove_file(ratchets_path);
 		}
+		std::fs::rename(&tmp_path, ratchets_path)
+			.map_err(|e| format!("Failed to rename ratchet file: {}", e))?;
+
+		Ok(())
 	}
 	
 	/// Reload ratchets from file with signature validation (Python: _reload_ratchets)
 	fn _reload_ratchets(&mut self, ratchets_path: &str) -> Result<(), String> {
-		// Check if file exists
-		// In full implementation:
-		// 1. Read file with retry logic (500ms retry on I/O conflict)
-		// 2. Unpack msgpack data
-		// 3. Validate signature: self.identity.validate(data["signature"], data["ratchets"])
-		// 4. Unpack ratchets and store
-		// 5. If file doesn't exist, initialize empty ratchets and persist
-		// For now, initialize empty ratchets
 		use std::path::Path;
 		if Path::new(ratchets_path).exists() {
-			// Would load and validate here
-			// let file_data = std::fs::read(ratchets_path)?;
-			// let persisted_data = unpack(file_data)?;
-			// if self.identity.validate(persisted_data["signature"], persisted_data["ratchets"]) {
-			//     self.ratchets = unpack(persisted_data["ratchets"]);
-			// }
-			self.ratchets = Some(Vec::new());
-			self.ratchets_path = Some(ratchets_path.to_string());
+			let load_attempt = |identity: &Identity| -> Result<Vec<Vec<u8>>, String> {
+				let file_data = std::fs::read(ratchets_path)
+					.map_err(|e| format!("Failed to read ratchet file: {}", e))?;
+				let persisted: HashMap<String, serde_bytes::ByteBuf> = from_slice(&file_data)
+					.map_err(|e| format!("Failed to deserialize ratchet file: {}", e))?;
+				let signature = persisted.get("signature")
+					.ok_or("Missing signature in ratchet file")?;
+				let packed_ratchets = persisted.get("ratchets")
+					.ok_or("Missing ratchets in ratchet file")?;
+				if !identity.validate(signature, packed_ratchets) {
+					return Err("Invalid ratchet file signature".to_string());
+				}
+				let ratchets: Vec<serde_bytes::ByteBuf> = from_slice(packed_ratchets)
+					.map_err(|e| format!("Failed to deserialize ratchet keys: {}", e))?;
+				Ok(ratchets.into_iter().map(|b| b.to_vec()).collect())
+			};
+
+			let identity = self.identity.as_ref()
+				.ok_or("No identity for ratchet validation")?;
+
+			let result = load_attempt(identity);
+			match result {
+				Ok(ratchets) => {
+					crate::log(&format!("Loaded {} ratchets from {}", ratchets.len(), ratchets_path), crate::LOG_DEBUG, false, false);
+					self.ratchets = Some(ratchets);
+					self.ratchets_path = Some(ratchets_path.to_string());
+				}
+				Err(e) => {
+					crate::log(&format!("First ratchet load attempt failed: {}. Retrying in 500ms.", e), crate::LOG_ERROR, false, false);
+					std::thread::sleep(std::time::Duration::from_millis(500));
+					match load_attempt(identity) {
+						Ok(ratchets) => {
+							crate::log("Ratchet reload retry succeeded", crate::LOG_DEBUG, false, false);
+							self.ratchets = Some(ratchets);
+							self.ratchets_path = Some(ratchets_path.to_string());
+						}
+						Err(e2) => {
+							crate::log(&format!("Ratchet file at {} could not be loaded: {}", ratchets_path, e2), crate::LOG_CRITICAL, false, false);
+							self.ratchets = Some(Vec::new());
+							self.ratchets_path = Some(ratchets_path.to_string());
+						}
+					}
+				}
+			}
 		} else {
 			// Initialize new ratchet file
+			crate::log(&format!("No existing ratchet data, initialising new ratchet file for {}", ratchets_path), crate::LOG_DEBUG, false, false);
 			self.ratchets = Some(Vec::new());
 			self.ratchets_path = Some(ratchets_path.to_string());
-			self._persist_ratchets()?;
+			let _ = self._persist_ratchets();
 		}
 		Ok(())
 	}
@@ -1019,17 +1066,16 @@ impl Destination {
 	}
 	
 	// Encrypt data for this destination
-	pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+	pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
 		match self.dest_type {
 			DestinationType::Plain => Ok(plaintext.to_vec()),
 			DestinationType::Single => {
 				if let Some(identity) = &self.identity {
-					// In full implementation: get selected ratchet
-					// let selected_ratchet = RNS.Identity.get_ratchet(self.hash);
-					// if selected_ratchet:
-					//     self.latest_ratchet_id = RNS.Identity._get_ratchet_id(selected_ratchet)
-					// return identity.encrypt(plaintext, ratchet=selected_ratchet)
-					identity.encrypt(plaintext)
+					let selected_ratchet = Identity::get_ratchet(&self.hash);
+					if let Some(ref ratchet) = selected_ratchet {
+						self.latest_ratchet_id = Some(Identity::ratchet_id_from_pub(ratchet));
+					}
+					identity.encrypt_with_ratchet(plaintext, selected_ratchet.as_deref())
 				} else {
 					Err("No identity for encryption".to_string())
 				}

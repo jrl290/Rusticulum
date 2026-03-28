@@ -1606,6 +1606,8 @@ impl Reticulum {
                     match crate::interfaces::tcp_interface::TcpClientInterface::new(&config_map) {
                         Ok(mut interface) => {
                             Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
+                            let kiss_framing = interface.kiss_framing;
+                            let interface_repr = interface.to_string();
                             let interface = Arc::new(Mutex::new(interface));
                             let handler_iface = Arc::clone(&interface);
                             let name = handler_iface.lock().unwrap().base.name.clone().unwrap_or_default();
@@ -1617,6 +1619,18 @@ impl Reticulum {
                                 }),
                             );
                             crate::interfaces::tcp_interface::TcpClientInterface::start_read_loop(Arc::clone(&interface));
+                            // For non-KISS TCP client interfaces, synthesize tunnel
+                            // so the remote transport daemon associates this connection
+                            // with our transport identity.
+                            if !kiss_framing {
+                                let iname = name.clone();
+                                let irepr = interface_repr.clone();
+                                std::thread::spawn(move || {
+                                    // Small delay to allow Transport to fully initialize
+                                    std::thread::sleep(std::time::Duration::from_millis(250));
+                                    crate::transport::Transport::synthesize_tunnel(&iname, &irepr);
+                                });
+                            }
                             self.system_interfaces.push(SystemInterface::TcpClient(interface));
                         }
                         Err(err) => {

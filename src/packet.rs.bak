@@ -192,7 +192,7 @@ impl Packet {
     }
 
     pub fn pack(&mut self) -> Result<(), String> {
-        let mut destination = self.destination.clone().ok_or("Packet has no destination")?;
+        let destination = self.destination.clone().ok_or("Packet has no destination")?;
         self.destination_hash = Some(destination.hash.clone());
 
         let mut header = Vec::new();
@@ -215,7 +215,9 @@ impl Packet {
             {
                 Ok(self.data.clone())
             } else {
+                eprintln!("[DEBUG] Packet::pack encrypt begin, ctx={}, ptype={}", self.context, self.packet_type);
                 let encrypted = destination.encrypt(&self.data)?;
+                eprintln!("[DEBUG] Packet::pack encrypt returned ({} bytes)", encrypted.len());
                 if destination.latest_ratchet_id.is_some() {
                     self.ratchet_id = destination.latest_ratchet_id.clone();
                 }
@@ -456,9 +458,12 @@ impl Packet {
 
         match proof_packet.send() {
             Ok(_) => {
+                eprintln!("[PROOF] sent proof for packet {}",
+                    crate::hexrep(self.packet_hash.as_ref().unwrap(), false));
                 Ok(())
             }
             Err(e) => {
+                eprintln!("[PROOF] failed to send proof: {}", e);
                 Err(format!("Failed to send proof: {}", e))
             }
         }

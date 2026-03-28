@@ -206,6 +206,30 @@ pub fn destination_hash_for(
     Ok(Destination::hash(Some(id_hash), app_name, aspects))
 }
 
+/// Create an outbound destination by recalling the remote identity from the
+/// known-destinations table by `dest_hash`, then wrapping it with the given
+/// `app_name` and `aspects`.  Returns a destination handle.
+///
+/// This is the one-shot helper iOS uses to send plain encrypted packets to a
+/// remote destination when it only knows the destination hash (e.g. rfed.apns).
+pub fn destination_create_outbound_from_hash(
+    dest_hash: &[u8],
+    app_name: &str,
+    aspects: Vec<String>,
+) -> Result<u64, String> {
+    let pub_key = Identity::recall_public_key(dest_hash)
+        .ok_or_else(|| "destination not in known-destinations table".to_string())?;
+    let id = Identity::from_public_key(&pub_key)
+        .map_err(|e| format!("from_public_key: {}", e))?;
+    let dest = Destination::new_outbound(
+        Some(id),
+        DestinationType::Single,
+        app_name.to_string(),
+        aspects,
+    )?;
+    Ok(store_handle(dest))
+}
+
 /// Create an outbound destination for a known identity and return a handle.
 pub fn destination_create_outbound(
     identity_handle: u64,

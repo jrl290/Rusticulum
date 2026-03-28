@@ -4,6 +4,8 @@ use crate::identity::{Identity, Token};
 use once_cell::sync::Lazy;
 use rand::RngCore;
 use rmp_serde::{decode::from_slice, encode::to_vec};
+use rmpv::decode::read_value as rmpv_read_value;
+use rmpv::encode::write_value as rmpv_write_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -1142,10 +1144,11 @@ impl Link {
         let mut proof_data = packet_hash.clone();
         proof_data.extend_from_slice(&signature);
 
-        crate::log(&format!("prove_packet hash={} link={} proof_len={}",
+        crate::log(&format!("prove_packet hash={} link={} proof_len={} iface={:?}",
             crate::hexrep(&packet_hash, false),
             crate::hexrep(&self.link_id, false),
-            proof_data.len()), crate::LOG_DEBUG, false, false);
+            proof_data.len(),
+            self.attached_interface), crate::LOG_NOTICE, false, false);
 
         let link_destination = {
             let dest = self.destination.lock()
@@ -1154,6 +1157,26 @@ impl Link {
             ld.dest_type = crate::destination::DestinationType::Link;
             ld.hash = self.link_id.clone();
             ld.hexhash = crate::hexrep(&ld.hash, false);
+            // ── FIX: PROOF INTERFACE ROUTING ───────────────────────────────────────
+            // DO NOT REMOVE THE ld.link = Some(...) ASSIGNMENT BELOW.
+            //
+            // Bug (pre-fix): prove_packet() left ld.link as None, so
+            // Transport::outbound() broadcast the 96-byte PROOF packet on ALL
+            // interfaces instead of routing it only through the link's own
+            // attached interface.  The receiving peer never saw the proof on the
+            // correct interface, so delivery receipts never fired.
+            //
+            // Fix: populate ld.link with a LinkInfo that carries attached_interface.
+            // Transport::outbound() checks link.attached_interface and sends only
+            // via that interface, matching Python's Packet.prove() behaviour.
+            // ────────────────────────────────────────────────────────────────────────
+            ld.link = Some(crate::destination::LinkInfo {
+                rtt: self.rtt,
+                traffic_timeout_factor: crate::link::TRAFFIC_TIMEOUT_FACTOR,
+                status_closed: self.state == crate::link::STATE_CLOSED,
+                mtu: Some(self.mtu),
+                attached_interface: self.attached_interface.clone(),
+            });
             ld
         };
 
@@ -1651,7 +1674,10 @@ impl Link {
     
     /// Handle DATA packets
     fn handle_data_packet(&mut self, packet: &Packet) -> Result<(), String> {
-        
+        crate::log(&format!("[HDR] context=0x{:02x} data_len={} link={}",
+            packet.context, packet.data.len(),
+            crate::hexrep(&self.link_id, false)), crate::LOG_NOTICE, false, false);
+
         if packet.context == crate::packet::RESOURCE {
             let mut deferred_actions: Vec<(Arc<Mutex<Resource>>, bool, bool)> = Vec::new();
             if let Ok(resources) = self.incoming_resources.lock() {
@@ -1714,7 +1740,8 @@ impl Link {
         if packet.context == crate::packet::RESOURCE_ADV {
             let plaintext = match self.decrypt(&packet.data) {
                 Ok(plaintext) => plaintext,
-                Err(_) => {
+                Err(e) => {
+                    crate::log(&format!("[RESP-RES] RESOURCE_ADV decrypt failed: {}", e), crate::LOG_NOTICE, false, false);
                     return Ok(());
                 }
             };
@@ -1722,7 +1749,12 @@ impl Link {
             let mut advertisement_packet = packet.clone();
             advertisement_packet.plaintext = Some(plaintext);
 
-            if crate::resource::ResourceAdvertisement::is_request(&advertisement_packet) {
+            let is_req = crate::resource::ResourceAdvertisement::is_request(&advertisement_packet);
+            let is_resp = crate::resource::ResourceAdvertisement::is_response(&advertisement_packet);
+            crate::log(&format!("[RESP-RES] RESOURCE_ADV is_request={} is_response={}",
+                is_req, is_resp), crate::LOG_NOTICE, false, false);
+
+            if is_req {
                 if let Some(resource) = Resource::accept(
                     &advertisement_packet,
                     Arc::new(Mutex::new(self.clone())),
@@ -1736,13 +1768,103 @@ impl Link {
                 return Ok(());
             }
 
-            if crate::resource::ResourceAdvertisement::is_response(&advertisement_packet) {
+            if is_resp {
+                let request_id_opt = crate::resource::ResourceAdvertisement::read_request_id(&advertisement_packet);
+                crate::log(&format!(
+                    "[RESP-RES] incoming response resource, request_id={}",
+                    request_id_opt.as_ref().map(|id| crate::hexrep(id, false)).unwrap_or_else(|| "None".to_string())
+                ), crate::LOG_NOTICE, false, false);
+
+                // Build a per-request concluded callback so that when the resource is fully
+                // assembled we can route the data to the correct pending request callback.
+                // Python RNS encodes response resources as msgpack([request_id_bytes, response_value])
+                // — identical to the direct RESPONSE packet plaintext format.
+                let pending_requests = Arc::clone(&self.pending_requests);
+                let link_arc = Arc::new(Mutex::new(self.clone()));
+                let concluded_callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>> =
+                    Some(Arc::new(move |resource: Arc<Mutex<Resource>>| {
+                        let (data_opt, res_request_id_opt) = {
+                            let res = resource.lock().unwrap();
+                            (res.data.clone(), res.request_id.clone())
+                        };
+                        crate::log(&format!(
+                            "[RESP-RES] concluded, data_len={:?}, res_request_id={}",
+                            data_opt.as_ref().map(|d| d.len()),
+                            res_request_id_opt.as_ref().map(|id| crate::hexrep(id, false)).unwrap_or_else(|| "None".to_string())
+                        ), crate::LOG_NOTICE, false, false);
+
+                        let data = match data_opt {
+                            Some(d) => d,
+                            None => {
+                                crate::log("[RESP-RES] concluded but data is None", crate::LOG_NOTICE, false, false);
+                                return;
+                            }
+                        };
+
+                        // Parse msgpack([request_id_bytes, response_value]) — same as direct RESPONSE format.
+                        let parsed = rmpv_read_value(&mut std::io::Cursor::new(&data));
+                        let (request_id, response_bytes) = match parsed {
+                            Ok(rmpv::Value::Array(elements)) if elements.len() >= 2 => {
+                                match &elements[0] {
+                                    rmpv::Value::Binary(b) => {
+                                        let rid = b.clone();
+                                        let mut rb = Vec::new();
+                                        if rmpv_write_value(&mut rb, &elements[1]).is_ok() {
+                                            (rid, rb)
+                                        } else {
+                                            crate::log("[RESP-RES] failed to re-encode response value", crate::LOG_NOTICE, false, false);
+                                            return;
+                                        }
+                                    }
+                                    _ => match res_request_id_opt {
+                                        Some(rid) => (rid, data),
+                                        None => { crate::log("[RESP-RES] no request_id (non-binary elements[0])", crate::LOG_NOTICE, false, false); return; }
+                                    }
+                                }
+                            }
+                            _ => match res_request_id_opt {
+                                Some(rid) => (rid, data),
+                                None => { crate::log("[RESP-RES] no request_id (non-array data)", crate::LOG_NOTICE, false, false); return; }
+                            }
+                        };
+
+                        let mut pending = match pending_requests.lock() {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        crate::log(&format!(
+                            "[RESP-RES] pending_requests count={}, looking for id={}",
+                            pending.len(), crate::hexrep(&request_id, false)
+                        ), crate::LOG_NOTICE, false, false);
+
+                        if let Some(index) = pending.iter().position(|p| p.request_id == request_id) {
+                            crate::log("[RESP-RES] found pending request, spawning callback thread", crate::LOG_NOTICE, false, false);
+                            let request = pending.remove(index);
+                            let receipt = RequestReceipt {
+                                request_id: request_id.clone(),
+                                response: Some(response_bytes),
+                                link: Arc::clone(&link_arc),
+                                sent_at: request.sent_at,
+                                received_at: Some(current_time().unwrap_or(0) as f64),
+                                progress: 1.0,
+                            };
+                            if let Some(callback) = request.response_callback {
+                                thread::spawn(move || { callback(receipt); });
+                            }
+                        } else {
+                            crate::log(&format!(
+                                "[RESP-RES] NO matching pending request for id={}",
+                                crate::hexrep(&request_id, false)
+                            ), crate::LOG_NOTICE, false, false);
+                        }
+                    }));
+
                 if let Some(resource) = Resource::accept(
                     &advertisement_packet,
                     Arc::new(Mutex::new(self.clone())),
-                    self.callbacks.resource_concluded.clone(),
+                    concluded_callback,
                     None,
-                    crate::resource::ResourceAdvertisement::read_request_id(&advertisement_packet),
+                    request_id_opt,
                 ) {
                     self.register_incoming_resource(resource);
                 }
@@ -2112,19 +2234,42 @@ impl Link {
     }
 
     fn handle_response_packet(&mut self, plaintext: &[u8]) -> Result<(), String> {
-        // Python RNS wire format: msgpack array [request_id_bytes, response_bytes]
-        let payload: ResponsePayload = match from_slice(plaintext) {
-            Ok(parsed) => parsed,
-            Err(_) => {
+        // Python RNS wire format: msgpack array [request_id_bytes, response_value]
+        // The response_value can be any msgpack type (integer error code, list, bytes)
+        // so we must NOT decode it as ByteBuf — use rmpv to read the outer array.
+        crate::log(&format!("[RESP] handle_response_packet: {} bytes plaintext", plaintext.len()), crate::LOG_NOTICE, false, false);
+        let outer = match rmpv_read_value(&mut std::io::Cursor::new(plaintext)) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::log(&format!("[RESP] rmpv_read_value failed: {}", e), crate::LOG_NOTICE, false, false);
                 return Ok(());
             }
         };
-
-        let request_id: Vec<u8> = payload.0.to_vec();
-        let response_bytes: Vec<u8> = payload.1.to_vec();
+        let elements = match outer {
+            rmpv::Value::Array(v) if v.len() >= 2 => v,
+            ref other => {
+                crate::log(&format!("[RESP] outer value is not Array(>=2): {:?}", other), crate::LOG_NOTICE, false, false);
+                return Ok(());
+            }
+        };
+        let request_id: Vec<u8> = match &elements[0] {
+            rmpv::Value::Binary(b) => b.clone(),
+            other => {
+                crate::log(&format!("[RESP] elements[0] is not Binary: {:?}", other), crate::LOG_NOTICE, false, false);
+                return Ok(());
+            }
+        };
+        crate::log(&format!("[RESP] response request_id={}", crate::hexrep(&request_id, false)), crate::LOG_NOTICE, false, false);
+        // Re-encode the response value as raw msgpack bytes so callers can decode it.
+        let mut response_bytes: Vec<u8> = Vec::new();
+        if rmpv_write_value(&mut response_bytes, &elements[1]).is_err() {
+            return Ok(());
+        }
 
         let mut pending = self.pending_requests.lock().map_err(|_| "Pending request lock poisoned")?;
+        crate::log(&format!("[RESP] pending_requests count={}, looking for id={}", pending.len(), crate::hexrep(&request_id, false)), crate::LOG_NOTICE, false, false);
         if let Some(index) = pending.iter().position(|p| p.request_id == request_id) {
+            crate::log(&format!("[RESP] found pending request, spawning callback thread"), crate::LOG_NOTICE, false, false);
             let request = pending.remove(index);
             let receipt = RequestReceipt {
                 request_id: request_id.clone(),
@@ -2142,6 +2287,7 @@ impl Link {
                 thread::spawn(move || { callback(receipt); });
             }
         } else {
+            crate::log(&format!("[RESP] NO matching pending request found for id={}", crate::hexrep(&request_id, false)), crate::LOG_NOTICE, false, false);
         }
 
         Ok(())
@@ -2164,7 +2310,19 @@ impl Link {
             serde_bytes::ByteBuf::from(data),
         );
 
-        let payload_data = to_vec(&payload).map_err(|e| e.to_string())?;
+        // Python wire format: msgpack.packb([timestamp_f64, path_hash_bytes, data])
+        // where `data` is the VALUE itself — not double-encoded as bin.
+        // We decode our pre-encoded `data` bytes back to an rmpv Value so we can
+        // embed it inline in the outer array (matching Python's msgpack.packb behaviour).
+        let data_value = rmpv_read_value(&mut std::io::Cursor::new(&payload.2.as_ref()))
+            .unwrap_or(rmpv::Value::Nil);
+        let outer_value = rmpv::Value::Array(vec![
+            rmpv::Value::F64(payload.0),
+            rmpv::Value::Binary(payload.1.into_vec()),
+            data_value,
+        ]);
+        let mut payload_data = Vec::new();
+        rmpv_write_value(&mut payload_data, &outer_value).map_err(|e| format!("Failed to encode request payload: {}", e))?;
         // Encrypt the payload using the link session key directly (via self.encrypt),
         // avoiding the self-deadlock that would occur if we went through
         // DestinationType::Link → runtime_encrypt_for_destination → link.lock()
@@ -2230,15 +2388,19 @@ impl Link {
 
         if let Err(err) = packet.send() {
             if let Some(callback) = failed_callback {
-                callback(receipt);
+                // Spawn so callback can re-acquire locks (e.g. router) that may
+                // already be held by the thread calling request().
+                thread::spawn(move || { callback(receipt); });
             }
             return Err(err);
         }
 
-        if let Some(callback) = progress_callback.as_ref() {
+        if let Some(callback) = progress_callback.clone() {
             let mut initial = receipt.clone();
             initial.progress = 0.1;
-            callback(initial);
+            // Spawn so the progress callback can re-acquire locks (e.g. router)
+            // that may already be held by the calling thread.
+            thread::spawn(move || { callback(initial); });
         }
 
         // Calculate timeout based on RTT or default
@@ -2414,7 +2576,7 @@ impl Link {
 
         self.update_keepalive();
 
-        crate::log(&format!("Link activated {} rtt={:.3}s keepalive={:.0}s", crate::hexrep(&self.link_id, false), self.rtt.unwrap_or(0.0), self.keepalive), crate::LOG_NOTICE, false, false);
+        crate::log(&format!("Link activated {} rtt={:.3}s keepalive={:.0}s attached_interface={:?}", crate::hexrep(&self.link_id, false), self.rtt.unwrap_or(0.0), self.keepalive, self.attached_interface), crate::LOG_NOTICE, false, false);
 
         if let Some(rtt) = self.rtt {
             let rtt_data = to_vec(&rtt).map_err(|e| format!("Failed to encode LRRTT payload: {}", e))?;
@@ -2427,6 +2589,13 @@ impl Link {
             link_destination.dest_type = DestinationType::Link;
             link_destination.hash = self.link_id.clone();
             link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
+            link_destination.link = Some(crate::destination::LinkInfo {
+                rtt: self.rtt,
+                traffic_timeout_factor: self.traffic_timeout_factor,
+                status_closed: self.state == STATE_CLOSED,
+                mtu: Some(self.mtu),
+                attached_interface: self.attached_interface.clone(),
+            });
 
             thread::spawn(move || {
                 let mut rtt_packet = Packet::new(
@@ -2534,6 +2703,13 @@ impl Link {
         dest.dest_type = crate::destination::DestinationType::Link;
         dest.hash = self.link_id.clone();
         dest.hexhash = crate::hexrep(&dest.hash, false);
+        dest.link = Some(crate::destination::LinkInfo {
+            rtt: self.rtt,
+            traffic_timeout_factor: self.traffic_timeout_factor,
+            status_closed: self.state == STATE_CLOSED,
+            mtu: Some(self.mtu),
+            attached_interface: self.attached_interface.clone(),
+        });
 
         // Create packet with LINKIDENTIFY context
         let packet = Packet::new(

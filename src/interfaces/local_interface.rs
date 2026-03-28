@@ -352,10 +352,12 @@ impl LocalClientInterface {
                             println!("Socket for {} was closed, attempting to reconnect...", self.to_string());
                             // TODO: call RNS.Transport.shared_connection_disappeared()
                             self.reconnect();
+                            // Continue loop to read from reconnected socket
+                            continue;
                         } else {
                             // TODO: call self.teardown(nowarning=true)
+                            break;
                         }
-                        break;
                     }
                     Ok(n) => {
                         self.frame_buffer.extend_from_slice(&buf[..n]);
@@ -364,8 +366,12 @@ impl LocalClientInterface {
                     Err(e) => {
                         self.base.online = false;
                         eprintln!("Interface error: {}", e);
-                        // TODO: teardown
-                        return Err(format!("Read error: {}", e));
+                        if self.is_connected_to_shared_instance && !self.detached {
+                            println!("Socket for {} had error ({}), attempting to reconnect...", self.to_string(), e);
+                            self.reconnect();
+                        } else {
+                            return Err(format!("Read error: {}", e));
+                        }
                     }
                 }
             } else {

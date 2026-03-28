@@ -390,43 +390,35 @@ impl Identity {
     
     /// Encrypt plaintext for this identity
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        self.encrypt_with_ratchet(plaintext, None)
-    }
-
-    /// Encrypt plaintext for this identity, optionally using a ratchet public key
-    pub fn encrypt_with_ratchet(&self, plaintext: &[u8], ratchet: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        eprintln!("[DEBUG] Identity::encrypt begin ({} bytes)", plaintext.len());
+        let enc_pub = self.encryption_pub_key.as_ref().ok_or("Identity has no public key")?;
         let salt = self.hash.as_ref().ok_or("Identity hash not available")?;
         // Generate ephemeral X25519 keypair
         let mut ephemeral_bytes = [0u8; 32];
         rand::thread_rng().fill(&mut ephemeral_bytes);
         let ephemeral_prv = X25519PrivateKey::from(ephemeral_bytes);
         let ephemeral_pub = X25519PublicKey::from(&ephemeral_prv);
-
-        // Use ratchet public key if provided, otherwise use identity's public key
-        let target_pub = if let Some(ratchet_pub_bytes) = ratchet {
-            let ratchet_arr: [u8; 32] = ratchet_pub_bytes.try_into()
-                .map_err(|_| "Invalid ratchet public key length")?;
-            X25519PublicKey::from(ratchet_arr)
-        } else {
-            *self.encryption_pub_key.as_ref().ok_or("Identity has no public key")?
-        };
-
+        
         // Perform ECDH
-        let shared_secret = ephemeral_prv.diffie_hellman(&target_pub);
+        let shared_secret = ephemeral_prv.diffie_hellman(enc_pub);
+        eprintln!("[DEBUG] Identity::encrypt ecdh done");
         
         // Derive encryption key using HKDF
         let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), shared_secret.as_bytes());
         let mut derived_key = [0u8; 64];
         hkdf.expand(b"", &mut derived_key)
             .map_err(|_| "HKDF expansion failed".to_string())?;
+        eprintln!("[DEBUG] Identity::encrypt hkdf done");
         
         // Encrypt with Token
         let token = Token::new(&derived_key)?;
         let ciphertext = token.encrypt(plaintext)?;
+        eprintln!("[DEBUG] Identity::encrypt token.encrypt done");
         
         // Return: ephemeral_pub (32) + ciphertext
         let mut result = ephemeral_pub.as_bytes().to_vec();
         result.extend_from_slice(&ciphertext);
+        eprintln!("[DEBUG] Identity::encrypt end ({} bytes)", result.len());
         Ok(result)
     }
 
@@ -443,14 +435,6 @@ impl Identity {
         if ciphertext.len() <= 32 {
             return Err("Ciphertext too short".to_string());
         }
-
-        crate::log(&format!("[DECRYPT] ciphertext_len={} identity_hash={} has_prv_key={} dest_ratchets={} identity_ratchets={}",
-            ciphertext.len(),
-            self.hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or("NONE".to_string()),
-            self.encryption_prv_key.is_some(),
-            dest_ratchets.map(|r| r.len()).unwrap_or(0),
-            self.ratchets.len(),
-        ), crate::LOG_NOTICE, false, false);
 
         // Extract ephemeral public key
         let ephemeral_pub_bytes: [u8; 32] = ciphertext[..32].try_into()
@@ -480,7 +464,6 @@ impl Identity {
 
         // Fall back to main encryption key
         let enc_prv = self.encryption_prv_key.as_ref().ok_or("Identity has no private key")?;
-        crate::log(&format!("[DECRYPT] trying main key, token_data_len={}", token_data.len()), crate::LOG_NOTICE, false, false);
         self.decrypt_with_key(enc_prv, &ephemeral_pub, token_data)
     }
 
@@ -493,25 +476,13 @@ impl Identity {
         let salt = self.hash.as_ref().ok_or("Identity hash not available")?;
         // Perform ECDH
         let shared_secret = prv_key.diffie_hellman(ephemeral_pub);
-
-        crate::log(&format!("[DECRYPT-KEY] salt={} ephemeral_pub={} shared_secret_8={} prv_pub={}",
-            crate::hexrep(salt, false),
-            crate::hexrep(ephemeral_pub.as_bytes(), false),
-            crate::hexrep(&shared_secret.as_bytes()[..8], false),
-            crate::hexrep(&X25519PublicKey::from(prv_key).as_bytes()[..], false),
-        ), crate::LOG_NOTICE, false, false);
-
+        
         // Derive decryption key using HKDF
         let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), shared_secret.as_bytes());
         let mut derived_key = [0u8; 64];
         hkdf.expand(b"", &mut derived_key)
             .map_err(|_| "HKDF expansion failed".to_string())?;
-
-        crate::log(&format!("[DECRYPT-KEY] derived_key_8={} token_data_len={}",
-            crate::hexrep(&derived_key[..8], false),
-            token_data.len(),
-        ), crate::LOG_NOTICE, false, false);
-
+        
         // Decrypt with Token
         let token = Token::new(&derived_key)?;
         token.decrypt(token_data)
@@ -968,103 +939,5 @@ mod hex {
         data.iter()
             .map(|b| format!("{:02x}", b))
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sha2::{Sha256, Digest};
-
-    /// Build the `signed_part` exactly as Python LXMF does:
-    ///   hashed_part = dest_hash + source_hash + packed_payload
-    ///   message_hash = SHA-256(hashed_part)
-    ///   signed_part  = hashed_part + message_hash
-    fn make_signed_part(dest_hash: &[u8], source_hash: &[u8], payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let mut hashed_part = Vec::new();
-        hashed_part.extend_from_slice(dest_hash);
-        hashed_part.extend_from_slice(source_hash);
-        hashed_part.extend_from_slice(payload);
-
-        let message_hash: Vec<u8> = Sha256::digest(&hashed_part).to_vec();
-
-        let mut signed_part = hashed_part.clone();
-        signed_part.extend_from_slice(&message_hash);
-        (signed_part, message_hash)
-    }
-
-    /// Verify that `Identity::sign` + `Identity::validate` round-trips correctly
-    /// with the LXMF signed_part construction.
-    #[test]
-    fn test_sign_validate_roundtrip() {
-        let sender = Identity::new(true);
-
-        let dest_hash = [0xAAu8; 16];
-        let source_hash = [0xBBu8; 16];
-        let payload = b"hello lxmf payload";
-
-        let (signed_part, _) = make_signed_part(&dest_hash, &source_hash, payload);
-
-        let signature = sender.sign(&signed_part);
-        assert_eq!(signature.len(), 64, "Ed25519 signature must be 64 bytes");
-
-        assert!(
-            sender.validate(&signature, &signed_part),
-            "Signature should be valid with correct signed_part"
-        );
-    }
-
-    /// Verify that a tampered message fails validation.
-    #[test]
-    fn test_validate_rejects_tampered_data() {
-        let sender = Identity::new(true);
-
-        let dest_hash = [0x01u8; 16];
-        let source_hash = [0x02u8; 16];
-        let payload = b"original payload";
-
-        let (signed_part, _) = make_signed_part(&dest_hash, &source_hash, payload);
-        let signature = sender.sign(&signed_part);
-
-        let mut tampered = signed_part.clone();
-        tampered[0] ^= 0xFF;
-
-        assert!(
-            !sender.validate(&signature, &tampered),
-            "Signature must be invalid on tampered data"
-        );
-    }
-
-    /// Verify the full recall cycle:
-    ///   remember_destination → recall → validate
-    /// This mirrors the path taken by `recall_identity` in lx_message.rs.
-    #[test]
-    fn test_remember_and_recall_then_validate() {
-        let sender = Identity::new(true);
-
-        let pub_key = sender.get_public_key().expect("sender must have public key");
-        assert_eq!(pub_key.len(), 64);
-
-        // Use a fixed fake destination hash (16 bytes).
-        let dest_hash = [0xCAu8; 16];
-
-        // Inject into the in-memory cache (save to disk may fail; that's OK for testing).
-        let _ = Identity::remember_destination(&dest_hash, &pub_key, None);
-
-        // Recall must succeed.
-        let recalled = Identity::recall(&dest_hash)
-            .expect("recalled identity must be Some after remember_destination");
-
-        // Build LXMF-style signed_part.
-        let source_hash = [0xDDu8; 16];
-        let payload = b"test lxmf content";
-        let (signed_part, _) = make_signed_part(&dest_hash, &source_hash, payload);
-
-        // Sign with full keypair, validate with recalled (public-key-only) identity.
-        let signature = sender.sign(&signed_part);
-        assert!(
-            recalled.validate(&signature, &signed_part),
-            "Recalled identity must validate signature produced by the sender"
-        );
     }
 }

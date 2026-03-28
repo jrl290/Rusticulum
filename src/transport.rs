@@ -582,7 +582,7 @@ impl Transport {
 
     fn extract_announce_app_data(packet: &Packet) -> Option<Vec<u8>> {
         let pubkey_len = crate::identity::KEYSIZE / 8;
-        let name_hash_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+        let name_hash_len = crate::identity::NAME_HASH_LENGTH / 8;
         let random_hash_len = 10usize;
         let ratchet_len = if packet.context_flag == crate::packet::FLAG_SET {
             crate::identity::RATCHETSIZE / 8
@@ -744,6 +744,126 @@ impl Transport {
 
     pub fn exit_handler() {
         Transport::persist_data();
+    }
+
+    /// Synthesize a tunnel on a TCP interface so the remote transport
+    /// daemon (rnsd) associates this connection with our transport
+    /// identity.  This must be called after the initial connection and
+    /// after every reconnection for non-KISS TCP interfaces.
+    ///
+    /// `interface_name` is the InterfaceStub name (used for
+    /// `attached_interface` routing).
+    ///
+    /// `interface_repr` is the full string representation matching
+    /// Python's `str(interface)`, e.g.
+    /// `"TCPInterface[LOCAL/192.168.2.113:4242]"`.  It is used to
+    /// derive the interface hash, just like the Python implementation.
+    pub fn synthesize_tunnel(interface_name: &str, interface_repr: &str) {
+        // Grab transport identity's public key and signing capability
+        let (public_key, tunnel_id, signed_data, signature) = {
+            let state = TRANSPORT.lock().unwrap();
+            let identity = match &state.identity {
+                Some(id) => id.clone(),
+                None => {
+                    log("synthesize_tunnel: no transport identity available", LOG_ERROR, false, false);
+                    return;
+                }
+            };
+
+            let public_key = match identity.get_public_key() {
+                Ok(pk) => pk,
+                Err(e) => {
+                    log(&format!("synthesize_tunnel: failed to get public key: {}", e), LOG_ERROR, false, false);
+                    return;
+                }
+            };
+
+            // interface_hash = Identity.full_hash(str(interface).encode("utf-8"))
+            let interface_hash = crate::identity::full_hash(interface_repr.as_bytes());
+
+            let random_hash = crate::identity::get_random_hash();
+
+            // tunnel_id = Identity.full_hash(public_key + interface_hash)
+            let mut tunnel_id_data = Vec::with_capacity(public_key.len() + interface_hash.len());
+            tunnel_id_data.extend_from_slice(&public_key);
+            tunnel_id_data.extend_from_slice(&interface_hash);
+            let tunnel_id = crate::identity::full_hash(&tunnel_id_data);
+
+            // signed_data = public_key + interface_hash + random_hash
+            let mut signed_data = Vec::with_capacity(public_key.len() + interface_hash.len() + random_hash.len());
+            signed_data.extend_from_slice(&public_key);
+            signed_data.extend_from_slice(&interface_hash);
+            signed_data.extend_from_slice(&random_hash);
+
+            let signature = identity.sign(&signed_data);
+
+            (public_key, tunnel_id, signed_data, signature)
+        };
+
+        // data = signed_data + signature
+        let mut data = signed_data;
+        data.extend_from_slice(&signature);
+
+        // Build the PLAIN destination for "rnstransport.tunnel.synthesize"
+        let dest = match crate::destination::Destination::new_outbound(
+            None,
+            crate::destination::DestinationType::Plain,
+            APP_NAME.to_string(),
+            vec!["tunnel".to_string(), "synthesize".to_string()],
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                log(&format!("synthesize_tunnel: failed to create destination: {}", e), LOG_ERROR, false, false);
+                return;
+            }
+        };
+
+        // Create and pack the packet
+        let mut packet = crate::packet::Packet::new(
+            Some(dest),
+            data,
+            crate::packet::DATA,        // packet_type
+            crate::packet::NONE,         // context
+            BROADCAST,                   // transport_type
+            crate::packet::HEADER_1,     // header_type
+            None,                        // transport_id
+            Some(interface_name.to_string()), // attached_interface
+            false,                       // create_receipt
+            crate::packet::FLAG_UNSET,   // context_flag
+        );
+
+        if let Err(e) = packet.pack() {
+            log(&format!("synthesize_tunnel: failed to pack packet: {}", e), LOG_ERROR, false, false);
+            return;
+        }
+
+        // Send through Transport::outbound
+        let sent = Transport::outbound(&mut packet);
+
+        // Mark the interface's wants_tunnel = false
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            for iface in state.interfaces.iter_mut() {
+                if iface.name == interface_name {
+                    iface.wants_tunnel = false;
+                    iface.tunnel_id = Some(tunnel_id.clone());
+                    break;
+                }
+            }
+        }
+
+        log(
+            &format!(
+                "synthesize_tunnel: sent={} interface={} tunnel_id={} data_len={}",
+                sent,
+                interface_name,
+                crate::hexrep(&tunnel_id, false),
+                public_key.len() + 32 + 16 + 64, // pk + iface_hash + random + sig
+            ),
+            crate::LOG_NOTICE,
+            false,
+            false,
+        );
     }
 
     pub fn add_remote_management_allowed(identity_hash: Vec<u8>) {
@@ -1936,15 +2056,23 @@ impl Transport {
                 b.bitrate.partial_cmp(&a.bitrate).unwrap_or(std::cmp::Ordering::Equal)
             });
             for interface in &mut state.interfaces {
+                // transport::InterfaceStub::process_held_announces is a no-op placeholder;
+                // real interfaces handle this via interface::InterfaceStub::take_held_announce.
                 interface.process_held_announces();
             }
             state.interface_last_jobs = now();
         }
 
+        // Collect management announce packets to send AFTER releasing the lock.
+        // destination.announce(..., send=true) calls packet.send() → Transport::outbound()
+        // → TRANSPORT.lock(), which deadlocks because jobs() already holds the lock.
+        let mut mgmt_announce_packets: Vec<Packet> = Vec::new();
         if now() > state.last_mgmt_announce + state.mgmt_announce_interval {
             state.last_mgmt_announce = now();
             for destination in &mut state.mgmt_destinations {
-                let _ = destination.announce(None, false, None, None, true);
+                if let Ok(Some(packet)) = destination.announce(None, false, None, None, false) {
+                    mgmt_announce_packets.push(packet);
+                }
             }
         }
 
@@ -1966,6 +2094,14 @@ impl Transport {
         state.jobs_running = false;
 
         drop(state);
+
+        // Send management announces (deferred to avoid calling Transport::outbound
+        // while the TRANSPORT lock is held — destination.announce(send=true) calls
+        // packet.send() → Transport::outbound() → TRANSPORT.lock() re-entrant deadlock).
+        for mut packet in mgmt_announce_packets {
+            let _ = packet.send();
+        }
+
         for mut packet in outgoing {
             // Announce retransmits are already packed (raw set), no destination.
             // Use Transport::outbound directly instead of packet.send() which
@@ -2037,21 +2173,41 @@ impl Transport {
                 _ => 0,
             };
 
+            crate::log(&format!("[OUTBOUND] ptype={} dest={} hops={} iface={:?} iface_exists={}",
+                packet.packet_type, dest_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                hops, outbound_interface_name, outbound_interface_exists), crate::LOG_NOTICE, false, false);
+
             if hops > 1 && packet.header_type == crate::packet::HEADER_1 {
                 if let Some(next_hop) = entry.get(IDX_PT_NEXT_HOP) {
                     if let PathEntryValue::NextHop(next_hop) = next_hop {
-                        let new_flags = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (packet.flags & 0b0000_1111);
-                        let mut new_raw = vec![new_flags, packet.hops];
-                        new_raw.extend_from_slice(next_hop);
-                        if packet.raw.len() > 2 {
-                            new_raw.extend_from_slice(&packet.raw[2..]);
-                        }
-                        mark_packet_sent(packet, outbound_time);
-                        if outbound_interface_exists {
-                            if let Some(iface_name) = outbound_interface_name.clone() {
-                                transmissions.push((iface_name, new_raw));
+                        // If next_hop == destination_hash, this path was learned from a
+                        // HEADER_1 announce (no transport relay).  The transport node we're
+                        // directly connected to can route it, so send as HEADER_1 directly
+                        // instead of wrapping in HEADER_2 with an invalid transport_id.
+                        if next_hop == dest_hash {
+                            crate::log(&format!("[OUTBOUND] hops>1 next_hop==dest: HEADER_1 direct, raw[0..4]={:02x?}",
+                                &packet.raw[..packet.raw.len().min(4)]), crate::LOG_NOTICE, false, false);
+                            mark_packet_sent(packet, outbound_time);
+                            if outbound_interface_exists {
+                                if let Some(iface_name) = outbound_interface_name.clone() {
+                                    transmissions.push((iface_name, packet.raw.clone()));
+                                }
+                                sent = true;
                             }
-                            sent = true;
+                        } else {
+                            let new_flags = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (packet.flags & 0b0000_1111);
+                            let mut new_raw = vec![new_flags, packet.hops];
+                            new_raw.extend_from_slice(next_hop);
+                            if packet.raw.len() > 2 {
+                                new_raw.extend_from_slice(&packet.raw[2..]);
+                            }
+                            mark_packet_sent(packet, outbound_time);
+                            if outbound_interface_exists {
+                                if let Some(iface_name) = outbound_interface_name.clone() {
+                                    transmissions.push((iface_name, new_raw));
+                                }
+                                sent = true;
+                            }
                         }
                     }
                 }
@@ -2083,6 +2239,12 @@ impl Transport {
                 }
             }
         } else {
+            if packet.packet_type != ANNOUNCE {
+                crate::log(&format!("[OUTBOUND] no path entry for ptype={} dest={:?} dtype={:?}",
+                    packet.packet_type,
+                    packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)),
+                    packet.destination_type), crate::LOG_NOTICE, false, false);
+            }
             let mut packet_hashes: Vec<Vec<u8>> = Vec::new();
 
             // For link-type destinations, get the link's attached_interface and status
@@ -2771,8 +2933,14 @@ impl Transport {
         }
 
         let ptype_str = match packet.packet_type { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
-        crate::log(&format!("Inbound {} hops={} dest={}", ptype_str, packet.hops,
-            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
+        crate::log(&format!("Inbound {} hops={} dest={} ctx={}", ptype_str, packet.hops,
+            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+            packet.context), crate::LOG_NOTICE, false, false);
+        if packet.packet_type == 3 {
+            crate::log(&format!("[INBOUND-PROOF] context={} dest={} hops={} raw_len={}",
+                packet.context, packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+                packet.hops, packet.raw.len()), crate::LOG_NOTICE, false, false);
+        }
         packet.hops = packet.hops.saturating_add(1);
 
         // Inline packet_filter + control destination check in a single lock acquisition
@@ -3054,40 +3222,99 @@ impl Transport {
 
                     let random_blob_start = crate::identity::KEYSIZE / 8 + crate::identity::NAME_HASH_LENGTH / 8;
                     let random_blob_end = random_blob_start + 10;
-                    let mut random_blobs = Vec::new();
-                    if packet.data.len() >= random_blob_end {
-                        random_blobs.push(packet.data[random_blob_start..random_blob_end].to_vec());
+                    let new_blob: Option<Vec<u8>> = if packet.data.len() >= random_blob_end {
+                        Some(packet.data[random_blob_start..random_blob_end].to_vec())
+                    } else {
+                        None
+                    };
+
+                    // ── FIX: PATH QUALITY GATE ──────────────────────────────────────────────────
+                    // DO NOT REVERT THIS BLOCK.
+                    //
+                    // Bug (pre-fix): path_table.insert() was called unconditionally, so any
+                    // high-hop announce flooding in after a good low-hop path was established
+                    // would silently overwrite the better entry.  Result: successive send
+                    // attempts used progressively worse paths (6 hops → 11 → 15 → 50),
+                    // causing link establishment timeouts that grew from 42 s to 306 s and
+                    // messages that appeared to send but never delivered.
+                    //
+                    // Fix: mirror Python's Transport.receive_announce() logic —
+                    //   • only replace a *fresh* (non-expired) path entry when the new
+                    //     announce has fewer or equal hops than the existing entry.
+                    //   • always replace when there is no existing entry, or when the
+                    //     existing entry has passed its DESTINATION_TIMEOUT expiry.
+                    //
+                    // Reference: Reticulum-master/RNS/Transport.py, should_add check
+                    //   (packet.hops <= Transport.path_table[hash][IDX_PT_HOPS]).
+                    //
+                    // Also accumulate random_blobs from the existing entry so that replay
+                    // detection state is preserved across path updates.
+                    // ────────────────────────────────────────────────────────────────────────
+                    let (has_existing, existing_hops, existing_expires, existing_blobs) =
+                        if let Some(existing) = state.path_table.get(destination_hash) {
+                            let h = match existing.get(IDX_PT_HOPS) {
+                                Some(PathEntryValue::Hops(h)) => *h,
+                                _ => u8::MAX,
+                            };
+                            let e = match existing.get(IDX_PT_EXPIRES) {
+                                Some(PathEntryValue::Expires(t)) => *t,
+                                _ => 0.0,
+                            };
+                            let b: Vec<Vec<u8>> = match existing.get(IDX_PT_RANDBLOBS) {
+                                Some(PathEntryValue::RandomBlobs(blobs)) => blobs.clone(),
+                                _ => Vec::new(),
+                            };
+                            (true, h, e, b)
+                        } else {
+                            (false, 0u8, 0.0_f64, Vec::new())
+                        };
+
+                    let is_expired = has_existing && now() >= existing_expires;
+                    let mut random_blobs = existing_blobs;
+                    if let Some(ref blob) = new_blob {
+                        if !random_blobs.contains(blob) {
+                            random_blobs.push(blob.clone());
+                        }
                     }
+                    if random_blobs.len() > MAX_RANDOM_BLOBS {
+                        random_blobs.truncate(MAX_RANDOM_BLOBS);
+                    }
+                    // Update if: no existing entry, OR new path is at least as good, OR existing path expired
+                    let should_update_path = !has_existing || packet.hops <= existing_hops || is_expired;
 
                     let received_from = packet.transport_id.clone().unwrap_or_else(|| destination_hash.clone());
                     let expires = now() + DESTINATION_TIMEOUT;
-                    let entry = vec![
-                        PathEntryValue::Timestamp(now()),
-                        PathEntryValue::NextHop(received_from.clone()),
-                        PathEntryValue::Hops(packet.hops),
-                        PathEntryValue::Expires(expires),
-                        PathEntryValue::RandomBlobs(random_blobs),
-                        PathEntryValue::ReceivingInterface(packet.receiving_interface.clone()),
-                        PathEntryValue::PacketHash(packet.packet_hash.clone().unwrap_or_default()),
-                    ];
-                    state.path_table.insert(destination_hash.clone(), entry);
-                    crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
-                    Transport::cache(&packet, true, Some("announce".to_string()));
-
-                    if state.transport_enabled && packet.transport_id.is_some() {
-                        let block_rebroadcasts = packet.context == crate::packet::PATH_RESPONSE;
-                        let announce_entry = vec![
-                            AnnounceEntryValue::Timestamp(now()),
-                            AnnounceEntryValue::RetransmitTimeout(now() + PATHFINDER_G + PATHFINDER_RW),
-                            AnnounceEntryValue::Retries(0),
-                            AnnounceEntryValue::ReceivedFrom(received_from),
-                            AnnounceEntryValue::Hops(packet.hops),
-                            AnnounceEntryValue::Packet(packet.clone()),
-                            AnnounceEntryValue::LocalRebroadcasts(0),
-                            AnnounceEntryValue::BlockRebroadcasts(block_rebroadcasts),
-                            AnnounceEntryValue::AttachedInterface(packet.receiving_interface.clone()),
+                    if should_update_path {
+                        let entry = vec![
+                            PathEntryValue::Timestamp(now()),
+                            PathEntryValue::NextHop(received_from.clone()),
+                            PathEntryValue::Hops(packet.hops),
+                            PathEntryValue::Expires(expires),
+                            PathEntryValue::RandomBlobs(random_blobs),
+                            PathEntryValue::ReceivingInterface(packet.receiving_interface.clone()),
+                            PathEntryValue::PacketHash(packet.packet_hash.clone().unwrap_or_default()),
                         ];
-                        state.announce_table.insert(destination_hash.clone(), announce_entry);
+                        state.path_table.insert(destination_hash.clone(), entry);
+                        crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
+                        Transport::cache(&packet, true, Some("announce".to_string()));
+
+                        if state.transport_enabled && packet.transport_id.is_some() {
+                            let block_rebroadcasts = packet.context == crate::packet::PATH_RESPONSE;
+                            let announce_entry = vec![
+                                AnnounceEntryValue::Timestamp(now()),
+                                AnnounceEntryValue::RetransmitTimeout(now() + PATHFINDER_G + PATHFINDER_RW),
+                                AnnounceEntryValue::Retries(0),
+                                AnnounceEntryValue::ReceivedFrom(received_from),
+                                AnnounceEntryValue::Hops(packet.hops),
+                                AnnounceEntryValue::Packet(packet.clone()),
+                                AnnounceEntryValue::LocalRebroadcasts(0),
+                                AnnounceEntryValue::BlockRebroadcasts(block_rebroadcasts),
+                                AnnounceEntryValue::AttachedInterface(packet.receiving_interface.clone()),
+                            ];
+                            state.announce_table.insert(destination_hash.clone(), announce_entry);
+                        }
+                    } else {
+                        crate::log(&format!("Path not updated dest={} new_hops={} existing_hops={} (keeping better path)", crate::hexrep(destination_hash, false), packet.hops, existing_hops), crate::LOG_DEBUG, false, false);
                     }
                 }
             }
