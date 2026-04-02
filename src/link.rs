@@ -1945,6 +1945,12 @@ impl Link {
             return Ok(());
         }
 
+        if packet.context == crate::packet::LINKCLOSE {
+            crate::log(&format!("[LINK] LINKCLOSE received on link={}", crate::hexrep(&self.link_id, false)), crate::LOG_NOTICE, false, false);
+            self.teardown();
+            return Ok(());
+        }
+
         if packet.context == crate::packet::RESOURCE_REQ {
             let hash_len = identity::HASHLENGTH / 8;
             if plaintext.len() >= 1 + hash_len {
@@ -2138,6 +2144,7 @@ impl Link {
     }
 
     fn handle_request_packet(&mut self, request_id: Vec<u8>, plaintext: &[u8]) -> Result<(), String> {
+        crate::log(&format!("[REQ] handle_request_packet: request_id={} plaintext_len={}", crate::hexrep(&request_id, false), plaintext.len()), crate::LOG_NOTICE, false, false);
         // Python RNS wire format: msgpack array [timestamp_f64, path_hash_bytes, data_any]
         // The third element (data) can be ANY msgpack type (bytes, array, nil, etc.)
         // so we must use rmpv to parse the outer array generically.
@@ -2174,6 +2181,7 @@ impl Link {
             rmpv_write_value(&mut buf, &outer[2]).map_err(|e| e.to_string())?;
             buf
         };
+        crate::log(&format!("[REQ] path_hash={} request_data_len={} timestamp={}", crate::hexrep(&path_hash, false), request_data.len(), timestamp), crate::LOG_NOTICE, false, false);
 
         let handler = {
             let dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?;
@@ -2224,12 +2232,21 @@ impl Link {
             Vec::new()
         };
 
-        // Python RNS response wire format: msgpack array [request_id_bytes, response_bytes]
-        let response_payload = ResponsePayload(
-            serde_bytes::ByteBuf::from(request_id.clone()),
-            serde_bytes::ByteBuf::from(response),
-        );
-        let response_data = to_vec(&response_payload).map_err(|e| e.to_string())?;
+        // Python RNS response wire format: msgpack array [request_id_bytes, response_value]
+        // CRITICAL: The response must be encoded as [Binary(request_id), <native_msgpack_value>]
+        // where the response value is embedded as its native msgpack type (array, int, nil, etc.)
+        // NOT wrapped in a Binary container. Our handler returns pre-encoded msgpack bytes,
+        // so we build the outer array manually: write array header, write request_id as Binary,
+        // then append the raw response bytes directly (they are already valid msgpack).
+        crate::log(&format!("[REQ] handler returned {} bytes, building response", response.len()), crate::LOG_NOTICE, false, false);
+        let mut response_data = Vec::new();
+        // 2-element array header
+        rmp::encode::write_array_len(&mut response_data, 2).map_err(|e| e.to_string())?;
+        // First element: request_id as Binary
+        rmp::encode::write_bin(&mut response_data, &request_id).map_err(|e| e.to_string())?;
+        // Second element: raw msgpack response value (already encoded by handler)
+        response_data.extend_from_slice(&response);
+        crate::log(&format!("[REQ] response_data (msgpack) {} bytes: {:02x?}", response_data.len(), &response_data[..response_data.len().min(64)]), crate::LOG_NOTICE, false, false);
 
         // Encrypt directly via self (we already hold the link lock, so we MUST NOT
         // go through runtime_encrypt_for_destination which would try to re-acquire
@@ -2261,6 +2278,8 @@ impl Link {
 
         if !sent {
             crate::log("[REQ] dispatch_outbound FAILED - response not sent!", crate::LOG_ERROR, false, false);
+        } else {
+            crate::log(&format!("[REQ] response SENT: {} bytes on wire (ciphertext={} bytes)", raw.len(), ciphertext.len()), crate::LOG_NOTICE, false, false);
         }
 
         self.had_outbound(false);
