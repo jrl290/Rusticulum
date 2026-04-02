@@ -2138,20 +2138,51 @@ impl Link {
     }
 
     fn handle_request_packet(&mut self, request_id: Vec<u8>, plaintext: &[u8]) -> Result<(), String> {
-        // Python RNS wire format: msgpack array [timestamp_f64, path_hash_16bytes, data_bytes]
-        let payload: RequestPayload = match from_slice(plaintext) {
-            Ok(parsed) => parsed,
-            Err(_) => {
+        // Python RNS wire format: msgpack array [timestamp_f64, path_hash_bytes, data_any]
+        // The third element (data) can be ANY msgpack type (bytes, array, nil, etc.)
+        // so we must use rmpv to parse the outer array generically.
+        let outer = match rmpv_read_value(&mut std::io::Cursor::new(plaintext)) {
+            Ok(rmpv::Value::Array(arr)) if arr.len() >= 3 => arr,
+            Ok(_) => {
+                crate::log("[REQ] msgpack not a 3-element array", crate::LOG_ERROR, false, false);
+                return Ok(());
+            }
+            Err(e) => {
+                crate::log(&format!("[REQ] msgpack parse FAILED: {}", e), crate::LOG_ERROR, false, false);
                 return Ok(());
             }
         };
 
-        let path_hash: Vec<u8> = payload.1.to_vec();
-        let request_data: Vec<u8> = payload.2.to_vec();
+        let timestamp = match &outer[0] {
+            rmpv::Value::F64(f) => *f,
+            rmpv::Value::F32(f) => *f as f64,
+            rmpv::Value::Integer(i) => i.as_f64().unwrap_or(0.0),
+            _ => 0.0,
+        };
+
+        let path_hash: Vec<u8> = match &outer[1] {
+            rmpv::Value::Binary(b) => b.clone(),
+            _ => {
+                crate::log("[REQ] path_hash is not binary", crate::LOG_ERROR, false, false);
+                return Ok(());
+            }
+        };
+
+        // Re-serialize the data element back to msgpack bytes for the handler
+        let request_data = {
+            let mut buf = Vec::new();
+            rmpv_write_value(&mut buf, &outer[2]).map_err(|e| e.to_string())?;
+            buf
+        };
 
         let handler = {
             let dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?;
-            dest.request_handlers.get(&path_hash).cloned()
+            let h = dest.request_handlers.get(&path_hash).cloned();
+            if h.is_none() {
+                let registered: Vec<String> = dest.request_handlers.keys().map(|k| crate::hexrep(k, false)).collect();
+                crate::log(&format!("[REQ] NO handler for path_hash={}, registered={:?}", crate::hexrep(&path_hash, false), registered), crate::LOG_ERROR, false, false);
+            }
+            h
         };
 
         let response = if let Some(handler) = handler {
@@ -2175,6 +2206,7 @@ impl Link {
             };
 
             if !allowed {
+                crate::log(&format!("[REQ] request denied for path '{}' (not allowed)", handler.path), crate::LOG_NOTICE, false, false);
                 Vec::new()
             } else if let Some(callback) = handler.callback {
                 let path_hex = crate::hexrep(&path_hash, false);
@@ -2183,7 +2215,7 @@ impl Link {
                     &request_data,
                     &request_id,
                     remote_identity_ref,
-                    payload.0,
+                    timestamp,
                 )
             } else {
                 Vec::new()
@@ -2199,13 +2231,13 @@ impl Link {
         );
         let response_data = to_vec(&response_payload).map_err(|e| e.to_string())?;
 
-
         // Encrypt directly via self (we already hold the link lock, so we MUST NOT
         // go through runtime_encrypt_for_destination which would try to re-acquire
         // the same mutex → deadlock).
         let ciphertext = match self.encrypt(&response_data) {
             Ok(ct) => ct,
-            Err(_) => {
+            Err(e) => {
+                crate::log(&format!("[REQ] encrypt FAILED: {}", e), crate::LOG_ERROR, false, false);
                 return Ok(());
             }
         };
@@ -2223,10 +2255,12 @@ impl Link {
         let sent = if let Some(ref iface) = self.attached_interface {
             crate::transport::Transport::dispatch_outbound(iface, &raw)
         } else {
+            crate::log("[REQ] NO attached_interface!", crate::LOG_ERROR, false, false);
             false
         };
 
         if !sent {
+            crate::log("[REQ] dispatch_outbound FAILED - response not sent!", crate::LOG_ERROR, false, false);
         }
 
         self.had_outbound(false);
