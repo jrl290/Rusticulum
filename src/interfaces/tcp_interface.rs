@@ -401,7 +401,7 @@ impl TcpClientInterface {
 
     /// Process outgoing data
     pub fn process_outgoing(&mut self, data: Vec<u8>) -> Result<(), String> {
-        crate::log(&format!("TCP outgoing {} bytes, online={}, detached={}", data.len(), self.base.online, self.detached), crate::LOG_NOTICE, false, false);
+        crate::log(&format!("TCP outgoing {} bytes, online={}, detached={}", data.len(), self.base.online, self.detached), crate::LOG_VERBOSE, false, false);
         if !self.base.online || self.detached {
             return Err("Interface offline or detached".to_string());
         }
@@ -626,7 +626,7 @@ impl TcpClientInterface {
                     Ok(n) => {
                         read_count += 1;
                         last_data_time = std::time::Instant::now();
-                        crate::log(&format!("TCP inbound: {} bytes (read #{})", n, read_count), crate::LOG_NOTICE, false, false);
+                        crate::log(&format!("TCP inbound: {} bytes (read #{})", n, read_count), crate::LOG_VERBOSE, false, false);
                         let data_in = &buf[..n];
 
                         if kiss_framing {
@@ -689,7 +689,7 @@ impl TcpClientInterface {
 
                                         const HEADER_MINSIZE: usize = 2;
                                         if unescaped.len() > HEADER_MINSIZE {
-                                            crate::log(&format!("TCP frame: {} bytes, passing to Transport::inbound", unescaped.len()), crate::LOG_NOTICE, false, false);
+                                            crate::log(&format!("TCP frame: {} bytes, passing to Transport::inbound", unescaped.len()), crate::LOG_VERBOSE, false, false);
                                             let _ = std::io::Write::flush(&mut std::io::stderr());
                                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                                 Transport::inbound(unescaped.clone(), interface_name.clone())

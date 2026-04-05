@@ -940,6 +940,7 @@ impl Destination {
 	/// Reload ratchets from file with signature validation (Python: _reload_ratchets)
 	fn _reload_ratchets(&mut self, ratchets_path: &str) -> Result<(), String> {
 		use std::path::Path;
+		crate::log(&format!("[RATCHET] _reload_ratchets: path={} exists={}", ratchets_path, Path::new(ratchets_path).exists()), crate::LOG_NOTICE, false, false);
 		if Path::new(ratchets_path).exists() {
 			let load_attempt = |identity: &Identity| -> Result<Vec<Vec<u8>>, String> {
 				let file_data = std::fs::read(ratchets_path)
@@ -964,7 +965,7 @@ impl Destination {
 			let result = load_attempt(identity);
 			match result {
 				Ok(ratchets) => {
-					crate::log(&format!("Loaded {} ratchets from {}", ratchets.len(), ratchets_path), crate::LOG_DEBUG, false, false);
+					crate::log(&format!("[RATCHET] Loaded {} ratchets from {}", ratchets.len(), ratchets_path), crate::LOG_NOTICE, false, false);
 					self.ratchets = Some(ratchets);
 					self.ratchets_path = Some(ratchets_path.to_string());
 				}
@@ -973,7 +974,7 @@ impl Destination {
 					std::thread::sleep(std::time::Duration::from_millis(500));
 					match load_attempt(identity) {
 						Ok(ratchets) => {
-							crate::log("Ratchet reload retry succeeded", crate::LOG_DEBUG, false, false);
+							crate::log("[RATCHET] Ratchet reload retry succeeded", crate::LOG_NOTICE, false, false);
 							self.ratchets = Some(ratchets);
 							self.ratchets_path = Some(ratchets_path.to_string());
 						}
@@ -987,7 +988,7 @@ impl Destination {
 			}
 		} else {
 			// Initialize new ratchet file
-			crate::log(&format!("No existing ratchet data, initialising new ratchet file for {}", ratchets_path), crate::LOG_DEBUG, false, false);
+			crate::log(&format!("[RATCHET] No existing ratchet file at {}, initialising empty", ratchets_path), crate::LOG_NOTICE, false, false);
 			self.ratchets = Some(Vec::new());
 			self.ratchets_path = Some(ratchets_path.to_string());
 			let _ = self._persist_ratchets();
@@ -1116,10 +1117,13 @@ impl Destination {
 				}
 
 				// Ratchet mismatch — try reloading from disk and retry
+				crate::log(&format!("[RATCHET] decrypt failed with {} ratchets, reloading from disk...",
+					self.ratchets.as_ref().map(|r| r.len()).unwrap_or(0)), crate::LOG_NOTICE, false, false);
 				if let Some(ratchets_path) = self.ratchets_path.clone() {
 					let _ = self._reload_ratchets(&ratchets_path);
 				}
 				let dest_ratchets_clone = self.ratchets.clone();
+				crate::log(&format!("[RATCHET] after reload: {} ratchets", dest_ratchets_clone.as_ref().map(|r| r.len()).unwrap_or(0)), crate::LOG_NOTICE, false, false);
 				if let Some(identity) = self.identity.as_mut() {
 					let dr = dest_ratchets_clone.as_ref().map(|r| r.as_slice());
 					identity.decrypt_with_ratchets(ciphertext, dr)

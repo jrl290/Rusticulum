@@ -2175,7 +2175,7 @@ impl Transport {
 
             crate::log(&format!("[OUTBOUND] ptype={} dest={} hops={} iface={:?} iface_exists={}",
                 packet.packet_type, dest_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-                hops, outbound_interface_name, outbound_interface_exists), crate::LOG_NOTICE, false, false);
+                hops, outbound_interface_name, outbound_interface_exists), crate::LOG_VERBOSE, false, false);
 
             if hops > 1 && packet.header_type == crate::packet::HEADER_1 {
                 if let Some(next_hop) = entry.get(IDX_PT_NEXT_HOP) {
@@ -2186,7 +2186,7 @@ impl Transport {
                         // instead of wrapping in HEADER_2 with an invalid transport_id.
                         if next_hop == dest_hash {
                             crate::log(&format!("[OUTBOUND] hops>1 next_hop==dest: HEADER_1 direct, raw[0..4]={:02x?}",
-                                &packet.raw[..packet.raw.len().min(4)]), crate::LOG_NOTICE, false, false);
+                                &packet.raw[..packet.raw.len().min(4)]), crate::LOG_VERBOSE, false, false);
                             mark_packet_sent(packet, outbound_time);
                             if outbound_interface_exists {
                                 if let Some(iface_name) = outbound_interface_name.clone() {
@@ -2243,7 +2243,7 @@ impl Transport {
                 crate::log(&format!("[OUTBOUND] no path entry for ptype={} dest={:?} dtype={:?}",
                     packet.packet_type,
                     packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)),
-                    packet.destination_type), crate::LOG_NOTICE, false, false);
+                    packet.destination_type), crate::LOG_VERBOSE, false, false);
             }
             let mut packet_hashes: Vec<Vec<u8>> = Vec::new();
 
@@ -2356,7 +2356,7 @@ impl Transport {
             state.receipts.push(receipt);
         }
 
-        crate::log(&format!("Transport::outbound {} transmissions, sent={}", transmissions.len(), sent), crate::LOG_NOTICE, false, false);
+        crate::log(&format!("Transport::outbound {} transmissions, sent={}", transmissions.len(), sent), crate::LOG_VERBOSE, false, false);
         let outbound_held_ms = outbound_lock_held_started.elapsed().as_millis();
         if outbound_held_ms > 500 {
         }
@@ -2901,7 +2901,8 @@ impl Transport {
         // Log raw packet type from header byte before any processing
         let raw_ptype = if raw.len() > 2 { raw[0] & 0x03 } else { 0xFF };
         let raw_ptype_str = match raw_ptype { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
-        crate::log(&format!("inbound_raw len={} ptype_byte={} ({})", raw.len(), raw_ptype, raw_ptype_str), crate::LOG_NOTICE, false, false);
+        let raw_log_level = if raw_ptype == 1 { crate::LOG_VERBOSE } else { crate::LOG_NOTICE };
+        crate::log(&format!("inbound_raw len={} ptype_byte={} ({})", raw.len(), raw_ptype, raw_ptype_str), raw_log_level, false, false);
         // IFAC flag check: if interface doesn't have IFAC, drop packets with IFAC flag
         if raw.len() > 2 && (raw[0] & 0x80) == 0x80 {
             // IFAC flag set but we don't have IFAC configured - drop
@@ -2933,9 +2934,10 @@ impl Transport {
         }
 
         let ptype_str = match packet.packet_type { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
+        let inbound_log_level = if packet.packet_type == ANNOUNCE { crate::LOG_VERBOSE } else { crate::LOG_NOTICE };
         crate::log(&format!("Inbound {} hops={} dest={} ctx={}", ptype_str, packet.hops,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-            packet.context), crate::LOG_NOTICE, false, false);
+            packet.context), inbound_log_level, false, false);
         if packet.packet_type == 3 {
             crate::log(&format!("[INBOUND-PROOF] context={} dest={} hops={} raw_len={}",
                 packet.context, packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
@@ -3052,7 +3054,7 @@ impl Transport {
                     crate::log(&format!("Announce INVALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
                     announce_should_add = false;
                 } else {
-                    crate::log(&format!("Announce VALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
+                    crate::log(&format!("Announce VALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_VERBOSE, false, false);
                 }
             }
 
@@ -3295,7 +3297,7 @@ impl Transport {
                             PathEntryValue::PacketHash(packet.packet_hash.clone().unwrap_or_default()),
                         ];
                         state.path_table.insert(destination_hash.clone(), entry);
-                        crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
+                        crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_VERBOSE, false, false);
                         Transport::cache(&packet, true, Some("announce".to_string()));
 
                         if state.transport_enabled && packet.transport_id.is_some() {

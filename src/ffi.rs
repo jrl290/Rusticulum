@@ -124,6 +124,11 @@ pub fn shutdown() -> Result<(), String> {
     Ok(())
 }
 
+/// Persist path table + packet hashlist + tunnels to disk (best-effort).
+pub fn persist_data() {
+    Transport::persist_data();
+}
+
 /// Set the log destination to LOG_CALLBACK and install the given closure.
 pub fn set_log_callback<F: Fn(String) + Send + Sync + 'static>(callback: F) {
     let mut state = crate::LOG_STATE.lock().unwrap();
@@ -488,4 +493,155 @@ pub fn destination_announce(dest_handle: u64, app_data: Option<&[u8]>) -> Result
 /// Destroy a destination handle.
 pub fn destination_destroy(dest_handle: u64) -> bool {
     destroy_handle(dest_handle)
+}
+
+// ---------------------------------------------------------------------------
+// Link-based request (synchronous one-shot)
+// ---------------------------------------------------------------------------
+
+/// Open a Link to a remote destination, identify with a local identity,
+/// send a request on a named path, wait for the response, tear down the
+/// link, and return the raw response bytes.
+///
+/// This is a blocking call — callers should invoke it from a background
+/// thread.
+///
+/// * `dest_hash`  — 16-byte truncated RNS hash of the remote destination.
+/// * `app_name`   — RNS app name, e.g. `"rfed"`.
+/// * `aspects`    — aspect list, e.g. `vec!["notify"]`.
+/// * `identity_handle` — handle to the local identity used for `identify()`.
+/// * `path`       — request path, e.g. `"/rfed/notify/register"`.
+/// * `payload`    — request payload bytes.
+/// * `timeout_secs` — seconds to wait for establishment and for the response.
+///
+/// Returns the raw response bytes, or an error string.
+pub fn link_request(
+    dest_hash: &[u8],
+    app_name: &str,
+    aspects: Vec<String>,
+    identity_handle: u64,
+    path: &str,
+    payload: &[u8],
+    timeout_secs: f64,
+) -> Result<Vec<u8>, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let our_identity: Identity =
+        get_handle(identity_handle).ok_or_else(|| "invalid identity handle".to_string())?;
+
+    let dest = destination_create_outbound_from_hash(dest_hash, app_name, aspects)?;
+    let dest_obj: Destination =
+        take_handle(dest).ok_or_else(|| "destination lost".to_string())?;
+
+    let link = crate::link::Link::new_outbound(dest_obj, crate::link::MODE_AES256_CBC)?;
+    let link_arc = Arc::new(Mutex::new(link));
+
+    let established = Arc::new(AtomicBool::new(false));
+    let est_failed = Arc::new(AtomicBool::new(false));
+
+    // Set callbacks and initiate the link handshake.
+    {
+        let est = Arc::clone(&established);
+        let la = Arc::clone(&link_arc);
+        let id = our_identity.clone();
+
+        let mut guard = link_arc.lock().map_err(|_| "link lock poisoned")?;
+        guard.callbacks.link_established = Some(Arc::new(move |_| {
+            est.store(true, Ordering::SeqCst);
+            // Identify once established.
+            if let Ok(mut l) = la.lock() {
+                let _ = l.identify(&id);
+            }
+        }));
+
+        let fail = Arc::clone(&est_failed);
+        guard.callbacks.link_closed = Some(Arc::new(move |_| {
+            fail.store(true, Ordering::SeqCst);
+        }));
+
+        // Generate ephemeral keys and send the LINKREQUEST packet.
+        // This updates link_id from the packet hash, so we must register
+        // the runtime link AFTER this call (otherwise proof lookup fails).
+        guard.initiate()?;
+    }
+
+    // Register with the real link_id (set by initiate → set_link_id_from_packet).
+    crate::link::register_runtime_link(Arc::clone(&link_arc));
+
+    // Wait for link establishment.
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+    loop {
+        if established.load(Ordering::SeqCst) {
+            break;
+        }
+        if est_failed.load(Ordering::SeqCst) {
+            return Err("Link establishment failed".to_string());
+        }
+        if Instant::now() >= deadline {
+            if let Ok(mut l) = link_arc.lock() {
+                l.teardown();
+            }
+            return Err("Link establishment timed out".to_string());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Send the request and wait for the response.
+    let response_data: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let request_done = Arc::new(AtomicBool::new(false));
+
+    let resp_ok = Arc::clone(&response_data);
+    let done_ok = Arc::clone(&request_done);
+    let response_cb: Arc<dyn Fn(crate::link::RequestReceipt) + Send + Sync> =
+        Arc::new(move |receipt: crate::link::RequestReceipt| {
+            if let Some(ref data) = receipt.response {
+                if let Ok(mut r) = resp_ok.lock() {
+                    *r = Some(data.clone());
+                }
+            }
+            done_ok.store(true, Ordering::SeqCst);
+        });
+
+    let done_fail = Arc::clone(&request_done);
+    let failed_cb: Arc<dyn Fn(crate::link::RequestReceipt) + Send + Sync> =
+        Arc::new(move |_receipt| {
+            done_fail.store(true, Ordering::SeqCst);
+        });
+
+    {
+        let guard = link_arc.lock().map_err(|_| "link lock poisoned")?;
+        guard.request(
+            path.to_string(),
+            payload.to_vec(),
+            Some(response_cb),
+            Some(failed_cb),
+            None,
+        )?;
+    }
+
+    // Wait for request response.
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+    loop {
+        if request_done.load(Ordering::SeqCst) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Teardown the link.
+    if let Ok(mut l) = link_arc.lock() {
+        l.teardown();
+    }
+
+    // Return the response.
+    let result = response_data
+        .lock()
+        .map_err(|_| "response lock poisoned")?
+        .take();
+    result.ok_or_else(|| "Request failed or timed out".to_string())
 }
