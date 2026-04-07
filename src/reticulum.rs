@@ -1130,7 +1130,7 @@ impl Reticulum {
         let cache_path = self.cache_path.clone();
         let job_interval = JOB_INTERVAL;
         let clean_interval = CLEAN_INTERVAL;
-        let persist_interval = PERSIST_INTERVAL;
+        let persist_interval = GRACIOUS_PERSIST_INTERVAL;
 
         thread::spawn(move || {
             let mut last_cache_clean = 0.0;

@@ -26,6 +26,8 @@ pub mod resource;
 pub mod reticulum;
 pub mod transport;
 pub mod ffi;
+pub mod cffi;
+pub mod client;
 
 pub const LOG_NONE: i32 = -1;
 pub const LOG_CRITICAL: i32 = 0;
