@@ -577,250 +577,273 @@ impl TcpClientInterface {
     const READ_WATCHDOG_TIMEOUT: u64 = 180;
 
     pub fn start_read_loop(interface: Arc<Mutex<TcpClientInterface>>) {
-        thread::spawn(move || {
-            let (mut socket, interface_name, kiss_framing, hw_mtu, is_initiator) = {
-                let iface = interface.lock().unwrap();
-                let Some(socket_ref) = iface.socket.as_ref() else {
-                    crate::log("TCP read loop: no socket, exiting", crate::LOG_ERROR, false, false);
-                    return;
-                };
-
-                let Ok(cloned_socket) = socket_ref.try_clone() else {
-                    crate::log("TCP read loop: socket clone failed, exiting", crate::LOG_ERROR, false, false);
-                    return;
-                };
-
-                (
-                    cloned_socket,
-                    iface.base.name.clone(),
-                    iface.kiss_framing,
-                    iface.base.hw_mtu.unwrap_or(Self::HW_MTU),
-                    iface.initiator,
-                )
-            };
-            crate::log(&format!("TCP read loop started for {:?}", interface_name), crate::LOG_NOTICE, false, false);
-
-            // Set a read timeout so we can detect zombie / half-open
-            // connections that Android's TCP keepalive fails to catch.
-            let watchdog_duration = Duration::from_secs(Self::READ_WATCHDOG_TIMEOUT);
-            if let Err(e) = socket.set_read_timeout(Some(watchdog_duration)) {
-                crate::log(&format!("TCP read loop: set_read_timeout failed: {}", e), crate::LOG_WARNING, false, false);
+        // Guard: use `reconnecting` as a "loop is live" sentinel.
+        // If another loop is already running for this exact Arc (e.g. a duplicate
+        // call from a stale code path), silently return so we never accumulate
+        // parallel read loops on a single interface.
+        {
+            let mut iface = interface.lock().unwrap();
+            if iface.reconnecting {
+                crate::log(
+                    "TCP start_read_loop: loop already active for this interface, ignoring duplicate call",
+                    crate::LOG_WARNING, false, false,
+                );
+                return;
             }
+            iface.reconnecting = true;
+        }
 
-            let mut in_frame = false;
-            let mut escape = false;
-            let mut frame_buffer = Vec::new();
-            let mut data_buffer = Vec::new();
-            let mut command = Kiss::CMD_UNKNOWN;
-            let mut buf = [0u8; 4096];
+        thread::spawn(move || {
+            // ── Outer loop: read → reconnect → read → … ─────────────────────
+            // We never spawn a second thread.  After a successful reconnect we
+            // simply `continue 'running` to re-clone the new socket and start
+            // reading again in the same thread.
+            'running: loop {
+                // ── Clone current socket and read static config ───────────────
+                let (mut socket, interface_name, kiss_framing, hw_mtu, is_initiator) = {
+                    let iface = interface.lock().unwrap();
+                    let Some(socket_ref) = iface.socket.as_ref() else {
+                        crate::log("TCP read loop: no socket, exiting", crate::LOG_ERROR, false, false);
+                        break 'running;
+                    };
+                    let Ok(cloned_socket) = socket_ref.try_clone() else {
+                        crate::log("TCP read loop: socket clone failed, exiting", crate::LOG_ERROR, false, false);
+                        break 'running;
+                    };
+                    (
+                        cloned_socket,
+                        iface.base.name.clone(),
+                        iface.kiss_framing,
+                        iface.base.hw_mtu.unwrap_or(Self::HW_MTU),
+                        iface.initiator,
+                    )
+                };
 
-            let mut read_count: u64 = 0;
-            let mut last_data_time = std::time::Instant::now();
-            crate::log("TCP read loop: entering blocking read", crate::LOG_NOTICE, false, false);
-            loop {
-                match socket.read(&mut buf) {
-                    Ok(0) => {
-                        crate::log("TCP read loop: connection closed (read 0)", crate::LOG_NOTICE, false, false);
-                        break;
-                    }
-                    Ok(n) => {
-                        read_count += 1;
-                        last_data_time = std::time::Instant::now();
-                        crate::log(&format!("TCP inbound: {} bytes (read #{})", n, read_count), crate::LOG_VERBOSE, false, false);
-                        let data_in = &buf[..n];
+                crate::log(&format!("TCP read loop started for {:?}", interface_name), crate::LOG_NOTICE, false, false);
 
-                        if kiss_framing {
-                            for &byte in data_in {
-                                if in_frame && byte == Kiss::FEND && command == Kiss::CMD_DATA {
-                                    in_frame = false;
-                                    if !data_buffer.is_empty() {
-                                        let _ = Transport::inbound(data_buffer.clone(), interface_name.clone());
+                // Set a read timeout so we can detect zombie / half-open
+                // connections that Android's TCP keepalive fails to catch.
+                let watchdog_duration = Duration::from_secs(Self::READ_WATCHDOG_TIMEOUT);
+                if let Err(e) = socket.set_read_timeout(Some(watchdog_duration)) {
+                    crate::log(&format!("TCP read loop: set_read_timeout failed: {}", e), crate::LOG_WARNING, false, false);
+                }
+
+                // Framing state resets on each new connection.
+                let mut in_frame = false;
+                let mut escape = false;
+                let mut frame_buffer = Vec::new();
+                let mut data_buffer = Vec::new();
+                let mut command = Kiss::CMD_UNKNOWN;
+                let mut buf = [0u8; 4096];
+                let mut read_count: u64 = 0;
+                let mut last_data_time = std::time::Instant::now();
+
+                crate::log("TCP read loop: entering blocking read", crate::LOG_NOTICE, false, false);
+
+                // ── Inner read loop ───────────────────────────────────────────
+                'reading: loop {
+                    match socket.read(&mut buf) {
+                        Ok(0) => {
+                            crate::log("TCP read loop: connection closed (read 0)", crate::LOG_NOTICE, false, false);
+                            break 'reading;
+                        }
+                        Ok(n) => {
+                            read_count += 1;
+                            last_data_time = std::time::Instant::now();
+                            crate::log(&format!("TCP inbound: {} bytes (read #{})", n, read_count), crate::LOG_VERBOSE, false, false);
+                            let data_in = &buf[..n];
+
+                            if kiss_framing {
+                                for &byte in data_in {
+                                    if in_frame && byte == Kiss::FEND && command == Kiss::CMD_DATA {
+                                        in_frame = false;
+                                        if !data_buffer.is_empty() {
+                                            let _ = Transport::inbound(data_buffer.clone(), interface_name.clone());
+                                            data_buffer.clear();
+                                        }
+                                    } else if byte == Kiss::FEND {
+                                        in_frame = true;
+                                        command = Kiss::CMD_UNKNOWN;
                                         data_buffer.clear();
-                                    }
-                                } else if byte == Kiss::FEND {
-                                    in_frame = true;
-                                    command = Kiss::CMD_UNKNOWN;
-                                    data_buffer.clear();
-                                } else if in_frame && data_buffer.len() < hw_mtu {
-                                    if data_buffer.is_empty() && command == Kiss::CMD_UNKNOWN {
-                                        command = byte & 0x0F;
-                                    } else if command == Kiss::CMD_DATA {
-                                        if byte == Kiss::FESC {
-                                            escape = true;
-                                        } else if escape {
-                                            let unescaped = match byte {
-                                                b if b == Kiss::TFEND => Kiss::FEND,
-                                                b if b == Kiss::TFESC => Kiss::FESC,
-                                                b => b,
-                                            };
-                                            data_buffer.push(unescaped);
-                                            escape = false;
-                                        } else {
-                                            data_buffer.push(byte);
+                                    } else if in_frame && data_buffer.len() < hw_mtu {
+                                        if data_buffer.is_empty() && command == Kiss::CMD_UNKNOWN {
+                                            command = byte & 0x0F;
+                                        } else if command == Kiss::CMD_DATA {
+                                            if byte == Kiss::FESC {
+                                                escape = true;
+                                            } else if escape {
+                                                let unescaped = match byte {
+                                                    b if b == Kiss::TFEND => Kiss::FEND,
+                                                    b if b == Kiss::TFESC => Kiss::FESC,
+                                                    b => b,
+                                                };
+                                                data_buffer.push(unescaped);
+                                                escape = false;
+                                            } else {
+                                                data_buffer.push(byte);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            frame_buffer.extend_from_slice(data_in);
+                            } else {
+                                frame_buffer.extend_from_slice(data_in);
 
-                            loop {
-                                if let Some(frame_start) = frame_buffer.iter().position(|&b| b == Hdlc::FLAG) {
-                                    if let Some(frame_end_offset) = frame_buffer[frame_start + 1..].iter().position(|&b| b == Hdlc::FLAG) {
-                                        let frame_end = frame_start + 1 + frame_end_offset;
-                                        let frame = &frame_buffer[frame_start + 1..frame_end];
+                                loop {
+                                    if let Some(frame_start) = frame_buffer.iter().position(|&b| b == Hdlc::FLAG) {
+                                        if let Some(frame_end_offset) = frame_buffer[frame_start + 1..].iter().position(|&b| b == Hdlc::FLAG) {
+                                            let frame_end = frame_start + 1 + frame_end_offset;
+                                            let frame = &frame_buffer[frame_start + 1..frame_end];
 
-                                        let mut unescaped = Vec::new();
-                                        let mut esc = false;
-                                        for &byte in frame {
-                                            if esc {
-                                                if byte == (Hdlc::FLAG ^ Hdlc::ESC_MASK) {
-                                                    unescaped.push(Hdlc::FLAG);
-                                                } else if byte == (Hdlc::ESC ^ Hdlc::ESC_MASK) {
-                                                    unescaped.push(Hdlc::ESC);
-                                                }
-                                                esc = false;
-                                            } else if byte == Hdlc::ESC {
-                                                esc = true;
-                                            } else {
-                                                unescaped.push(byte);
-                                            }
-                                        }
-
-                                        const HEADER_MINSIZE: usize = 2;
-                                        if unescaped.len() > HEADER_MINSIZE {
-                                            crate::log(&format!("TCP frame: {} bytes, passing to Transport::inbound", unescaped.len()), crate::LOG_VERBOSE, false, false);
-                                            let _ = std::io::Write::flush(&mut std::io::stderr());
-                                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                                Transport::inbound(unescaped.clone(), interface_name.clone())
-                                            }));
-                                            match &result {
-                                                Ok(_v) => {
-                                                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                                                }
-                                                Err(panic) => {
-                                                    let _detail = if let Some(s) = panic.downcast_ref::<&str>() {
-                                                        s.to_string()
-                                                    } else if let Some(s) = panic.downcast_ref::<String>() {
-                                                        s.clone()
-                                                    } else {
-                                                        "unknown panic".to_string()
-                                                    };
+                                            let mut unescaped = Vec::new();
+                                            let mut esc = false;
+                                            for &byte in frame {
+                                                if esc {
+                                                    if byte == (Hdlc::FLAG ^ Hdlc::ESC_MASK) {
+                                                        unescaped.push(Hdlc::FLAG);
+                                                    } else if byte == (Hdlc::ESC ^ Hdlc::ESC_MASK) {
+                                                        unescaped.push(Hdlc::ESC);
+                                                    }
+                                                    esc = false;
+                                                } else if byte == Hdlc::ESC {
+                                                    esc = true;
+                                                } else {
+                                                    unescaped.push(byte);
                                                 }
                                             }
-                                        }
 
-                                        frame_buffer.drain(..=frame_end);
+                                            const HEADER_MINSIZE: usize = 2;
+                                            if unescaped.len() > HEADER_MINSIZE {
+                                                crate::log(&format!("TCP frame: {} bytes, passing to Transport::inbound", unescaped.len()), crate::LOG_VERBOSE, false, false);
+                                                let _ = std::io::Write::flush(&mut std::io::stderr());
+                                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                    Transport::inbound(unescaped.clone(), interface_name.clone())
+                                                }));
+                                                match &result {
+                                                    Ok(_v) => {
+                                                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                                                    }
+                                                    Err(panic) => {
+                                                        let _detail = if let Some(s) = panic.downcast_ref::<&str>() {
+                                                            s.to_string()
+                                                        } else if let Some(s) = panic.downcast_ref::<String>() {
+                                                            s.clone()
+                                                        } else {
+                                                            "unknown panic".to_string()
+                                                        };
+                                                    }
+                                                }
+                                            }
+
+                                            frame_buffer.drain(..=frame_end);
+                                        } else {
+                                            break;
+                                        }
                                     } else {
                                         break;
                                     }
-                                } else {
-                                    break;
                                 }
                             }
                         }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                        let idle_secs = last_data_time.elapsed().as_secs();
-                        if idle_secs >= Self::READ_WATCHDOG_TIMEOUT {
-                            crate::log(
-                                &format!(
-                                    "TCP watchdog: no data received for {}s (threshold {}s), connection appears dead — triggering reconnect",
-                                    idle_secs, Self::READ_WATCHDOG_TIMEOUT
-                                ),
-                                crate::LOG_WARNING,
-                                false, false,
-                            );
-                            break;
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                            let idle_secs = last_data_time.elapsed().as_secs();
+                            if idle_secs >= Self::READ_WATCHDOG_TIMEOUT {
+                                crate::log(
+                                    &format!(
+                                        "TCP watchdog: no data received for {}s (threshold {}s), connection appears dead — triggering reconnect",
+                                        idle_secs, Self::READ_WATCHDOG_TIMEOUT
+                                    ),
+                                    crate::LOG_WARNING,
+                                    false, false,
+                                );
+                                break 'reading;
+                            }
+                            // Timeout fired but we haven't exceeded the watchdog threshold yet.
+                            continue 'reading;
                         }
-                        // Timeout fired but we haven't exceeded the watchdog threshold yet.
-                        // This can happen if the socket timeout fires slightly early; just retry.
-                        continue;
+                        Err(e) => {
+                            crate::log(&format!("TCP read loop: socket error: {}", e), crate::LOG_ERROR, false, false);
+                            break 'reading;
+                        }
                     }
-                    Err(e) => {
-                        crate::log(&format!("TCP read loop: socket error: {}", e), crate::LOG_ERROR, false, false);
-                        break;
+                } // 'reading
+
+                // ── Read loop exited ──────────────────────────────────────────
+                crate::log("TCP read loop exited, marking interface offline", crate::LOG_WARNING, false, false);
+                let iface_name = {
+                    let mut iface = interface.lock().unwrap();
+                    iface.base.online = false;
+                    iface.socket = None;
+                    iface.base.name.clone()
+                };
+
+                // For server-side (accepted) connections, deregister and stop.
+                if !is_initiator {
+                    if let Some(ref name) = iface_name {
+                        crate::transport::Transport::deregister_interface_stub(name);
+                        crate::transport::Transport::unregister_outbound_handler(name);
+                        crate::log(
+                            &format!("TCP server client disconnected, deregistered interface {}", name),
+                            crate::LOG_NOTICE, false, false,
+                        );
                     }
+                    break 'running;
                 }
-            }
 
-            // Read loop exited — mark interface offline and attempt reconnect
-            crate::log("TCP read loop exited, marking interface offline", crate::LOG_WARNING, false, false);
-            let iface_name = {
-                let mut iface = interface.lock().unwrap();
-                iface.base.online = false;
-                iface.socket = None;
-                iface.base.name.clone()
-            };
-
-            // For server-side (accepted) connections, deregister the interface stub
-            // and its outbound handler so Transport::outbound sees no live interface
-            // and treats any pending fanout delivery as missed → deferred_queue.
-            if !is_initiator {
-                if let Some(ref name) = iface_name {
-                    crate::transport::Transport::deregister_interface_stub(name);
-                    crate::transport::Transport::unregister_outbound_handler(name);
-                    crate::log(
-                        &format!("TCP server client disconnected, deregistered interface {}", name),
-                        crate::LOG_NOTICE, false, false,
-                    );
-                }
-            }
-
-            if is_initiator {
+                // ── Reconnect (initiator only) ────────────────────────────────
                 crate::log("TCP read loop: initiator, attempting reconnect...", crate::LOG_NOTICE, false, false);
-                // Reconnect loop
                 let mut attempts = 0u32;
-                loop {
+                let reconnected = 'reconnect: loop {
                     thread::sleep(Duration::from_secs(Self::RECONNECT_WAIT));
                     attempts += 1;
 
-                    let max_tries = {
+                    let (detached, max_tries) = {
                         let iface = interface.lock().unwrap();
-                        if iface.detached {
-                            crate::log("TCP reconnect: interface detached, giving up", crate::LOG_NOTICE, false, false);
-                            break;
-                        }
-                        iface.max_reconnect_tries
+                        (iface.detached, iface.max_reconnect_tries)
                     };
+
+                    if detached {
+                        crate::log("TCP reconnect: interface detached, giving up", crate::LOG_NOTICE, false, false);
+                        break 'reconnect false;
+                    }
 
                     if let Some(max) = max_tries {
                         if attempts as usize > max {
                             crate::log(&format!("TCP reconnect: max attempts ({}) reached, giving up", max), crate::LOG_ERROR, false, false);
-                            break;
+                            break 'reconnect false;
                         }
                     }
 
                     crate::log(&format!("TCP reconnect attempt {}...", attempts), crate::LOG_NOTICE, false, false);
-                    let reconnect_ok = {
+                    let ok = {
                         let mut iface = interface.lock().unwrap();
                         iface.connect(false).is_ok()
                     };
 
-                    if reconnect_ok {
+                    if ok {
                         crate::log("TCP reconnected successfully, restarting read loop", crate::LOG_NOTICE, false, false);
-                        // Restart the read loop on the new socket (recursive spawn)
-                        Self::start_read_loop(Arc::clone(&interface));
-
-                        // Synthesize tunnel for non-KISS TCP interfaces
-                        let (kiss_framing, iface_name, iface_repr) = {
-                            let iface = interface.lock().unwrap();
-                            (
-                                iface.kiss_framing,
-                                iface.base.name.clone().unwrap_or_default(),
-                                iface.to_string(),
-                            )
-                        };
-                        if !kiss_framing {
-                            crate::transport::Transport::synthesize_tunnel(&iface_name, &iface_repr);
-                        }
-
-                        return;
+                        break 'reconnect true;
                     } else {
                         crate::log(&format!("TCP reconnect attempt {} failed", attempts), crate::LOG_WARNING, false, false);
                     }
+                }; // 'reconnect
+
+                if !reconnected {
+                    break 'running;
                 }
-            }
+
+                // Synthesize tunnel on the new connection then loop back to read.
+                let (kiss_framing2, iname, irepr) = {
+                    let iface = interface.lock().unwrap();
+                    (iface.kiss_framing, iface.base.name.clone().unwrap_or_default(), iface.to_string())
+                };
+                if !kiss_framing2 {
+                    crate::transport::Transport::synthesize_tunnel(&iname, &irepr);
+                }
+                // continue 'running → re-clone the new socket and read again
+            } // 'running
+
+            // Clear the "loop is live" sentinel so the interface can be restarted.
+            interface.lock().unwrap().reconnecting = false;
         });
     }
 

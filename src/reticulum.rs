@@ -2054,6 +2054,29 @@ pub fn exit_handler() {
     }
     crate::set_loglevel(-1);
 
+    // Detach all TCP client interfaces before clearing the instance.
+    //
+    // Each TcpClientInterface read-loop thread holds its own Arc clone and
+    // will outlive the Reticulum instance unless we explicitly signal it to
+    // stop.  Calling detach() sets detached=true and shuts down the socket,
+    // which causes any blocked read() to return an error immediately;  the
+    // thread then sees detached=true in the reconnect check and exits cleanly
+    // without opening a new connection.  This prevents the "ghost loop"
+    // accumulation that produces duplicate TCP connections on library restart.
+    if let Ok(instance_guard) = INSTANCE.try_lock() {
+        if let Some(ref rns_arc) = *instance_guard {
+            if let Ok(rns) = rns_arc.try_lock() {
+                for iface in &rns.system_interfaces {
+                    if let SystemInterface::TcpClient(ref tcp_arc) = iface {
+                        if let Ok(mut tcp) = tcp_arc.lock() {
+                            tcp.detach();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Clear the singleton so init() can be called again (needed for Android service restart)
     if let Ok(mut instance) = INSTANCE.lock() {
         *instance = None;

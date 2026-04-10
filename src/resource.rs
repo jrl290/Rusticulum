@@ -265,10 +265,10 @@ impl Resource {
             let hashmap_raw = r.hashmap_raw.clone();
             // Inline the hashmap population without calling request_next
             r.status = ResourceStatus::Transferring;
-            let seg_len = ResourceAdvertisement::HASHMAP_MAX_LEN;
+            let _seg_len = ResourceAdvertisement::HASHMAP_MAX_LEN;
             let hashes = hashmap_raw.len() / Resource::MAPHASH_LEN;
             for i in 0..hashes {
-                let idx = i + 0 * seg_len; // segment=0
+                let idx = i; // segment=0 (0 * seg_len == 0)
                 let slice = &hashmap_raw[i * Resource::MAPHASH_LEN..(i + 1) * Resource::MAPHASH_LEN];
                 let target_index = idx * Resource::MAPHASH_LEN;
                 if target_index + Resource::MAPHASH_LEN <= r.hashmap.len() {
@@ -1066,9 +1066,9 @@ impl Resource {
     /// Returns Some(packet) if a REQ should be sent, None otherwise.
     pub fn prepare_request_next(&mut self) -> Option<Packet> {
 
-        while self.receiving_part {
-            thread::sleep(Duration::from_millis(1));
-        }
+        // Both prepare_request_next and receive_part require &mut self, so they
+        // can never run concurrently — receiving_part must be false here.
+        debug_assert!(!self.receiving_part, "prepare_request_next entered while receive_part was active");
 
         if self.status != ResourceStatus::Failed {
             if !self.waiting_for_hmu {

@@ -373,7 +373,8 @@ impl Packet {
         if dest_type == DestinationType::Plain {
             return false;
         }
-        if self.context >= KEEPALIVE && self.context <= LRPROOF {
+        // LRPROOF is u8::MAX, so <= LRPROOF is always true; only the lower bound matters.
+        if self.context >= KEEPALIVE {
             return false;
         }
         if self.context >= RESOURCE && self.context <= RESOURCE_RCL {

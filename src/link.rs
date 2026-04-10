@@ -2175,11 +2175,26 @@ impl Link {
             }
         };
 
-        // Re-serialize the data element back to msgpack bytes for the handler
-        let request_data = {
-            let mut buf = Vec::new();
-            rmpv_write_value(&mut buf, &outer[2]).map_err(|e| e.to_string())?;
-            buf
+        // Extract request data for the handler.
+        //
+        // When the sender is Python RNS, `data` is passed as raw bytes which Python
+        // msgpack wraps as a Binary element in the outer array.  Those bytes are
+        // themselves a msgpack-encoded value (the actual payload).  Re-serializing
+        // the Binary wrapper would add an extra length-prefix layer that doubles the
+        // encoding depth and breaks all handler decoders.
+        //
+        // Instead: if outer[2] is Binary, hand the inner bytes directly to the
+        // handler.  For any other type (Array, Integer, Nil …) — used by Rust-to-Rust
+        // calls where link.request() decodes `data` back to an rmpv Value before
+        // embedding — fall through to the normal re-serialisation path.
+        let request_data: Vec<u8> = match &outer[2] {
+            rmpv::Value::Binary(b) => b.clone(),
+            rmpv::Value::Nil => Vec::new(),
+            _ => {
+                let mut buf = Vec::new();
+                rmpv_write_value(&mut buf, &outer[2]).map_err(|e| e.to_string())?;
+                buf
+            }
         };
         crate::log(&format!("[REQ] path_hash={} request_data_len={} timestamp={}", crate::hexrep(&path_hash, false), request_data.len(), timestamp), crate::LOG_NOTICE, false, false);
 
@@ -2679,6 +2694,63 @@ impl Link {
         Ok(())
     }
     
+    /// Send a raw DATA packet on this link.
+    ///
+    /// Unlike [`request`], this does not invoke any request handler on the remote
+    /// side.  The packet falls through to the remote's `callbacks.packet` callback
+    /// (the same path used by client PUT packets).  Use this for fire-and-forget
+    /// delivery where no response ACK is expected.
+    ///
+    /// **Locking**: `self` must be locked by the caller (normal `&self` borrow).
+    /// The method pre-encrypts using the link session key and manually packs the
+    /// packet to avoid calling `Transport::outbound` while holding the link mutex
+    /// (same pattern as [`request`]).
+    pub fn send_packet(&self, data: &[u8]) -> Result<(), String> {
+        if self.state != STATE_ACTIVE {
+            return Err(format!("Link is not active (state={})", self.state));
+        }
+        let ciphertext = self.encrypt(data)?;
+
+        let mut dest = self.destination.lock().map_err(|_| "Destination lock poisoned")?.clone();
+        dest.dest_type = DestinationType::Link;
+        dest.hash = self.link_id.clone();
+        dest.hexhash = crate::hexrep(&dest.hash, false);
+        dest.link = Some(crate::destination::LinkInfo {
+            rtt: self.rtt,
+            traffic_timeout_factor: self.traffic_timeout_factor,
+            status_closed: self.state == STATE_CLOSED,
+            mtu: Some(self.mtu),
+            attached_interface: self.attached_interface.clone(),
+        });
+
+        let mut packet = Packet::new(
+            Some(dest),
+            vec![], // data unused — ciphertext injected manually below
+            DATA,
+            crate::packet::DATA,
+            crate::transport::BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        );
+        packet.ciphertext = Some(ciphertext);
+        {
+            let mut raw = Vec::new();
+            raw.push(packet.flags);
+            raw.push(packet.hops);
+            raw.extend_from_slice(&self.link_id);
+            raw.push(packet.context);
+            raw.extend_from_slice(packet.ciphertext.as_ref().unwrap());
+            packet.destination_hash = Some(self.link_id.clone());
+            packet.raw = raw;
+            packet.packed = true;
+            packet.update_hash();
+        }
+        packet.send().map(|_| ()).map_err(|e| format!("send_packet failed: {e}"))
+    }
+
     /// Update keepalive interval based on measured RTT (matches Python __update_keepalive)
     pub fn update_keepalive(&mut self) {
         if let Some(rtt) = self.rtt {
