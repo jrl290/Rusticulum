@@ -418,3 +418,17 @@ pub extern "C" fn rns_link_request(
         }
     }
 }
+
+// =========================================================================
+// Network connectivity hint
+// =========================================================================
+
+/// Signal that network connectivity has been restored.
+///
+/// Wakes all TCP client interface reconnect loops so they attempt an
+/// immediate connect instead of waiting out the full polling interval.
+/// Safe to call at any time; no-op if all interfaces are already online.
+#[no_mangle]
+pub extern "C" fn rns_nudge_reconnect() {
+    crate::interfaces::tcp_interface::nudge_reconnect();
+}

@@ -1607,6 +1607,7 @@ impl Reticulum {
                         Ok(mut interface) => {
                             Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
                             let kiss_framing = interface.kiss_framing;
+                            let is_online = interface.base.online;
                             let interface_repr = interface.to_string();
                             let interface = Arc::new(Mutex::new(interface));
                             let handler_iface = Arc::clone(&interface);
@@ -1622,7 +1623,9 @@ impl Reticulum {
                             // For non-KISS TCP client interfaces, synthesize tunnel
                             // so the remote transport daemon associates this connection
                             // with our transport identity.
-                            if !kiss_framing {
+                            // Only if already connected; the reconnect loop handles this
+                            // for deferred connections.
+                            if !kiss_framing && is_online {
                                 let iname = name.clone();
                                 let irepr = interface_repr.clone();
                                 std::thread::spawn(move || {

@@ -2,9 +2,36 @@ use super::interface::{Interface, InterfaceMode};
 use crate::transport::Transport;
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
+
+// ── Global reconnect nudge ──────────────────────────────────────────────
+// A Condvar shared by all TCP client reconnect loops.  When the platform
+// layer detects that network connectivity has been restored it calls
+// `nudge_reconnect()`, which wakes every sleeping reconnect loop so they
+// can attempt an immediate connect instead of waiting out the full
+// RECONNECT_WAIT interval.
+static RECONNECT_NUDGE: once_cell::sync::Lazy<(Mutex<()>, Condvar)> =
+    once_cell::sync::Lazy::new(|| (Mutex::new(()), Condvar::new()));
+
+/// Wake all TCP client reconnect loops immediately.
+/// Safe to call from any thread, including C FFI.
+pub fn nudge_reconnect() {
+    let (lock, cvar) = &*RECONNECT_NUDGE;
+    let _guard = lock.lock().unwrap();
+    cvar.notify_all();
+}
+
+/// Sleep for up to `secs` but return early if `nudge_reconnect()` is called.
+fn wait_or_nudge(secs: u64) {
+    let (lock, cvar) = &*RECONNECT_NUDGE;
+    let nudged = lock.lock().unwrap();
+    // Use wait_timeout (not wait_timeout_while) so that ANY notify_all
+    // wakes us, regardless of whether another thread consumed the flag first.
+    // We don't care about the flag value — the nudge is purely a "try now" hint.
+    let _ = cvar.wait_timeout(nudged, Duration::from_secs(secs));
+}
 
 /// HDLC framing for TCP Interface
 pub struct Hdlc;
@@ -167,8 +194,10 @@ impl TcpClientInterface {
             writing: false,
         };
 
-        // Initial connection
-        interface.initial_connect()?;
+        // Attempt initial connection.  If it fails, the interface is still
+        // created in a "pending" state — start_read_loop will handle the
+        // reconnect using the same condvar-based wait as a mid-session drop.
+        let _ = interface.initial_connect();
 
         Ok(interface)
     }
@@ -424,11 +453,19 @@ impl TcpClientInterface {
         };
 
         if let Some(ref mut socket) = self.socket {
+            #[cfg(unix)]
+            let write_fd = {
+                use std::os::unix::io::AsRawFd;
+                socket.as_raw_fd()
+            };
             match socket.write_all(&framed) {
                 Ok(_) => {
                     self.base.txb += framed.len() as u64;
                 }
                 Err(e) => {
+                    #[cfg(unix)]
+                    crate::log(&format!("TCP write failed on fd={}, marking offline: {}", write_fd, e), crate::LOG_ERROR, false, false);
+                    #[cfg(not(unix))]
                     crate::log(&format!("TCP write failed, marking offline: {}", e), crate::LOG_ERROR, false, false);
                     self.base.online = false;
                     self.socket = None;
@@ -600,24 +637,43 @@ impl TcpClientInterface {
             // reading again in the same thread.
             'running: loop {
                 // ── Clone current socket and read static config ───────────────
-                let (mut socket, interface_name, kiss_framing, hw_mtu, is_initiator) = {
+                let socket_result: Option<(TcpStream, Option<String>, bool, usize, bool)> = {
                     let iface = interface.lock().unwrap();
-                    let Some(socket_ref) = iface.socket.as_ref() else {
-                        crate::log("TCP read loop: no socket, exiting", crate::LOG_ERROR, false, false);
-                        break 'running;
-                    };
-                    let Ok(cloned_socket) = socket_ref.try_clone() else {
-                        crate::log("TCP read loop: socket clone failed, exiting", crate::LOG_ERROR, false, false);
-                        break 'running;
-                    };
-                    (
-                        cloned_socket,
-                        iface.base.name.clone(),
-                        iface.kiss_framing,
-                        iface.base.hw_mtu.unwrap_or(Self::HW_MTU),
-                        iface.initiator,
-                    )
+                    if let Some(socket_ref) = iface.socket.as_ref() {
+                        if let Ok(cloned_socket) = socket_ref.try_clone() {
+                            #[cfg(unix)] {
+                                use std::os::unix::io::AsRawFd;
+                                crate::log(&format!("TCP socket clone: original_fd={} clone_fd={}", socket_ref.as_raw_fd(), cloned_socket.as_raw_fd()), crate::LOG_NOTICE, false, false);
+                            }
+                            Some((
+                                cloned_socket,
+                                iface.base.name.clone(),
+                                iface.kiss_framing,
+                                iface.base.hw_mtu.unwrap_or(Self::HW_MTU),
+                                iface.initiator,
+                            ))
+                        } else {
+                            crate::log("TCP read loop: socket clone failed", crate::LOG_WARNING, false, false);
+                            None
+                        }
+                    } else {
+                        // No socket yet (initial connect failed) — fall through
+                        // to the reconnect section below.
+                        None
+                    }
                 };
+
+                // If we have no socket, skip straight to the reconnect logic
+                // instead of breaking out entirely.
+                if socket_result.is_none() {
+                    let iface_name = interface.lock().unwrap().base.name.clone();
+                    crate::log(
+                        &format!("TCP read loop: no socket for {:?}, entering reconnect", iface_name),
+                        crate::LOG_NOTICE, false, false,
+                    );
+                } else {
+
+                let (mut socket, interface_name, kiss_framing, hw_mtu, is_initiator) = socket_result.unwrap();
 
                 crate::log(&format!("TCP read loop started for {:?}", interface_name), crate::LOG_NOTICE, false, false);
 
@@ -761,6 +817,11 @@ impl TcpClientInterface {
                             continue 'reading;
                         }
                         Err(e) => {
+                            #[cfg(unix)] {
+                                use std::os::unix::io::AsRawFd;
+                                crate::log(&format!("TCP read loop: socket error on fd={}: {}", socket.as_raw_fd(), e), crate::LOG_ERROR, false, false);
+                            }
+                            #[cfg(not(unix))]
                             crate::log(&format!("TCP read loop: socket error: {}", e), crate::LOG_ERROR, false, false);
                             break 'reading;
                         }
@@ -769,15 +830,15 @@ impl TcpClientInterface {
 
                 // ── Read loop exited ──────────────────────────────────────────
                 crate::log("TCP read loop exited, marking interface offline", crate::LOG_WARNING, false, false);
-                let iface_name = {
+                {
                     let mut iface = interface.lock().unwrap();
                     iface.base.online = false;
                     iface.socket = None;
-                    iface.base.name.clone()
-                };
+                }
 
                 // For server-side (accepted) connections, deregister and stop.
                 if !is_initiator {
+                    let iface_name = interface.lock().unwrap().base.name.clone();
                     if let Some(ref name) = iface_name {
                         crate::transport::Transport::deregister_interface_stub(name);
                         crate::transport::Transport::unregister_outbound_handler(name);
@@ -789,11 +850,15 @@ impl TcpClientInterface {
                     break 'running;
                 }
 
+                } // end of `if socket_result.is_some()` block
+
                 // ── Reconnect (initiator only) ────────────────────────────────
                 crate::log("TCP read loop: initiator, attempting reconnect...", crate::LOG_NOTICE, false, false);
                 let mut attempts = 0u32;
                 let reconnected = 'reconnect: loop {
-                    thread::sleep(Duration::from_secs(Self::RECONNECT_WAIT));
+                    // Wait up to RECONNECT_WAIT seconds, but wake immediately
+                    // if the platform signals that network connectivity is back.
+                    wait_or_nudge(Self::RECONNECT_WAIT);
                     attempts += 1;
 
                     let (detached, max_tries) = {
