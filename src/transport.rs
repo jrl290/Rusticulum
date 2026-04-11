@@ -34,6 +34,11 @@ pub const PATHFINDER_E: f64 = 60.0 * 60.0 * 24.0 * 7.0;
 pub const AP_PATH_TIME: f64 = 60.0 * 60.0 * 24.0;
 pub const ROAMING_PATH_TIME: f64 = 60.0 * 60.0 * 6.0;
 
+/// Reasonable hop-count fallback when path info is unavailable.
+/// Used for timeout calculations instead of PATHFINDER_M (128)
+/// which produces absurdly long timeouts on slow links like LoRa.
+pub const LINK_UNKNOWN_HOP_COUNT: u8 = 4;
+
 pub const LOCAL_REBROADCASTS_MAX: u8 = 2;
 
 pub const PATH_REQUEST_TIMEOUT: f64 = 15.0;
@@ -2666,10 +2671,13 @@ impl Transport {
             if let Some(PathEntryValue::Hops(hops)) = entry.get(IDX_PT_HOPS) {
                 *hops
             } else {
-                PATHFINDER_M
+                // Path exists but hop count unavailable — assume direct
+                1
             }
         } else {
-            PATHFINDER_M
+            // No path known; use a reasonable default instead of PATHFINDER_M (128)
+            // which causes multi-minute timeouts on slow links like LoRa
+            LINK_UNKNOWN_HOP_COUNT
         }
     }
 
@@ -2688,10 +2696,17 @@ impl Transport {
         let lock_wait_start = Instant::now();
         let state = TRANSPORT.lock().unwrap();
         let waited_ms = lock_wait_start.elapsed().as_millis();
-        let found = state.path_table.contains_key(destination_hash);
         if waited_ms > 250 {
         }
-        found
+        // Check both existence and that the path hasn't been soft-expired (timestamp=0)
+        if let Some(entry) = state.path_table.get(destination_hash) {
+            match entry.get(IDX_PT_TIMESTAMP) {
+                Some(PathEntryValue::Timestamp(ts)) if *ts == 0.0 => false,
+                _ => true,
+            }
+        } else {
+            false
+        }
     }
 
     pub fn add_packet_hash(packet_hash: Vec<u8>) {
@@ -2870,12 +2885,25 @@ impl Transport {
         state.destinations.retain(|d| d.hash != destination_hash);
     }
 
+    /// Remove a link_table relay entry immediately instead of waiting
+    /// for the periodic cull (up to LINK_TIMEOUT / 900s). Called on
+    /// link teardown to free stale relay state promptly — critical on
+    /// bandwidth-constrained links where connections drop frequently.
+    pub fn remove_link_entry(link_id: &[u8]) {
+        let mut state = TRANSPORT.lock().unwrap();
+        state.link_table.remove(link_id);
+    }
+
     pub fn register_link(link: crate::link::Link) {
         let mut state = TRANSPORT.lock().unwrap();
         if link.initiator {
-            state.pending_links.push(link);
+            if !state.pending_links.iter().any(|l| l.link_id == link.link_id) {
+                state.pending_links.push(link);
+            }
         } else {
-            state.active_links.push(link);
+            if !state.active_links.iter().any(|l| l.link_id == link.link_id) {
+                state.active_links.push(link);
+            }
         }
     }
 

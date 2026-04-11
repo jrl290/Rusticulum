@@ -231,6 +231,16 @@ pub fn set_loglevel(level: i32) {
     state.loglevel = level;
 }
 
+pub fn set_logdest(dest: i32) {
+    let mut state = LOG_STATE.lock().unwrap();
+    state.logdest = dest;
+}
+
+pub fn set_logfile(path: String) {
+    let mut state = LOG_STATE.lock().unwrap();
+    state.logfile = Some(path);
+}
+
 fn append_log(path: &str, line: &str) -> std::io::Result<()> {
     let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{}", line)?;

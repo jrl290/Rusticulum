@@ -504,9 +504,13 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
                                 // Check stale first
                                 let stale_secs = link_guard.stale_time as u64;
                                 if now >= last_inbound + stale_secs {
+                                    // Match Python: transition to STALE but don't
+                                    // tear down yet — allow a STALE_GRACE period
+                                    // for any in-flight data to arrive.
                                     link_guard.state = STATE_STALE;
                                     link_guard.status = STATE_STALE;
-                                    WatchdogAction::Teardown
+                                    link_guard.stale_since = Some(now);
+                                    WatchdogAction::Continue
                                 } else if link_guard.initiator && now >= link_guard.last_keepalive + keepalive_secs {
                                     // Send keepalive (initiator only)
                                     if let Some(info) = link_guard.prepare_keepalive() {
@@ -522,7 +526,14 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
                             }
                         }
                         STATE_STALE => {
-                            WatchdogAction::Teardown
+                            let now = current_time().unwrap_or(0);
+                            let grace = STALE_GRACE as u64;
+                            let stale_at = link_guard.stale_since.unwrap_or(0);
+                            if now >= stale_at + grace {
+                                WatchdogAction::Teardown
+                            } else {
+                                WatchdogAction::Continue
+                            }
                         }
                         _ => WatchdogAction::Continue,
                     }
@@ -644,6 +655,7 @@ pub struct Link {
     pub keepalive_timeout_factor: f64,
     pub keepalive: f64,
     pub stale_time: f64,
+    pub stale_since: Option<u64>,
     pub establishment_timeout: f64,
     pub watchdog_lock: bool,
     pub track_phy_stats: bool,
@@ -711,6 +723,7 @@ impl Clone for Link {
             keepalive_timeout_factor: self.keepalive_timeout_factor,
             keepalive: self.keepalive,
             stale_time: self.stale_time,
+            stale_since: self.stale_since,
             establishment_timeout: self.establishment_timeout,
             watchdog_lock: self.watchdog_lock,
             track_phy_stats: self.track_phy_stats,
@@ -940,6 +953,7 @@ impl Link {
             keepalive_timeout_factor: KEEPALIVE_TIMEOUT_FACTOR,
             keepalive: KEEPALIVE,
             stale_time: STALE_TIME,
+            stale_since: None,
             establishment_timeout: ESTABLISHMENT_TIMEOUT_PER_HOP,
             watchdog_lock: false,
             track_phy_stats: false,
@@ -1005,6 +1019,7 @@ impl Link {
             keepalive_timeout_factor: KEEPALIVE_TIMEOUT_FACTOR,
             keepalive: KEEPALIVE,
             stale_time: STALE_TIME,
+            stale_since: None,
             establishment_timeout: ESTABLISHMENT_TIMEOUT_PER_HOP,
             watchdog_lock: false,
             track_phy_stats: false,
@@ -1618,6 +1633,10 @@ impl Link {
         self.state = STATE_CLOSED;
         self.status = STATE_CLOSED;
         unregister_runtime_link(&self.link_id);
+        // Immediately remove the transport relay entry instead of waiting for
+        // the periodic cull (~900s). Prevents stale link_table buildup on
+        // lossy links where connections drop frequently.
+        crate::transport::Transport::remove_link_entry(&self.link_id);
         self.link_closed();
     }
     
