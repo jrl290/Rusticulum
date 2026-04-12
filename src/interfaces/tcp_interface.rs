@@ -749,6 +749,7 @@ impl TcpClientInterface {
                                 }
                             } else {
                                 frame_buffer.extend_from_slice(data_in);
+                                crate::log(&format!("TCP HDLC: frame_buffer len={} after extend", frame_buffer.len()), crate::LOG_DEBUG, false, false);
 
                                 loop {
                                     if let Some(frame_start) = frame_buffer.iter().position(|&b| b == Hdlc::FLAG) {
@@ -775,32 +776,39 @@ impl TcpClientInterface {
 
                                             const HEADER_MINSIZE: usize = 2;
                                             if unescaped.len() > HEADER_MINSIZE {
-                                                crate::log(&format!("TCP frame: {} bytes, passing to Transport::inbound", unescaped.len()), crate::LOG_VERBOSE, false, false);
+                                                crate::log(&format!("TCP frame: {} bytes, passing to Transport::inbound", unescaped.len()), crate::LOG_DEBUG, false, false);
                                                 let _ = std::io::Write::flush(&mut std::io::stderr());
                                                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                                     Transport::inbound(unescaped.clone(), interface_name.clone())
                                                 }));
                                                 match &result {
                                                     Ok(_v) => {
+                                                        crate::log("TCP frame: Transport::inbound returned OK", crate::LOG_DEBUG, false, false);
                                                         let _ = std::io::Write::flush(&mut std::io::stderr());
                                                     }
                                                     Err(panic) => {
-                                                        let _detail = if let Some(s) = panic.downcast_ref::<&str>() {
+                                                        let detail = if let Some(s) = panic.downcast_ref::<&str>() {
                                                             s.to_string()
                                                         } else if let Some(s) = panic.downcast_ref::<String>() {
                                                             s.clone()
                                                         } else {
                                                             "unknown panic".to_string()
                                                         };
+                                                        crate::log(&format!("TCP frame: Transport::inbound PANICKED: {}", detail), crate::LOG_ERROR, false, false);
                                                     }
                                                 }
+                                            } else {
+                                                crate::log(&format!("TCP frame: {} bytes TOO SMALL, skipping", unescaped.len()), crate::LOG_DEBUG, false, false);
                                             }
 
                                             frame_buffer.drain(..=frame_end);
+                                            crate::log(&format!("TCP HDLC: drained to frame_end={}, remaining={}", frame_end, frame_buffer.len()), crate::LOG_DEBUG, false, false);
                                         } else {
+                                            crate::log(&format!("TCP HDLC: partial frame, waiting (buf={})", frame_buffer.len()), crate::LOG_DEBUG, false, false);
                                             break;
                                         }
                                     } else {
+                                        crate::log(&format!("TCP HDLC: no flag byte in buffer (buf={})", frame_buffer.len()), crate::LOG_DEBUG, false, false);
                                         break;
                                     }
                                 }

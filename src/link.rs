@@ -22,23 +22,28 @@ static RUNTIME_LINKS: Lazy<Mutex<HashMap<Vec<u8>, Weak<Mutex<Link>>>>> =
 
 /// Strong references for incoming (non-initiator) links to keep Arc alive
 /// so that RUNTIME_LINKS Weak references remain valid.
-static INCOMING_LINK_ARCS: Lazy<Mutex<Vec<Arc<Mutex<Link>>>>> =
+/// Each entry stores the link_id alongside the Arc so we can match during
+/// unregister WITHOUT locking the Arc (which would deadlock when teardown
+/// is called from dispatch_runtime_packet while the link Mutex is held).
+static INCOMING_LINK_ARCS: Lazy<Mutex<Vec<(Vec<u8>, Arc<Mutex<Link>>)>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 
 pub fn register_runtime_link(link: Arc<Mutex<Link>>) {
     if let Ok(link_guard) = link.lock() {
         let is_incoming = !link_guard.initiator;
         let link_id_hex = crate::hexrep(&link_guard.link_id, false);
+        let link_id = link_guard.link_id.clone();
         let strong = Arc::strong_count(&link);
         if let Ok(mut links) = RUNTIME_LINKS.lock() {
             crate::log(&format!("RUNTIME register link={} strong_count={} incoming={} total={}", link_id_hex, strong, is_incoming, links.len() + 1), crate::LOG_NOTICE, false, false);
-            links.insert(link_guard.link_id.clone(), Arc::downgrade(&link));
+            links.insert(link_id.clone(), Arc::downgrade(&link));
         }
         drop(link_guard);
-        // For incoming links, store a strong reference so the Weak doesn't expire
+        // For incoming links, store a strong reference so the Weak doesn't expire.
+        // Store link_id alongside so unregister can match without re-locking.
         if is_incoming {
             if let Ok(mut arcs) = INCOMING_LINK_ARCS.lock() {
-                arcs.push(Arc::clone(&link));
+                arcs.push((link_id, Arc::clone(&link)));
             }
         }
         // Start link watchdog (establishment timeout, keepalive, stale detection)
@@ -50,6 +55,16 @@ pub fn unregister_runtime_link(link_id: &[u8]) {
     if let Ok(mut links) = RUNTIME_LINKS.lock() {
         let removed = links.remove(link_id).is_some();
         crate::log(&format!("RUNTIME unregister link={} removed={} remaining={}", crate::hexrep(link_id, false), removed, links.len()), crate::LOG_NOTICE, false, false);
+    }
+    // Remove strong reference from INCOMING_LINK_ARCS using the stored link_id,
+    // WITHOUT locking the Arc. Locking the Arc here would deadlock when teardown
+    // is called from dispatch_runtime_packet while link_guard is held.
+    if let Ok(mut arcs) = INCOMING_LINK_ARCS.lock() {
+        let before = arcs.len();
+        arcs.retain(|(id, _arc)| id != link_id);
+        if arcs.len() < before {
+            crate::log(&format!("INCOMING_LINK_ARCS cleaned link={} remaining={}", crate::hexrep(link_id, false), arcs.len()), crate::LOG_DEBUG, false, false);
+        }
     }
 }
 
@@ -480,11 +495,8 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
                                 if now_seconds() >= request_time + link_guard.establishment_timeout {
                                     let state_name = if link_guard.state == STATE_PENDING { "PENDING" } else { "HANDSHAKE" };
                                     crate::log(&format!("Link establishment timed out ({}): {}", state_name, crate::hexrep(&link_guard.link_id, false)), crate::LOG_DEBUG, false, false);
-                                    link_guard.state = STATE_CLOSED;
-                                    link_guard.status = STATE_CLOSED;
                                     link_guard.teardown_reason = REASON_TIMEOUT;
-                                    link_guard.link_closed();
-                                    WatchdogAction::Exit
+                                    WatchdogAction::Teardown
                                 } else {
                                     WatchdogAction::Continue
                                 }
@@ -1335,6 +1347,16 @@ impl Link {
         link_destination.dest_type = DestinationType::Link;
         link_destination.hash = self.link_id.clone();
         link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
+        // Set LinkInfo so Transport::outbound routes the LRPROOF only via the
+        // link's attached interface (not broadcast to all interfaces).
+        // This matches the fix already applied in prove_packet().
+        link_destination.link = Some(crate::destination::LinkInfo {
+            rtt: self.rtt,
+            traffic_timeout_factor: crate::link::TRAFFIC_TIMEOUT_FACTOR,
+            status_closed: self.state == crate::link::STATE_CLOSED,
+            mtu: Some(self.mtu),
+            attached_interface: self.attached_interface.clone(),
+        });
 
         // Create and send the proof packet
         let mut proof_packet = Packet::new(

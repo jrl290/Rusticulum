@@ -2947,7 +2947,6 @@ impl Transport {
             crate::log(&format!("inbound unpack FAILED len={} raw_ptype={}", packet.raw.len(), raw_ptype_str), crate::LOG_NOTICE, false, false);
             return false;
         }
-
         // Early-drop: when drop_announces is enabled, silently discard
         // announce packets before any logging or processing. PATH_RESPONSE
         // replies to our own request_path() calls are always kept.
@@ -3328,18 +3327,32 @@ impl Transport {
                         crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_VERBOSE, false, false);
                         Transport::cache(&packet, true, Some("announce".to_string()));
 
-                        if state.transport_enabled && packet.transport_id.is_some() {
-                            let block_rebroadcasts = packet.context == crate::packet::PATH_RESPONSE;
+                        // Match Python Transport.py line 1741:
+                        // Insert into announce_table for rebroadcast when transport is enabled.
+                        // Python: (transport_enabled or from_local_client) and context != PATH_RESPONSE
+                        // Previous Rust code wrongly required transport_id.is_some(), which
+                        // excluded first-hop announces (HEADER_1, no transport_id) from ever
+                        // being rebroadcast to other interfaces.
+                        if state.transport_enabled && packet.context != crate::packet::PATH_RESPONSE {
+                            let block_rebroadcasts = false;
+                            // Python line 1725: initial retransmit_timeout = now + rand() * PATHFINDER_RW
+                            // (0 to 0.5s). PATHFINDER_G (5s) is only added on RETRY.
+                            // Previous code used PATHFINDER_G + PATHFINDER_RW here, which meant
+                            // the timer kept getting reset by new announces before it could fire.
+                            let initial_timeout = now() + (rand::random::<f64>() * PATHFINDER_RW);
                             let announce_entry = vec![
                                 AnnounceEntryValue::Timestamp(now()),
-                                AnnounceEntryValue::RetransmitTimeout(now() + PATHFINDER_G + PATHFINDER_RW),
+                                AnnounceEntryValue::RetransmitTimeout(initial_timeout),
                                 AnnounceEntryValue::Retries(0),
                                 AnnounceEntryValue::ReceivedFrom(received_from),
                                 AnnounceEntryValue::Hops(packet.hops),
                                 AnnounceEntryValue::Packet(packet.clone()),
                                 AnnounceEntryValue::LocalRebroadcasts(0),
                                 AnnounceEntryValue::BlockRebroadcasts(block_rebroadcasts),
-                                AnnounceEntryValue::AttachedInterface(packet.receiving_interface.clone()),
+                                // Python line 1726: attached_interface = None
+                                // Must be None so outbound() broadcasts to ALL interfaces,
+                                // not just back to the receiving interface.
+                                AnnounceEntryValue::AttachedInterface(None),
                             ];
                             state.announce_table.insert(destination_hash.clone(), announce_entry);
                         }
@@ -3379,18 +3392,34 @@ impl Transport {
 
                         if !next_hop.is_empty() || state.path_table.contains_key(destination_hash) {
 
+                            // Match Python Transport.py line 1448-1462:
+                            // remaining_hops > 1 → replace transport_id with next_hop, update hops
+                            // remaining_hops == 1 → strip transport headers (HEADER_2 → HEADER_1), update hops
+                            // remaining_hops == 0 → just update hops
+                            let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8; // 16
                             let mut new_raw = packet.raw.clone();
-                            if remaining_hops == 1 && packet.header_type == crate::packet::HEADER_2 {
+                            if remaining_hops > 1 {
+                                if packet.header_type == crate::packet::HEADER_2 {
+                                    // Already HEADER_2: replace transport_id (bytes 2..18) with next_hop
+                                    if new_raw.len() > 2 + dst_len && next_hop.len() == dst_len {
+                                        new_raw[1] = packet.hops;
+                                        new_raw[2..2 + dst_len].copy_from_slice(&next_hop);
+                                    }
+                                } else {
+                                    // HEADER_1 → HEADER_2: insert transport_id
+                                    let new_flags = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (packet.flags & 0b0000_1111);
+                                    new_raw[0] = new_flags;
+                                    new_raw[1] = packet.hops;
+                                    new_raw.splice(2..2, next_hop.clone());
+                                }
+                            } else if remaining_hops == 1 && packet.header_type == crate::packet::HEADER_2 {
+                                // Strip transport headers: HEADER_2 → HEADER_1
                                 let new_flags = (crate::packet::HEADER_1 << 6) | (BROADCAST << 4) | (packet.flags & 0b0000_1111);
                                 new_raw[0] = new_flags;
-                                let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+                                new_raw[1] = packet.hops;
                                 if new_raw.len() > 2 + dst_len * 2 {
                                     new_raw.drain(2..2 + dst_len);
                                 }
-                            } else if remaining_hops > 1 && packet.header_type == crate::packet::HEADER_1 {
-                                let new_flags = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (packet.flags & 0b0000_1111);
-                                new_raw[0] = new_flags;
-                                new_raw.splice(2..2, next_hop.clone());
                             } else if remaining_hops == 0 {
                                 if new_raw.len() > 1 {
                                     new_raw[1] = packet.hops;
@@ -3411,6 +3440,7 @@ impl Transport {
                                 proof_timeout += now_ts + crate::link::ESTABLISHMENT_TIMEOUT_PER_HOP * (remaining_hops.max(1) as f64);
 
                                 let mut path_mtu = crate::link::mtu_from_lr_packet(&packet.data);
+                                let original_had_signalling = path_mtu.is_some();
                                 let mode = crate::link::mode_from_lr_packet(&packet.data);
                                 if let Some(name) = outbound_interface_name.as_ref() {
                                     if let Some(out_iface) = state.interfaces.iter().find(|i| &i.name == name) {
@@ -3442,7 +3472,11 @@ impl Transport {
                                             }
                                         }
 
-                                        if path_mtu.is_none() && new_raw.len() >= crate::link::LINK_MTU_SIZE {
+                                        // Python: only strip signalling bytes if they were originally
+                                        // present in the packet and the outbound interface can't handle them.
+                                        // Previous code checked path_mtu.is_none() which would also fire when
+                                        // signalling was already stripped by a previous hop, causing double-truncation.
+                                        if original_had_signalling && path_mtu.is_none() && new_raw.len() >= crate::link::LINK_MTU_SIZE {
                                             new_raw.truncate(new_raw.len() - crate::link::LINK_MTU_SIZE);
                                         }
                                     } else {
@@ -3692,6 +3726,7 @@ impl Transport {
             match destination.receive(&destination_packet) {
                 Ok(handled) => {
                     if handled {
+                        crate::log(&format!("[DEST-RX] OK dest={} ptype={}", crate::hexrep(&destination.hash, false), destination_packet.packet_type), crate::LOG_NOTICE, false, false);
                         // Generate proof based on destination's proof strategy
                         if destination.proof_strategy == crate::destination::PROVE_ALL {
                             let _ = destination_packet.prove(Some(&destination));
@@ -3704,7 +3739,8 @@ impl Transport {
                         }
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    crate::log(&format!("[DEST-RX] ERROR dest={} ptype={}: {}", crate::hexrep(&destination.hash, false), destination_packet.packet_type, e), crate::LOG_ERROR, false, false);
                 }
             }
         }
