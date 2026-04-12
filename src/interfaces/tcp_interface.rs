@@ -673,7 +673,13 @@ impl TcpClientInterface {
                     );
                 } else {
 
-                let (mut socket, interface_name, kiss_framing, hw_mtu, is_initiator) = socket_result.unwrap();
+                let (raw_socket, interface_name, kiss_framing, hw_mtu, is_initiator) = socket_result.unwrap();
+                // Wrap in ManuallyDrop so we control when close() is called.
+                // If the OS reclaims our fd (e.g., iOS background), Rust's
+                // automatic Drop would call close() on a potentially-reused fd
+                // number, corrupting an unrelated socket.
+                let mut socket = std::mem::ManuallyDrop::new(raw_socket);
+                let mut ebadf = false;
 
                 crate::log(&format!("TCP read loop started for {:?}", interface_name), crate::LOG_NOTICE, false, false);
 
@@ -819,7 +825,13 @@ impl TcpClientInterface {
                         Err(e) => {
                             #[cfg(unix)] {
                                 use std::os::unix::io::AsRawFd;
-                                crate::log(&format!("TCP read loop: socket error on fd={}: {}", socket.as_raw_fd(), e), crate::LOG_ERROR, false, false);
+                                let fd = socket.as_raw_fd();
+                                if e.raw_os_error() == Some(9) { // EBADF
+                                    ebadf = true;
+                                    crate::log(&format!("TCP read loop: EBADF on fd={} — fd was reclaimed by OS", fd), crate::LOG_ERROR, false, false);
+                                } else {
+                                    crate::log(&format!("TCP read loop: socket error on fd={}: {}", fd, e), crate::LOG_ERROR, false, false);
+                                }
                             }
                             #[cfg(not(unix))]
                             crate::log(&format!("TCP read loop: socket error: {}", e), crate::LOG_ERROR, false, false);
@@ -829,6 +841,19 @@ impl TcpClientInterface {
                 } // 'reading
 
                 // ── Read loop exited ──────────────────────────────────────────
+                // Handle the cloned socket carefully.  If EBADF occurred the fd
+                // was already closed/reclaimed by the OS (common on iOS during
+                // background transitions).  Calling close() on that fd number
+                // would corrupt whatever new socket inherited it.
+                if ebadf {
+                    // Intentionally leak — the fd is already gone.
+                    crate::log("TCP: leaking dead socket fd (EBADF — already reclaimed by OS)", crate::LOG_WARNING, false, false);
+                    // ManuallyDrop prevents close(); nothing else needed.
+                } else {
+                    // Normal exit (EOF, timeout, connection reset) — close the clone.
+                    unsafe { std::mem::ManuallyDrop::drop(&mut socket); }
+                }
+
                 crate::log("TCP read loop exited, marking interface offline", crate::LOG_WARNING, false, false);
                 {
                     let mut iface = interface.lock().unwrap();

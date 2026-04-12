@@ -810,6 +810,23 @@ impl Identity {
         destinations.get(destination_hash).map(|entry| entry.public_key.clone())
     }
 
+    /// Test-only: inject a known destination in-memory without disk I/O
+    #[cfg(test)]
+    pub fn remember_destination_in_memory(destination_hash: &[u8], public_key: &[u8]) {
+        let mut destinations = KNOWN_DESTINATIONS.lock().unwrap();
+        destinations.insert(destination_hash.to_vec(), KnownDestination {
+            public_key: public_key.to_vec(),
+            app_data: None,
+        });
+    }
+
+    /// Test-only: remove a known destination from in-memory store
+    #[cfg(test)]
+    pub fn forget_destination_in_memory(destination_hash: &[u8]) {
+        let mut destinations = KNOWN_DESTINATIONS.lock().unwrap();
+        destinations.remove(destination_hash);
+    }
+
     // ===== Known Destinations Storage =====
     
     /// Save known destinations to disk

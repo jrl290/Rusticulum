@@ -840,6 +840,17 @@ impl Resource {
                         break;
                     }
 
+                    // Check if the underlying link is still alive
+                    let link_dead = if let Ok(link_guard) = r.link.lock() {
+                        link_guard.state == crate::link::STATE_CLOSED || link_guard.state == crate::link::STATE_STALE
+                    } else {
+                        true
+                    };
+                    if link_dead {
+                        r.cancel();
+                        break;
+                    }
+
                     // Wait if watchdog is locked (e.g. during receive_part)
                     if r.watchog_lock {
                         drop(r);

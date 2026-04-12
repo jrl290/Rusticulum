@@ -31,14 +31,20 @@ fn main() {
     let loglevel = effective_verbosity.max(reticulum_rust::LOG_CRITICAL);
 
     // Service mode: log to file instead of stdout
-    if service {
+    // Set before init so early messages are captured, and re-applied after
+    // in case Reticulum::init() resets log state.
+    let service_logfile = if service {
         let log_dir = config_dir
             .clone()
             .unwrap_or_else(default_config_dir);
         let logfile_path = log_dir.join("logfile");
+        let path_str = logfile_path.to_string_lossy().to_string();
         reticulum_rust::set_logdest(reticulum_rust::LOG_FILE);
-        reticulum_rust::set_logfile(logfile_path.to_string_lossy().to_string());
-    }
+        reticulum_rust::set_logfile(path_str.clone());
+        Some(path_str)
+    } else {
+        None
+    };
 
     reticulum_rust::set_loglevel(loglevel);
 
@@ -81,6 +87,13 @@ fn main() {
             eprintln!("[rnsd] Reticulum init panicked: {detail}");
             std::process::exit(1);
         }
+    }
+
+    // Re-apply log settings after init (Reticulum::init may reset loglevel)
+    reticulum_rust::set_loglevel(loglevel);
+    if let Some(ref path) = service_logfile {
+        reticulum_rust::set_logdest(reticulum_rust::LOG_FILE);
+        reticulum_rust::set_logfile(path.clone());
     }
 
     // Check if connected to shared instance (which is probably wrong for rnsd)

@@ -3574,6 +3574,7 @@ impl Transport {
                 // forward the LRPROOF back to the received_interface (toward the link initiator).
                 let mut forwarded_via_link_table = false;
                 if packet.context == crate::packet::LRPROOF {
+                    let link_hex = packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default();
                     if let Some(destination_hash) = &packet.destination_hash {
                         if let Some(entry) = state.link_table.get_mut(destination_hash) {
                             let rcvd_if = match entry.get(IDX_LT_RCVD_IF) {
@@ -3584,21 +3585,54 @@ impl Transport {
                                 Some(LinkEntryValue::NextHopInterface(name)) => name.clone(),
                                 _ => None,
                             };
-                            // Only forward if the proof arrived from the next-hop direction
-                            if packet.receiving_interface == nh_if {
-                                if let Some(name) = rcvd_if.as_ref() {
-                                    let mut new_raw = packet.raw.clone();
-                                    if new_raw.len() > 1 {
-                                        new_raw[1] = packet.hops;
+                            let remaining_hops = match entry.get(IDX_LT_REM_HOPS) {
+                                Some(LinkEntryValue::RemainingHops(h)) => *h,
+                                _ => 0,
+                            };
+                            // Python checks: hops must match remaining_hops, and
+                            // proof must arrive from the next-hop interface direction
+                            if packet.hops != remaining_hops {
+                                crate::log(&format!("[LRPROOF-RELAY] link={} hop mismatch: proof_hops={} expected={}, not forwarding",
+                                    link_hex, packet.hops, remaining_hops), crate::LOG_DEBUG, false, false);
+                            } else if packet.receiving_interface == nh_if {
+                                // Validate LRPROOF signature before forwarding (per spec)
+                                let dst_hash = match entry.get(IDX_LT_DSTHASH) {
+                                    Some(LinkEntryValue::DestinationHash(h)) => Some(h.clone()),
+                                    _ => None,
+                                };
+                                let sig_valid = if let Some(ref dh) = dst_hash {
+                                    validate_lrproof_signature(&packet.data, destination_hash, dh)
+                                } else {
+                                    crate::log(&format!("[LRPROOF-RELAY] link={} no destination hash in link_table entry", link_hex), crate::LOG_DEBUG, false, false);
+                                    false
+                                };
+
+                                    if sig_valid {
+                                        if let Some(name) = rcvd_if.as_ref() {
+                                            let mut new_raw = packet.raw.clone();
+                                            if new_raw.len() > 1 {
+                                                new_raw[1] = packet.hops;
+                                            }
+                                            crate::log(&format!("[LRPROOF-RELAY] validated and forwarding link={} via rcvd_if={}", link_hex, name), crate::LOG_NOTICE, false, false);
+                                            deferred_outbound.push((name.clone(), new_raw));
+                                            forwarded_via_link_table = true;
+                                            // Mark the link entry as validated
+                                            if let Some(LinkEntryValue::Validated(v)) = entry.get_mut(IDX_LT_VALIDATED) {
+                                                *v = true;
+                                            }
+                                        } else {
+                                            crate::log(&format!("[LRPROOF-RELAY] link={} rcvd_if is None, cannot forward", link_hex), crate::LOG_WARNING, false, false);
+                                        }
+                                    } else {
+                                        crate::log(&format!("[LRPROOF-RELAY] invalid signature for link={}, dropping proof", link_hex), crate::LOG_DEBUG, false, false);
                                     }
-                                    deferred_outbound.push((name.clone(), new_raw));
-                                    forwarded_via_link_table = true;
-                                    // Mark the link entry as validated
-                                    if let Some(LinkEntryValue::Validated(v)) = entry.get_mut(IDX_LT_VALIDATED) {
-                                        *v = true;
-                                    }
-                                }
+                            } else {
+                                crate::log(&format!("[LRPROOF-RELAY] link={} interface mismatch: received_on={:?} expected_nh={:?}, not forwarding",
+                                    link_hex, packet.receiving_interface, nh_if), crate::LOG_DEBUG, false, false);
                             }
+                        } else {
+                            crate::log(&format!("[LRPROOF-RELAY] link={} not found in link_table (entry expired or never created), dropping",
+                                link_hex), crate::LOG_WARNING, false, false);
                         }
                     }
                 }
@@ -3648,7 +3682,10 @@ impl Transport {
         drop(state);
 
         for (iface_name, raw) in deferred_outbound {
-            let _ = Transport::dispatch_outbound(&iface_name, &raw);
+            if !Transport::dispatch_outbound(&iface_name, &raw) {
+                crate::log(&format!("[DISPATCH] outbound failed for interface {} (disconnected?), {} bytes dropped",
+                    iface_name, raw.len()), crate::LOG_WARNING, false, false);
+            }
         }
 
         for (mut destination, destination_packet) in deferred_destination_receives {
@@ -3884,6 +3921,67 @@ fn find_interface_by_hash<'a>(interfaces: &'a mut [InterfaceStub], interface_has
 fn is_local_client_interface(name: &str) -> bool {
     let state = TRANSPORT.lock().unwrap();
     state.local_client_interfaces.iter().any(|iface| iface.name == name)
+}
+
+/// Validate an LRPROOF signature per the Reticulum spec.
+///
+/// `proof_data` – the packet's `.data` field (signature + peer_pub_bytes + optional signalling)
+/// `link_id`    – the destination_hash (link_id) from the packet
+/// `dst_hash`   – the destination hash from link_table[IDX_LT_DSTHASH]
+///
+/// Returns `true` if the signature is valid.
+pub(crate) fn validate_lrproof_signature(proof_data: &[u8], link_id: &[u8], dst_hash: &[u8]) -> bool {
+    let sig_len = crate::identity::SIGLENGTH / 8; // 64
+    let peer_pub_len = crate::link::ECPUBSIZE / 2; // 32
+    let expected_short = sig_len + peer_pub_len; // 96
+    let expected_long = expected_short + crate::link::LINK_MTU_SIZE; // 99
+
+    if proof_data.len() != expected_short && proof_data.len() != expected_long {
+        crate::log(&format!("[LRPROOF-VALIDATE] invalid proof data length {} (expected {} or {})",
+            proof_data.len(), expected_short, expected_long), crate::LOG_DEBUG, false, false);
+        return false;
+    }
+
+    let peer_identity = match Identity::recall(dst_hash) {
+        Some(id) => id,
+        None => {
+            crate::log(&format!("[LRPROOF-VALIDATE] cannot recall identity for destination {}",
+                crate::hexrep(dst_hash, false)), crate::LOG_DEBUG, false, false);
+            return false;
+        }
+    };
+
+    let peer_pub_key = match peer_identity.get_public_key() {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+
+    // peer_sig_pub_bytes = Ed25519 signing key (bytes 32..64 of full public key)
+    let peer_sig_pub_bytes = &peer_pub_key[peer_pub_len..crate::link::ECPUBSIZE];
+
+    let signature = &proof_data[..sig_len];
+    let peer_pub_bytes = &proof_data[sig_len..sig_len + peer_pub_len];
+
+    // Build signalling_bytes if extended proof
+    let signalling_bytes: Vec<u8> = if proof_data.len() == expected_long {
+        let mtu = crate::link::mtu_from_lp_packet(proof_data).unwrap_or(0);
+        let mode = crate::link::mode_from_lp_packet(proof_data);
+        match crate::link::signalling_bytes(mtu, mode) {
+            Ok(sb) => sb.to_vec(),
+            Err(_) => return false,
+        }
+    } else {
+        Vec::new()
+    };
+
+    // signed_data = link_id + peer_pub_bytes + peer_sig_pub_bytes + signalling_bytes
+    let mut signed_data = Vec::with_capacity(link_id.len() + peer_pub_len + 32 + signalling_bytes.len());
+    signed_data.extend_from_slice(link_id);
+    signed_data.extend_from_slice(peer_pub_bytes);
+    signed_data.extend_from_slice(peer_sig_pub_bytes);
+    signed_data.extend_from_slice(&signalling_bytes);
+
+    peer_identity.validate(signature, &signed_data)
 }
 
 #[cfg(test)]
@@ -4353,5 +4451,192 @@ mod tests {
 
         packet.transport_id = Some(local_hash);
         assert!(Transport::packet_filter(&packet));
+    }
+
+    // ===== LRPROOF Signature Validation Tests =====
+
+    /// Helper: create an identity and register it in the in-memory known destinations
+    /// under its own truncated hash so `Identity::recall(dst_hash)` works in tests.
+    fn setup_known_identity() -> (Identity, Vec<u8>) {
+        let identity = Identity::new(true);
+        let pub_key = identity.get_public_key().expect("identity public key");
+        // Use a deterministic destination hash derived from the public key
+        let dst_hash = crate::identity::truncated_hash(&pub_key);
+        Identity::remember_destination_in_memory(&dst_hash, &pub_key);
+        (identity, dst_hash)
+    }
+
+    /// Build valid LRPROOF proof_data (96 bytes, no signalling) for a given link_id,
+    /// using the identity's signing key.
+    fn build_valid_proof_data(identity: &Identity, link_id: &[u8]) -> Vec<u8> {
+        let pub_key = identity.get_public_key().expect("public key");
+        // peer_pub_bytes = X25519 key (first 32 bytes)
+        let peer_pub_bytes = &pub_key[..32];
+        // peer_sig_pub_bytes = Ed25519 key (bytes 32..64)
+        let peer_sig_pub_bytes = &pub_key[32..64];
+
+        // signed_data = link_id + peer_pub_bytes + peer_sig_pub_bytes
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(link_id);
+        signed_data.extend_from_slice(peer_pub_bytes);
+        signed_data.extend_from_slice(peer_sig_pub_bytes);
+
+        let signature = identity.sign(&signed_data);
+
+        // proof_data = signature(64) + peer_pub_bytes(32) = 96 bytes
+        let mut proof_data = signature;
+        proof_data.extend_from_slice(peer_pub_bytes);
+        proof_data
+    }
+
+    /// Build valid LRPROOF proof_data with signalling bytes (99 bytes)
+    fn build_valid_proof_data_with_signalling(identity: &Identity, link_id: &[u8], mtu: usize, mode: u8) -> Vec<u8> {
+        let pub_key = identity.get_public_key().expect("public key");
+        let peer_pub_bytes = &pub_key[..32];
+        let peer_sig_pub_bytes = &pub_key[32..64];
+        let sig_bytes = crate::link::signalling_bytes(mtu, mode).expect("signalling_bytes");
+
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(link_id);
+        signed_data.extend_from_slice(peer_pub_bytes);
+        signed_data.extend_from_slice(peer_sig_pub_bytes);
+        signed_data.extend_from_slice(&sig_bytes);
+
+        let signature = identity.sign(&signed_data);
+
+        // proof_data = signature(64) + peer_pub_bytes(32) + signalling(3) = 99 bytes
+        let mut proof_data = signature;
+        proof_data.extend_from_slice(peer_pub_bytes);
+        proof_data.extend_from_slice(&sig_bytes);
+        proof_data
+    }
+
+    #[test]
+    fn lrproof_valid_signature_short_proof() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let (identity, dst_hash) = setup_known_identity();
+        let link_id = vec![0xA1; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        let proof_data = build_valid_proof_data(&identity, &link_id);
+        assert_eq!(proof_data.len(), 96);
+        assert!(validate_lrproof_signature(&proof_data, &link_id, &dst_hash));
+
+        // Cleanup
+        Identity::forget_destination_in_memory(&dst_hash);
+    }
+
+    #[test]
+    fn lrproof_valid_signature_long_proof_with_signalling() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let (identity, dst_hash) = setup_known_identity();
+        let link_id = vec![0xB2; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        let proof_data = build_valid_proof_data_with_signalling(
+            &identity, &link_id, 500, crate::link::MODE_AES256_CBC,
+        );
+        assert_eq!(proof_data.len(), 99);
+        assert!(validate_lrproof_signature(&proof_data, &link_id, &dst_hash));
+
+        // Cleanup
+        Identity::forget_destination_in_memory(&dst_hash);
+    }
+
+    #[test]
+    fn lrproof_invalid_signature_rejected() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let (identity, dst_hash) = setup_known_identity();
+        let link_id = vec![0xC3; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        let mut proof_data = build_valid_proof_data(&identity, &link_id);
+        // Corrupt the signature by flipping a byte
+        proof_data[10] ^= 0xFF;
+        assert!(!validate_lrproof_signature(&proof_data, &link_id, &dst_hash));
+
+        // Cleanup
+        Identity::forget_destination_in_memory(&dst_hash);
+    }
+
+    #[test]
+    fn lrproof_wrong_link_id_rejected() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let (identity, dst_hash) = setup_known_identity();
+        let link_id = vec![0xD4; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+        let wrong_link_id = vec![0xE5; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        let proof_data = build_valid_proof_data(&identity, &link_id);
+        // Signature was made for link_id, but we validate against wrong_link_id
+        assert!(!validate_lrproof_signature(&proof_data, &wrong_link_id, &dst_hash));
+
+        // Cleanup
+        Identity::forget_destination_in_memory(&dst_hash);
+    }
+
+    #[test]
+    fn lrproof_wrong_identity_rejected() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        // Create two different identities
+        let (identity_a, dst_hash_a) = setup_known_identity();
+        let (_identity_b, dst_hash_b) = setup_known_identity();
+        let link_id = vec![0xF6; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        // Sign with identity_a but validate against identity_b's destination hash
+        let proof_data = build_valid_proof_data(&identity_a, &link_id);
+        assert!(!validate_lrproof_signature(&proof_data, &link_id, &dst_hash_b));
+
+        // Cleanup
+        Identity::forget_destination_in_memory(&dst_hash_a);
+        Identity::forget_destination_in_memory(&dst_hash_b);
+    }
+
+    #[test]
+    fn lrproof_wrong_data_length_rejected() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let (identity, dst_hash) = setup_known_identity();
+        let link_id = vec![0x07; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        // Too short (95 bytes)
+        let proof_data = build_valid_proof_data(&identity, &link_id);
+        assert!(!validate_lrproof_signature(&proof_data[..95], &link_id, &dst_hash));
+
+        // Too long (100 bytes, between valid sizes)
+        let mut padded = proof_data.clone();
+        padded.extend_from_slice(&[0u8; 4]);
+        assert!(!validate_lrproof_signature(&padded, &link_id, &dst_hash));
+
+        // Way too short (10 bytes)
+        assert!(!validate_lrproof_signature(&[0u8; 10], &link_id, &dst_hash));
+
+        // Empty
+        assert!(!validate_lrproof_signature(&[], &link_id, &dst_hash));
+
+        // Cleanup
+        Identity::forget_destination_in_memory(&dst_hash);
+    }
+
+    #[test]
+    fn lrproof_unknown_destination_rejected() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let identity = Identity::new(true);
+        let link_id = vec![0x18; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+        // Use a dst_hash that is NOT registered in known destinations
+        let unknown_dst = vec![0xFF; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        let proof_data = build_valid_proof_data(&identity, &link_id);
+        assert!(!validate_lrproof_signature(&proof_data, &link_id, &unknown_dst));
+    }
+
+    #[test]
+    fn lrproof_corrupted_peer_pub_bytes_rejected() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let (identity, dst_hash) = setup_known_identity();
+        let link_id = vec![0x29; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+
+        let mut proof_data = build_valid_proof_data(&identity, &link_id);
+        // Corrupt the peer_pub_bytes (bytes 64..96) — signature will no longer match
+        proof_data[70] ^= 0xFF;
+        assert!(!validate_lrproof_signature(&proof_data, &link_id, &dst_hash));
+
+        // Cleanup
+        Identity::forget_destination_in_memory(&dst_hash);
     }
 }
