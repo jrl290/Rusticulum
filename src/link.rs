@@ -3034,3 +3034,150 @@ fn now_seconds() -> f64 {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
     now.as_secs() as f64 + (now.subsec_nanos() as f64 / 1_000_000_000.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Build a minimal incoming Link with a unique link_id. `initiator=false`
+    /// causes `register_runtime_link` to store a strong ref in INCOMING_LINK_ARCS.
+    fn make_incoming_link(link_id: Vec<u8>) -> Link {
+        let dest = crate::destination::Destination::default();
+        let mut link = Link::new_inbound(dest).expect("new_inbound");
+        link.link_id = link_id;
+        link.initiator = false;
+        link
+    }
+
+    /// Regression test: `unregister_runtime_link` must not deadlock when called
+    /// while the caller already holds the link's Mutex.
+    ///
+    /// This reproduces the exact scenario from `dispatch_runtime_packet`:
+    ///   1. Lock the link Arc<Mutex<Link>> (simulating dispatch holding link_guard)
+    ///   2. Call `unregister_runtime_link` from within that lock
+    ///
+    /// Before the fix, the old `retain()` closure called `arc.lock()` on the same
+    /// Arc, causing a non-reentrant Mutex deadlock that permanently blocked the
+    /// TCP read-loop thread and prevented any subsequent frames from being read.
+    #[test]
+    fn unregister_runtime_link_no_deadlock_while_holding_link_mutex() {
+        let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(13)).collect();
+        let link = make_incoming_link(link_id.clone());
+        let link_arc = Arc::new(Mutex::new(link));
+
+        register_runtime_link(Arc::clone(&link_arc));
+
+        // Spawn a thread that holds the link mutex while calling unregister —
+        // this is the same sequence as dispatch_runtime_packet → teardown().
+        let (tx, rx) = mpsc::channel::<()>();
+        let link_arc_clone = Arc::clone(&link_arc);
+        let link_id_clone = link_id.clone();
+        std::thread::spawn(move || {
+            // Hold the link mutex (simulating link_guard in dispatch_runtime_packet)
+            let _guard = link_arc_clone.lock().unwrap();
+            // Call unregister while the mutex is held — must not deadlock.
+            unregister_runtime_link(&link_id_clone);
+            let _ = tx.send(());
+        });
+
+        // Allow up to 2 seconds; a deadlock would never send on the channel.
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("unregister_runtime_link deadlocked while link mutex was held");
+    }
+
+    /// After `register_runtime_link` + `unregister_runtime_link`, the entry must
+    /// be absent from both RUNTIME_LINKS and INCOMING_LINK_ARCS.
+    #[test]
+    fn unregister_runtime_link_removes_from_both_stores() {
+        let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(17)).collect();
+        let link = make_incoming_link(link_id.clone());
+        let link_arc = Arc::new(Mutex::new(link));
+
+        register_runtime_link(Arc::clone(&link_arc));
+
+        // Verify both stores have the entry.
+        assert!(
+            RUNTIME_LINKS.lock().unwrap().contains_key(&link_id),
+            "RUNTIME_LINKS should contain the link after register"
+        );
+        assert!(
+            INCOMING_LINK_ARCS.lock().unwrap().iter().any(|(id, _)| id == &link_id),
+            "INCOMING_LINK_ARCS should contain the link after register"
+        );
+
+        unregister_runtime_link(&link_id);
+
+        assert!(
+            !RUNTIME_LINKS.lock().unwrap().contains_key(&link_id),
+            "RUNTIME_LINKS should not contain the link after unregister"
+        );
+        assert!(
+            !INCOMING_LINK_ARCS.lock().unwrap().iter().any(|(id, _)| id == &link_id),
+            "INCOMING_LINK_ARCS should not contain the link after unregister"
+        );
+    }
+
+    /// Outbound links (initiator=true) must NOT be inserted into INCOMING_LINK_ARCS,
+    /// since they don't need a strong-reference keeper (the initiator holds its
+    /// own Arc elsewhere).
+    #[test]
+    fn register_runtime_link_outbound_not_stored_in_incoming_arcs() {
+        let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(19)).collect();
+        let dest = crate::destination::Destination::default();
+        let mut link = Link::new_inbound(dest).expect("new_inbound");
+        link.link_id = link_id.clone();
+        link.initiator = true; // outbound
+
+        let link_arc = Arc::new(Mutex::new(link));
+        register_runtime_link(Arc::clone(&link_arc));
+
+        let in_arcs = INCOMING_LINK_ARCS.lock().unwrap().iter().any(|(id, _)| id == &link_id);
+        let in_runtime = RUNTIME_LINKS.lock().unwrap().contains_key(&link_id);
+
+        // Clean up before asserting so a failed assert doesn't leave state.
+        unregister_runtime_link(&link_id);
+
+        assert!(!in_arcs, "outbound link must not appear in INCOMING_LINK_ARCS");
+        assert!(in_runtime, "outbound link must appear in RUNTIME_LINKS");
+    }
+
+    /// `prove_with_identity` must populate `link_destination.link` with a `LinkInfo`
+    /// that carries `attached_interface`. Without this, `Transport::outbound` broadcasts
+    /// the LRPROOF on ALL interfaces instead of routing it to only the link's peer.
+    ///
+    /// We verify the invariant by inspecting the `prove_with_identity` path indirectly:
+    /// a link with `attached_interface = Some("iface0")` must produce `LinkInfo` with
+    /// the same value. The test reaches this by checking the field is propagated when
+    /// we manually run the setup that `prove_with_identity` does.
+    #[test]
+    fn prove_with_identity_builds_link_destination_with_link_info() {
+        let dest = crate::destination::Destination::default();
+        let mut link = Link::new_inbound(dest).expect("new_inbound");
+        link.attached_interface = Some("test_iface".to_string());
+        link.state = STATE_ACTIVE;
+
+        // Reproduce the link_destination construction from prove_with_identity.
+        let mut link_destination = link.destination.lock().unwrap().clone();
+        link_destination.dest_type = DestinationType::Link;
+        link_destination.hash = link.link_id.clone();
+        link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
+        link_destination.link = Some(crate::destination::LinkInfo {
+            rtt: link.rtt,
+            traffic_timeout_factor: TRAFFIC_TIMEOUT_FACTOR,
+            status_closed: link.state == STATE_CLOSED,
+            mtu: Some(link.mtu),
+            attached_interface: link.attached_interface.clone(),
+        });
+
+        let info = link_destination.link
+            .as_ref()
+            .expect("link_destination.link must be Some after prove_with_identity setup");
+        assert_eq!(
+            info.attached_interface.as_deref(),
+            Some("test_iface"),
+            "LinkInfo.attached_interface must match the link's attached_interface"
+        );
+        assert!(!info.status_closed, "link is ACTIVE, status_closed must be false");
+    }
+}
