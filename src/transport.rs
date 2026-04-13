@@ -759,6 +759,29 @@ impl Transport {
     /// `interface_name` is the InterfaceStub name (used for
     /// `attached_interface` routing).
     ///
+    /// Re-announce all locally registered IN/SINGLE destinations to a specific
+    /// interface.  Called after a new interface connects so that the remote
+    /// transport node learns about all local destinations immediately, without
+    /// waiting for the periodic announce cycle.
+    pub fn announce_all_destinations(interface_name: &str) {
+        let destinations = {
+            let state = TRANSPORT.lock().unwrap();
+            state.destinations.clone()
+        };
+        let iface = interface_name.to_string();
+        for mut dest in destinations {
+            if dest.direction == crate::destination::Direction::IN
+                && dest.dest_type == crate::destination::DestinationType::Single
+            {
+                log(
+                    &format!("Re-announcing {} to new interface {}", crate::hexrep(&dest.hash, true), iface),
+                    LOG_DEBUG, false, false,
+                );
+                let _ = dest.announce(None, false, Some(iface.clone()), None, true);
+            }
+        }
+    }
+
     /// `interface_repr` is the full string representation matching
     /// Python's `str(interface)`, e.g.
     /// `"TCPInterface[LOCAL/192.168.2.113:4242]"`.  It is used to
@@ -3326,6 +3349,48 @@ impl Transport {
                         state.path_table.insert(destination_hash.clone(), entry);
                         crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_VERBOSE, false, false);
                         Transport::cache(&packet, true, Some("announce".to_string()));
+
+                        // Python Transport.py line 1838-1865:
+                        // If there is a waiting discovery path request for this destination,
+                        // immediately relay a PATH_RESPONSE announce back to the requesting
+                        // interface so it can reach the querying client (e.g. Meshchat).
+                        // Without this, discovery_path_requests entries only expire on timeout
+                        // and the requester never learns the path.
+                        if state.transport_enabled {
+                            if let Some(discovery_entry) = state.discovery_path_requests.remove(destination_hash.as_slice()) {
+                                if let Some(ref requesting_iface) = discovery_entry.requesting_interface {
+                                    crate::log(&format!(
+                                        "Got matching announce, answering waiting discovery path request for {} on {}",
+                                        crate::hexrep(destination_hash, true), requesting_iface
+                                    ), crate::LOG_DEBUG, false, false);
+                                    let identity_hash_bytes = state.identity.as_ref()
+                                        .and_then(|i| i.hash.clone())
+                                        .unwrap_or_default();
+                                    let dest_type_bits: u8 = match packet.destination_type {
+                                        Some(crate::destination::DestinationType::Single) => 0x00,
+                                        Some(crate::destination::DestinationType::Group) => 0x01,
+                                        Some(crate::destination::DestinationType::Plain) => 0x02,
+                                        Some(crate::destination::DestinationType::Link) => 0x03,
+                                        None => 0x00,
+                                    };
+                                    let flags: u8 = (crate::packet::HEADER_2 << 6)
+                                        | ((packet.context_flag & 0x01) << 5)
+                                        | (MODE_TRANSPORT << 4)
+                                        | (dest_type_bits << 2)
+                                        | ANNOUNCE;
+                                    let dest_hash_bytes = packet.destination_hash.clone()
+                                        .unwrap_or_else(|| destination_hash.clone());
+                                    let mut raw = Vec::with_capacity(2 + 16 + 16 + 1 + packet.data.len());
+                                    raw.push(flags);
+                                    raw.push(packet.hops);
+                                    raw.extend_from_slice(&identity_hash_bytes);
+                                    raw.extend_from_slice(&dest_hash_bytes);
+                                    raw.push(crate::packet::PATH_RESPONSE);
+                                    raw.extend_from_slice(&packet.data);
+                                    deferred_outbound.push((requesting_iface.clone(), raw));
+                                }
+                            }
+                        }
 
                         // Match Python Transport.py line 1741:
                         // Insert into announce_table for rebroadcast when transport is enabled.

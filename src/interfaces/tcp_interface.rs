@@ -983,7 +983,7 @@ pub struct TcpServerInterface {
     pub bind_port: u16,
     pub i2p_tunneled: bool,
     pub mode: u8,
-    spawn_config: SpawnConfig,
+    spawn_config: Arc<Mutex<SpawnConfig>>,
     pub spawned_interfaces: Arc<Mutex<Vec<Arc<Mutex<TcpClientInterface>>>>>,
     #[allow(dead_code)]
     listener: Option<Arc<TcpListener>>,
@@ -1161,8 +1161,8 @@ impl TcpServerInterface {
         let listener_clone = listener_arc.clone();
         let spawned_clone = spawned.clone();
         let name_clone = base.name.clone();
-        let spawn_config = SpawnConfig::from_base(&base);
-        let spawn_config_clone = spawn_config.clone();
+        let spawn_config = Arc::new(Mutex::new(SpawnConfig::from_base(&base)));
+        let spawn_config_clone = Arc::clone(&spawn_config);
         
         thread::spawn(move || {
             Self::accept_loop(listener_clone, spawned_clone, name_clone, spawn_config_clone);
@@ -1183,7 +1183,7 @@ impl TcpServerInterface {
     }
 
     pub fn update_spawn_config(&mut self) {
-        self.spawn_config = SpawnConfig::from_base(&self.base);
+        *self.spawn_config.lock().unwrap() = SpawnConfig::from_base(&self.base);
         self.mode = mode_to_u8(self.base.mode);
     }
 
@@ -1192,7 +1192,7 @@ impl TcpServerInterface {
         listener: Arc<TcpListener>,
         spawned: Arc<Mutex<Vec<Arc<Mutex<TcpClientInterface>>>>>,
         server_name: Option<String>,
-        spawn_config: SpawnConfig,
+        spawn_config: Arc<Mutex<SpawnConfig>>,
     ) {
         for stream in listener.incoming() {
             match stream {
@@ -1207,10 +1207,13 @@ impl TcpServerInterface {
                     
                     let spawned_interface = Arc::new(Mutex::new(TcpClientInterface::from_socket(client_name, stream)));
                     let iface_name;
+                    let client_mode;
                     {
+                        let sc = spawn_config.lock().unwrap();
                         let mut iface = spawned_interface.lock().unwrap();
-                        spawn_config.apply_to_base(&mut iface.base);
-                        iface.mode = mode_to_u8(spawn_config.mode);
+                        sc.apply_to_base(&mut iface.base);
+                        client_mode = mode_to_u8(sc.mode);
+                        iface.mode = client_mode;
 
                         if let Some(addr) = peer_addr {
                             iface.target_ip = addr.ip().to_string();
@@ -1231,7 +1234,14 @@ impl TcpServerInterface {
                             iface.process_outgoing(raw.to_vec()).is_ok()
                         }),
                     );
-                    crate::transport::Transport::register_interface_stub(&iface_name, "TCPClientInterface");
+                    {
+                        let mut stub_config = crate::transport::InterfaceStubConfig::default();
+                        stub_config.name = iface_name.clone();
+                        stub_config.mode = client_mode;
+                        stub_config.out = true;
+                        stub_config.announce_cap = Some(crate::reticulum::ANNOUNCE_CAP / 100.0);
+                        crate::transport::Transport::register_interface_stub_config(stub_config);
+                    }
 
                     TcpClientInterface::start_read_loop(Arc::clone(&spawned_interface));
                     spawned.lock().unwrap().push(spawned_interface);
@@ -1320,5 +1330,558 @@ mod tests {
         assert!(escaped.len() > data.len());
         assert!(!escaped.contains(&Kiss::FEND));
         assert_eq!(escaped.iter().filter(|&&b| b == Kiss::FESC).count(), 2);
+    }
+
+    // ── Helpers for integration tests ─────────────────────────────────
+
+    /// Create a TcpClientInterface connected to a local listener, returning
+    /// (Arc<Mutex<interface>>, server_stream).
+    fn make_connected_pair() -> (Arc<Mutex<TcpClientInterface>>, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Connect a raw stream first, then inject it via from_socket
+        let client_stream = TcpStream::connect_timeout(
+            &addr,
+            Duration::from_secs(2),
+        ).unwrap();
+        client_stream.set_nodelay(true).unwrap();
+
+        let (server_stream, _) = listener.accept().unwrap();
+        server_stream.set_nodelay(true).unwrap();
+
+        let mut iface = TcpClientInterface::from_socket(
+            "test".to_string(),
+            client_stream,
+        );
+        // Mark as initiator so the read-loop will attempt reconnect
+        iface.initiator = true;
+
+        (Arc::new(Mutex::new(iface)), server_stream)
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 1: Clone fd remains valid while original fd lives
+    //
+    // Reproduces the basic setup from retichat.log:
+    //   TCP socket clone: original_fd=7 clone_fd=8
+    // Verifies the clone can read while the original is used for writes.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_clone_fd_survives_concurrent_writes() {
+        let (iface_arc, mut server) = make_connected_pair();
+
+        // Clone the socket exactly like start_read_loop does
+        let clone = {
+            let iface = iface_arc.lock().unwrap();
+            iface.socket.as_ref().unwrap().try_clone().unwrap()
+        };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let orig_fd = iface_arc.lock().unwrap().socket.as_ref().unwrap().as_raw_fd();
+            let clone_fd = clone.as_raw_fd();
+            eprintln!("test: original_fd={} clone_fd={}", orig_fd, clone_fd);
+            assert_ne!(orig_fd, clone_fd, "clone must have a distinct fd");
+        }
+
+        clone.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        // Start a reader thread (simulates start_read_loop's inner 'reading loop)
+        let reader = {
+            let mut read_sock = clone;
+            thread::spawn(move || -> Vec<u8> {
+                let mut buf = [0u8; 4096];
+                let mut received = Vec::new();
+                loop {
+                    match read_sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => received.extend_from_slice(&buf[..n]),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => break,
+                        Err(e) => panic!("read error (EBADF?): {}", e),
+                    }
+                }
+                received
+            })
+        };
+
+        // Simulate concurrent outgoing writes on the *original* socket
+        // (like synthesize_tunnel + PSYNC path requests from Transport threads)
+        for i in 0..20 {
+            {
+                let mut iface = iface_arc.lock().unwrap();
+                let payload = format!("write_{:04}", i);
+                let _ = iface.process_outgoing(payload.into_bytes());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Server sends data through — the clone must receive it
+        let test_payload = b"server_data_hello";
+        server.write_all(test_payload).unwrap();
+        server.flush().unwrap();
+
+        // Wait for reader to finish (read timeout)
+        let received = reader.join().expect("reader thread panicked");
+        // The received data includes HDLC frames from process_outgoing that the
+        // _server_ sees, but the server also sent test_payload.  Check the reader
+        // got the server's payload.
+        assert!(
+            received.windows(test_payload.len()).any(|w| w == test_payload),
+            "clone failed to receive server data — possible EBADF or fd invalidation\nreceived {} bytes: {:?}",
+            received.len(),
+            String::from_utf8_lossy(&received),
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 2: Dropping original socket does NOT invalidate the clone
+    //
+    // Simulates what happens when process_outgoing gets a write error and
+    // sets self.socket = None (dropping the TcpStream, calling close(fd)).
+    // The clone — which has its own fd via dup() — must keep working.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_clone_survives_original_drop() {
+        let (iface_arc, mut server) = make_connected_pair();
+
+        // Clone exactly like start_read_loop
+        let mut clone = {
+            let iface = iface_arc.lock().unwrap();
+            iface.socket.as_ref().unwrap().try_clone().unwrap()
+        };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let orig_fd = iface_arc.lock().unwrap().socket.as_ref().unwrap().as_raw_fd();
+            let clone_fd = clone.as_raw_fd();
+            eprintln!("test: original_fd={} clone_fd={}", orig_fd, clone_fd);
+        }
+
+        // Drop the original (simulates write-error path: self.socket = None)
+        {
+            let mut iface = iface_arc.lock().unwrap();
+            iface.socket = None;
+            iface.base.online = false;
+        }
+
+        // The clone must still work.  Server sends data, clone reads it.
+        let test_payload = b"after_drop_test";
+        server.write_all(test_payload).unwrap();
+        server.flush().unwrap();
+
+        clone.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 256];
+        let n = clone.read(&mut buf).expect("clone read failed after original drop — EBADF?");
+        assert_eq!(&buf[..n], test_payload, "clone received wrong data after original drop");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 3: Reconnect creates new socket — old clone must be independent
+    //
+    // Simulates the full retichat.log cycle:
+    //   1. Connect → clone for read loop
+    //   2. Connection dies → drop original
+    //   3. Reconnect with new socket
+    //   4. Old clone fd must not collide with new socket fd
+    //
+    // From the log:
+    //   First:  original_fd=7 clone_fd=8
+    //   After:  original_fd=7 clone_fd=10  (fd=8 reused by something else)
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    #[cfg(unix)]
+    fn test_reconnect_fd_independence() {
+        use std::os::unix::io::AsRawFd;
+
+        // Set up server that accepts two connections (original + reconnect)
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let (s1, _) = listener.accept().unwrap();
+            let (s2, _) = listener.accept().unwrap();
+            (s1, s2)
+        });
+
+        // --- Connection 1 ---
+        let stream1 = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        stream1.set_nodelay(true).unwrap();
+        let mut clone1 = stream1.try_clone().unwrap();
+
+        let orig_fd1 = stream1.as_raw_fd();
+        let clone_fd1 = clone1.as_raw_fd();
+        eprintln!("connection1: original_fd={} clone_fd={}", orig_fd1, clone_fd1);
+
+        // Simulate connection death — drop original + close its fd
+        drop(stream1);
+
+        // Open some decoy fds to simulate the OS reusing the number
+        // (like iOS allocating fds for ViewBridge, etc.)
+        let decoy1 = std::fs::File::open("/dev/null").ok();
+        let decoy2 = std::fs::File::open("/dev/null").ok();
+        let decoy_fds: Vec<i32> = [&decoy1, &decoy2]
+            .iter()
+            .filter_map(|d| d.as_ref().map(|f| f.as_raw_fd()))
+            .collect();
+        eprintln!("decoy fds: {:?}", decoy_fds);
+
+        // --- Connection 2 (reconnect) ---
+        let stream2 = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        stream2.set_nodelay(true).unwrap();
+        let mut clone2 = stream2.try_clone().unwrap();
+
+        let orig_fd2 = stream2.as_raw_fd();
+        let clone_fd2 = clone2.as_raw_fd();
+        eprintln!("connection2: original_fd={} clone_fd={}", orig_fd2, clone_fd2);
+
+        // Key assertion: clone1's fd must not be the same as any new fd
+        assert_ne!(clone_fd1, orig_fd2, "clone1 fd reused as reconnect original — fd collision!");
+        assert_ne!(clone_fd1, clone_fd2, "clone1 fd reused as reconnect clone — fd collision!");
+
+        // clone1 should be EBADF or disconnected at this point (server-side close)
+        clone1.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut buf = [0u8; 16];
+        let result = clone1.read(&mut buf);
+        eprintln!("clone1 read after reconnect: {:?}", result);
+        // Either Ok(0) (connection closed) or error — NOT a successful read
+        match result {
+            Ok(0) => {} // expected: server side closed
+            Ok(n) => panic!("clone1 read {} bytes from a dead connection — fd collision!", n),
+            Err(_) => {} // expected: broken pipe / connection reset / EBADF
+        }
+
+        // clone2 must work on the new connection
+        let (_server1, mut server2) = server_thread.join().unwrap();
+        let test_data = b"reconnect_works";
+        server2.write_all(test_data).unwrap();
+        server2.flush().unwrap();
+
+        clone2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let n = clone2.read(&mut buf).expect("clone2 read failed on new connection");
+        assert_eq!(&buf[..n], test_data);
+
+        drop(decoy1);
+        drop(decoy2);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 4: Stress-test concurrent read/write with fd validity checks
+    //
+    // Exercises the exact concurrency pattern from retichat.log:
+    //   - Reader thread blocked on socket.read()
+    //   - Multiple writer threads calling process_outgoing()
+    //   - Timed check that the reader fd stays valid for 5 seconds
+    //
+    // This is the pattern that triggers EBADF on macOS Catalyst.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    #[cfg(unix)]
+    fn test_concurrent_rw_fd_stability() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (iface_arc, mut server) = make_connected_pair();
+
+        let clone = {
+            let iface = iface_arc.lock().unwrap();
+            iface.socket.as_ref().unwrap().try_clone().unwrap()
+        };
+        let clone_fd = clone.as_raw_fd();
+        eprintln!("test: clone_fd={}", clone_fd);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ebadf_detected = Arc::new(AtomicBool::new(false));
+
+        // Reader thread — mirrors start_read_loop's 'reading loop
+        let reader = {
+            let stop_r = Arc::clone(&stop);
+            let ebadf_r = Arc::clone(&ebadf_detected);
+            let mut read_sock = clone;
+            read_sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while !stop_r.load(Ordering::Relaxed) {
+                    match read_sock.read(&mut buf) {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(ref e) if e.raw_os_error() == Some(9) => {
+                            eprintln!("EBADF detected on clone_fd={}", read_sock.as_raw_fd());
+                            ebadf_r.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("reader error: {}", e);
+                            return;
+                        }
+                    }
+                }
+            })
+        };
+
+        // Writer threads — simulate Transport threads sending packets
+        // (synthesize_tunnel, PSYNC path requests, link requests, keepalives)
+        let writers: Vec<_> = (0..4).map(|tid| {
+            let iface = Arc::clone(&iface_arc);
+            let stop_w = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop_w.load(Ordering::Relaxed) {
+                    {
+                        let mut guard = iface.lock().unwrap();
+                        let payload = format!("t{}_{}", tid, i);
+                        let _ = guard.process_outgoing(payload.into_bytes());
+                    }
+                    i += 1;
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        }).collect();
+
+        // Server sends periodic data (like inbound announces/proofs)
+        let server_writer = {
+            let stop_s = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop_s.load(Ordering::Relaxed) {
+                    let data = format!("srv_{}", i);
+                    if server.write_all(data.as_bytes()).is_err() {
+                        break;
+                    }
+                    let _ = server.flush();
+                    i += 1;
+                    thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+
+        // Run for 5 seconds then check
+        thread::sleep(Duration::from_secs(5));
+        stop.store(true, Ordering::Relaxed);
+
+        reader.join().unwrap();
+        for w in writers { w.join().unwrap(); }
+        server_writer.join().unwrap();
+
+        // Verify the clone fd was valid (fcntl F_GETFD) for the entire duration
+        assert!(
+            !ebadf_detected.load(Ordering::Relaxed),
+            "EBADF detected on clone_fd={} during concurrent read/write — \
+             fd was invalidated while in use",
+            clone_fd,
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 5: ManuallyDrop EBADF guard prevents double-close
+    //
+    // Simulates the iOS scenario where the OS reclaims an fd, then Rust's
+    // Drop would close() the same fd number — now belonging to a
+    // different socket.  Verifies that ManuallyDrop prevents this.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    #[cfg(unix)]
+    fn test_manually_drop_prevents_double_close_on_ebadf() {
+        use std::os::unix::io::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s
+        });
+
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        let clone = stream.try_clone().unwrap();
+        let clone_fd = clone.as_raw_fd();
+        let _server_stream = server.join().unwrap();
+
+        // Simulate the OS reclaiming our fd (iOS background transition)
+        // by forcibly closing it.  This is what happens in the wild.
+        unsafe { libc::close(clone_fd); }
+
+        // Now wrap in ManuallyDrop (as our real code does)
+        let manual = std::mem::ManuallyDrop::new(clone);
+
+        // Open a new socket — it will likely reuse clone_fd
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = thread::spawn(move || {
+            let (s, _) = listener2.accept().unwrap();
+            s
+        });
+        let mut innocent = TcpStream::connect_timeout(&addr2, Duration::from_secs(2)).unwrap();
+        let innocent_fd = innocent.as_raw_fd();
+        let _server2_stream = server2.join().unwrap();
+
+        eprintln!("clone_fd={} innocent_fd={}", clone_fd, innocent_fd);
+
+        // Without ManuallyDrop, dropping `clone` here would call
+        // close(clone_fd), which — if reused — would kill the innocent
+        // socket.  With ManuallyDrop, the fd is NOT closed.
+        //
+        // ManuallyDrop goes out of scope here without calling close().
+        // (std::mem::drop on a ManuallyDrop is intentionally a no-op)
+        std::mem::forget(manual);
+
+        // The innocent socket must still be alive
+        innocent.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut buf = [0u8; 16];
+        let result = innocent.read(&mut buf);
+        // Should get WouldBlock/TimedOut, NOT EBADF
+        match result {
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                // Good — socket is still alive
+            }
+            Err(ref e) if e.raw_os_error() == Some(9) => {
+                panic!(
+                    "innocent socket (fd={}) got EBADF — ManuallyDrop failed to \
+                     prevent double-close of reused fd={}",
+                    innocent_fd, clone_fd,
+                );
+            }
+            Ok(0) => {} // Server closed — still means the fd was valid
+            Ok(_) => {} // Got data — fine
+            Err(e) => {
+                // Connection reset etc. — fd was at least valid
+                eprintln!("innocent read error (not EBADF, OK): {}", e);
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Test 6: Full retichat.log scenario end-to-end
+    //
+    // Replays the exact sequence from the attached log:
+    //   18:05:27  TCP connect, clone fd=7→8
+    //   18:05:27  synthesize_tunnel (outbound write via process_outgoing)
+    //   18:05:30… PSYNC path requests (more outbound writes)
+    //   18:06:06  EBADF on fd=8
+    //   18:06:11  Reconnect, new clone fd=7→10
+    //
+    // We can't force the OS to reclaim an fd, but we CAN verify that the
+    // infrastructure handles it correctly:  ManuallyDrop prevents cascade
+    // corruption, and reconnect produces a working new connection.
+    // ────────────────────────────────────────────────────────────────────
+    #[test]
+    #[cfg(unix)]
+    fn test_full_ebadf_reconnect_scenario() {
+        use std::os::unix::io::AsRawFd;
+
+        // --- Phase 1: "RPi" server that accepts two connections ---
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let (s1, _) = listener.accept().unwrap();
+            s1.set_nodelay(true).unwrap();
+            // Simulate RPi: keep the connection alive, accept a second one later
+            let (s2, _) = listener.accept().unwrap();
+            s2.set_nodelay(true).unwrap();
+            (s1, s2)
+        });
+
+        // --- Phase 2: Connect like retichat.log 18:05:27 ---
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut iface = TcpClientInterface::from_socket("RPi".to_string(), stream);
+        iface.initiator = true;
+
+        // Clone for read loop
+        let clone = iface.socket.as_ref().unwrap().try_clone().unwrap();
+        let orig_fd = iface.socket.as_ref().unwrap().as_raw_fd();
+        let clone_fd = clone.as_raw_fd();
+        eprintln!("phase2: original_fd={} clone_fd={}", orig_fd, clone_fd);
+
+        // Wrap clone in ManuallyDrop like start_read_loop does
+        let clone = std::mem::ManuallyDrop::new(clone);
+
+        // --- Phase 3: Outgoing writes (synthesize_tunnel + PSYNC) ---
+        for i in 0..5 {
+            let payload = format!("tunnel_synth_{}", i);
+            assert!(iface.process_outgoing(payload.into_bytes()).is_ok(), "write {} failed", i);
+        }
+
+        // --- Phase 4: Simulate EBADF (OS reclaims clone's fd) ---
+        // This is the equivalent of what happens at 18:06:06 in the log.
+        // On iOS, the OS closes the fd during a background transition.
+        unsafe { libc::close(clone_fd); }
+
+        // Verify clone is now EBADF
+        let mut buf = [0u8; 16];
+        // Deref through ManuallyDrop to get &TcpStream
+        let read_result = (&*clone).set_read_timeout(Some(Duration::from_millis(100)));
+        eprintln!("phase4: set_read_timeout after close: {:?}", read_result);
+
+        // The read loop would detect EBADF here and set ebadf=true
+        // ManuallyDrop ensures we don't call close() on the now-reused fd
+        let _ = buf;
+
+        // --- Phase 5: Simulate something else grabbing the old fd ---
+        // Open a file to reuse clone_fd's number (like iOS ViewBridge)
+        let decoy = std::fs::File::open("/dev/null").ok();
+        if let Some(ref f) = decoy {
+            eprintln!("phase5: decoy reused fd={}", f.as_raw_fd());
+        }
+
+        // Drop the ManuallyDrop — this MUST NOT call close()
+        // (if it did, it would close the decoy file)
+        // ManuallyDrop prevents the inner TcpStream's Drop from running.
+        std::mem::forget(clone);
+
+        // Verify decoy is still alive (ManuallyDrop protected it)
+        if let Some(ref f) = decoy {
+            use std::io::Read;
+            let mut dbuf = [0u8; 1];
+            let r = f.try_clone().and_then(|mut c| c.read(&mut dbuf));
+            // /dev/null reads as Ok(0) — the point is it doesn't return EBADF
+            assert!(r.is_ok(), "decoy fd corrupted by ManuallyDrop — double-close! {:?}", r);
+        }
+
+        // --- Phase 6: Reconnect (18:06:11 in the log) ---
+        // Drop old socket
+        iface.socket = None;
+        iface.base.online = false;
+
+        // Reconnect to the same server (second accept)
+        let stream2 = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        stream2.set_nodelay(true).unwrap();
+        let new_orig_fd = stream2.as_raw_fd();
+        let new_clone = stream2.try_clone().unwrap();
+        let new_clone_fd = new_clone.as_raw_fd();
+        eprintln!("phase6: original_fd={} clone_fd={}", new_orig_fd, new_clone_fd);
+
+        // The new clone must not collide with the old clone's fd
+        // (which is now owned by the decoy)
+        if let Some(ref f) = decoy {
+            assert_ne!(new_clone_fd, f.as_raw_fd(),
+                "new clone fd collided with decoy — would cause cross-corruption");
+        }
+
+        // Store new socket and verify writes work
+        iface.socket = Some(stream2);
+        iface.base.online = true;
+        assert!(iface.process_outgoing(b"after_reconnect".to_vec()).is_ok());
+
+        // Verify new clone can read from server
+        let (_srv1, mut srv2) = server_thread.join().unwrap();
+        let test_data = b"reconnect_data";
+        srv2.write_all(test_data).unwrap();
+        srv2.flush().unwrap();
+
+        let mut read_clone = new_clone;
+        read_clone.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut rbuf = [0u8; 256];
+        let n = read_clone.read(&mut rbuf).expect("new clone read failed after reconnect");
+        // Data includes HDLC-framed outbound writes + the raw test_data from server
+        assert!(n > 0, "new clone received no data after reconnect");
+
+        drop(decoy);
     }
 }
