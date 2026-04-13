@@ -809,20 +809,20 @@ impl Destination {
 	/// Handle incoming link request
 	pub fn incoming_link_request(&mut self, _data: &[u8], _packet: &Packet) -> Result<(), String> {
 		if !self.accept_link_requests {
+			crate::log(&format!("[DEST] incoming_link_request: REJECTED accept_link_requests=false dest={}", crate::hexrep(&self.hash, false)), crate::LOG_NOTICE, false, false);
 			return Ok(());
 		}
 		
-		eprintln!("[DEST] incoming_link_request: data_len={} accept={}", _data.len(), self.accept_link_requests);
+		crate::log(&format!("[DEST] incoming_link_request: data_len={} dest={}", _data.len(), crate::hexrep(&self.hash, false)), crate::LOG_NOTICE, false, false);
 		
 		// Validate the link request and create Link if valid
 		match crate::link::Link::validate_request(self, _data, _packet) {
 			Ok(link) => {
-				eprintln!("[DEST] incoming_link_request: link created, link_id={}", 
-					crate::hexrep(&link.link_id, false));
+				crate::log(&format!("[DEST] incoming_link_request: link created link_id={}", crate::hexrep(&link.link_id, false)), crate::LOG_NOTICE, false, false);
 				self.links.push(link);
 			}
 			Err(e) => {
-				eprintln!("[DEST] incoming_link_request: validate_request failed: {}", e);
+				crate::log(&format!("[DEST] incoming_link_request: validate_request FAILED: {}", e), crate::LOG_NOTICE, false, false);
 			}
 		}
 		
