@@ -1540,6 +1540,11 @@ impl Transport {
         
         let mut state = TRANSPORT.lock().unwrap();
         
+        // Set tunnel_id on the interface stub (matches Python: interface.tunnel_id = tunnel_id)
+        if let Some(iface) = state.interfaces.iter_mut().find(|i| i.name == interface) {
+            iface.tunnel_id = Some(tunnel_id.clone());
+        }
+        
         if let Some(tunnel_entry) = state.tunnels.get_mut(&tunnel_id) {
             // Tunnel exists, restore it
             log(&format!("Tunnel endpoint restored"), LOG_DEBUG, false, false);
@@ -1843,7 +1848,9 @@ impl Transport {
 
             let mut stale_links = Vec::new();
             let mut path_rediscovery_tasks: Vec<(Vec<u8>, Option<String>, bool, bool)> = Vec::new();
-            
+            if !state.link_table.is_empty() {
+                crate::log(&format!("[LT-JOBS] link_table size={}", state.link_table.len()), crate::LOG_NOTICE, false, false);
+            }
             for (link_id, entry) in state.link_table.iter() {
                 let validated = match entry.get(IDX_LT_VALIDATED) {
                     Some(LinkEntryValue::Validated(v)) => *v,
@@ -2059,6 +2066,7 @@ impl Transport {
             }
 
             for link_id in stale_links {
+                crate::log(&format!("[LT-JOBS] REMOVING stale link={}", crate::hexrep(&link_id, false)), crate::LOG_NOTICE, false, false);
                 state.link_table.remove(&link_id);
             }
 
@@ -2288,6 +2296,10 @@ impl Transport {
                 None
             };
 
+            if packet.packet_type == ANNOUNCE {
+                crate::log(&format!("[OUTBOUND-ANNOUNCE] interfaces_count={}", state.interfaces.len()), crate::LOG_VERBOSE, false, false);
+            }
+
             for interface in &mut state.interfaces {
                 // For announces, broadcast to ALL interfaces even if out_enabled=false
                 // For other packets, only send on interfaces with out_enabled=true
@@ -2322,6 +2334,12 @@ impl Transport {
                         if interface.mode == InterfaceStub::MODE_ACCESS_POINT {
                             should_transmit = false;
                         }
+                    }
+
+                    if packet.packet_type == ANNOUNCE {
+                        crate::log(&format!("[OUTBOUND-ANNOUNCE] iface={} out={} mode={} should_transmit={} attached={:?}",
+                            interface.name, interface.out, interface.mode, should_transmit, packet.attached_interface),
+                            crate::LOG_VERBOSE, false, false);
                     }
 
                     if should_transmit {
@@ -2952,7 +2970,7 @@ impl Transport {
         // Log raw packet type from header byte before any processing
         let raw_ptype = if raw.len() > 2 { raw[0] & 0x03 } else { 0xFF };
         let raw_ptype_str = match raw_ptype { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
-        let raw_log_level = if raw_ptype == 1 { crate::LOG_VERBOSE } else { crate::LOG_NOTICE };
+        let raw_log_level = crate::LOG_NOTICE;
         crate::log(&format!("inbound_raw len={} ptype_byte={} ({})", raw.len(), raw_ptype, raw_ptype_str), raw_log_level, false, false);
         // IFAC flag check: if interface doesn't have IFAC, drop packets with IFAC flag
         if raw.len() > 2 && (raw[0] & 0x80) == 0x80 {
@@ -2984,7 +3002,7 @@ impl Transport {
         }
 
         let ptype_str = match packet.packet_type { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
-        let inbound_log_level = if packet.packet_type == ANNOUNCE { crate::LOG_VERBOSE } else { crate::LOG_NOTICE };
+        let inbound_log_level = crate::LOG_NOTICE;
         crate::log(&format!("Inbound {} hops={} dest={} ctx={}", ptype_str, packet.hops,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
             packet.context), inbound_log_level, false, false);
@@ -3104,7 +3122,7 @@ impl Transport {
                     crate::log(&format!("Announce INVALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
                     announce_should_add = false;
                 } else {
-                    crate::log(&format!("Announce VALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_VERBOSE, false, false);
+                    crate::log(&format!("Announce VALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
                 }
             }
 
@@ -3347,7 +3365,7 @@ impl Transport {
                             PathEntryValue::PacketHash(packet.packet_hash.clone().unwrap_or_default()),
                         ];
                         state.path_table.insert(destination_hash.clone(), entry);
-                        crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_VERBOSE, false, false);
+                        crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
                         Transport::cache(&packet, true, Some("announce".to_string()));
 
                         // Python Transport.py line 1838-1865:
@@ -3400,10 +3418,6 @@ impl Transport {
                         // being rebroadcast to other interfaces.
                         if state.transport_enabled && packet.context != crate::packet::PATH_RESPONSE {
                             let block_rebroadcasts = false;
-                            // Python line 1725: initial retransmit_timeout = now + rand() * PATHFINDER_RW
-                            // (0 to 0.5s). PATHFINDER_G (5s) is only added on RETRY.
-                            // Previous code used PATHFINDER_G + PATHFINDER_RW here, which meant
-                            // the timer kept getting reset by new announces before it could fire.
                             let initial_timeout = now() + (rand::random::<f64>() * PATHFINDER_RW);
                             let announce_entry = vec![
                                 AnnounceEntryValue::Timestamp(now()),
@@ -3429,6 +3443,12 @@ impl Transport {
         }
 
         if packet.packet_type != ANNOUNCE && packet.transport_id.is_some() {
+            if packet.packet_type == LINKREQUEST {
+                crate::log(&format!("[LR-TRACE] LINKREQUEST has transport_id={:?} my_hash={:?}",
+                    packet.transport_id.as_ref().map(|h| crate::hexrep(h, false)),
+                    state.identity.as_ref().and_then(|i| i.hash.as_ref()).map(|h| crate::hexrep(h, false))),
+                    crate::LOG_NOTICE, false, false);
+            }
             if let Some(identity) = &state.identity {
                 if identity
                     .hash
@@ -3561,6 +3581,10 @@ impl Transport {
                                     LinkEntryValue::ProofTimeout(proof_timeout),
                                 ];
                                 let link_id = crate::link::link_id_from_lr_packet(&packet);
+                                crate::log(&format!("[LR-TRACE] link_table INSERT link_id={} dest={} rcvd_if={:?} nh_if={:?} rem_hops={}",
+                                    crate::hexrep(&link_id, false), crate::hexrep(destination_hash, false),
+                                    packet.receiving_interface, outbound_interface_name, remaining_hops),
+                                    crate::LOG_NOTICE, false, false);
                                 state.link_table.insert(link_id, link_entry);
                             } else {
                                 let reverse_entry = vec![
@@ -3642,6 +3666,12 @@ impl Transport {
         }
 
         if packet.packet_type == LINKREQUEST {
+            if packet.transport_id.is_none() {
+                crate::log(&format!("[LR-TRACE] LINKREQUEST has NO transport_id, dest={:?} header_type={} hops={}",
+                    packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)),
+                    packet.header_type, packet.hops),
+                    crate::LOG_NOTICE, false, false);
+            }
             if let Some(destination_hash) = &packet.destination_hash {
                 for dest in &mut state.destinations {
                     if &dest.hash == destination_hash {
@@ -4739,5 +4769,261 @@ mod tests {
 
         // Cleanup
         Identity::forget_destination_in_memory(&dst_hash);
+    }
+
+    // ===== Regression Tests for 2026-04-13 Fixes =====
+
+    /// Regression: CLI `-vvvv` compound flag must be parsed as 4 verbose increments.
+    /// Previously, `-vvvv` was treated as a single unrecognized arg (verbose=0).
+    /// The fix counts 'v' characters in short flags.
+    #[test]
+    fn cli_verbose_flag_parsing_compound_flags() {
+        // Reproduce the exact parsing logic from bin/rnsd.rs
+        fn parse_verbose(args: &[&str]) -> i32 {
+            args.iter().map(|a| {
+                if *a == "--verbose" { 1 }
+                else if a.starts_with("-") && !a.starts_with("--") {
+                    a.chars().filter(|&c| c == 'v').count() as i32
+                } else { 0 }
+            }).sum()
+        }
+
+        fn parse_quiet(args: &[&str]) -> i32 {
+            args.iter().map(|a| {
+                if *a == "--quiet" { 1 }
+                else if a.starts_with("-") && !a.starts_with("--") {
+                    a.chars().filter(|&c| c == 'q').count() as i32
+                } else { 0 }
+            }).sum()
+        }
+
+        // Single -v
+        assert_eq!(parse_verbose(&["-v"]), 1);
+        // Compound -vvv
+        assert_eq!(parse_verbose(&["-vvv"]), 3);
+        // Compound -vvvvvv (the original failing case)
+        assert_eq!(parse_verbose(&["-vvvvvv"]), 6);
+        // Separate -v -v -v
+        assert_eq!(parse_verbose(&["-v", "-v", "-v"]), 3);
+        // Mixed: -vv and -v
+        assert_eq!(parse_verbose(&["-vv", "-v"]), 3);
+        // --verbose long form
+        assert_eq!(parse_verbose(&["--verbose"]), 1);
+        // No verbose flags
+        assert_eq!(parse_verbose(&["--config", "/tmp/test"]), 0);
+        // Mixed with other short flags (should only count 'v' chars)
+        assert_eq!(parse_verbose(&["-sv"]), 1);
+        // Quiet parsing
+        assert_eq!(parse_quiet(&["-qqq"]), 3);
+        assert_eq!(parse_quiet(&["--quiet"]), 1);
+
+        // Effective log level calculation
+        let base = crate::LOG_NOTICE; // 3
+        let verbose = parse_verbose(&["-vvvv"]);
+        let quiet = parse_quiet(&[]);
+        let effective = (base + verbose - quiet).max(crate::LOG_CRITICAL);
+        assert_eq!(effective, 7); // NOTICE(3) + 4 = 7 (EXTREME)
+    }
+
+    /// Regression: `handle_tunnel` must set `tunnel_id` on the InterfaceStub.
+    /// Previously, the tunnel_id was only stored in the tunnel entry but NOT
+    /// on the interface, breaking tunnel path association.
+    #[test]
+    fn handle_tunnel_sets_tunnel_id_on_interface_stub() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let iface_name = "test_tunnel_iface_42";
+        let tunnel_id = vec![0xAA; 32];
+
+        // Register a stub interface
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let mut stub = InterfaceStub::default();
+            stub.name = iface_name.to_string();
+            stub.out = true;
+            state.interfaces.push(stub);
+        }
+
+        // Call handle_tunnel
+        Transport::handle_tunnel(tunnel_id.clone(), iface_name.to_string());
+
+        // Verify tunnel_id was set on the interface stub
+        {
+            let state = TRANSPORT.lock().unwrap();
+            let iface = state.interfaces.iter().find(|i| i.name == iface_name)
+                .expect("interface stub must exist");
+            assert_eq!(
+                iface.tunnel_id.as_ref(),
+                Some(&tunnel_id),
+                "handle_tunnel must set tunnel_id on InterfaceStub"
+            );
+        }
+
+        // Verify tunnel entry was created
+        {
+            let state = TRANSPORT.lock().unwrap();
+            assert!(
+                state.tunnels.contains_key(&tunnel_id),
+                "handle_tunnel must create a tunnel entry"
+            );
+        }
+
+        // Cleanup
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.interfaces.retain(|i| i.name != iface_name);
+            state.tunnels.remove(&tunnel_id);
+        }
+    }
+
+    /// Regression: `handle_tunnel` called a second time must update the existing
+    /// tunnel entry and still keep tunnel_id on the interface.
+    #[test]
+    fn handle_tunnel_restores_existing_tunnel() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let iface_name = "test_tunnel_restore_iface";
+        let tunnel_id = vec![0xBB; 32];
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            let mut stub = InterfaceStub::default();
+            stub.name = iface_name.to_string();
+            stub.out = true;
+            state.interfaces.push(stub);
+        }
+
+        // First call creates the tunnel
+        Transport::handle_tunnel(tunnel_id.clone(), iface_name.to_string());
+
+        // Second call should restore (not duplicate)
+        Transport::handle_tunnel(tunnel_id.clone(), iface_name.to_string());
+
+        {
+            let state = TRANSPORT.lock().unwrap();
+            let iface = state.interfaces.iter().find(|i| i.name == iface_name)
+                .expect("interface stub must exist");
+            assert_eq!(iface.tunnel_id.as_ref(), Some(&tunnel_id));
+            assert!(state.tunnels.contains_key(&tunnel_id));
+        }
+
+        // Cleanup
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.interfaces.retain(|i| i.name != iface_name);
+            state.tunnels.remove(&tunnel_id);
+        }
+    }
+
+    /// Regression: When rnsd relays a LINKREQUEST (transport_id matches our identity),
+    /// a link_table entry must be created so that subsequent LRPROOF and DATA packets
+    /// on that link can be forwarded.
+    #[test]
+    fn inbound_linkrequest_creates_link_table_entry() {
+        let _test_guard = TEST_GUARD.lock().unwrap();
+        let _restore = ReceiptStateRestore::new();
+
+        let local_identity = Identity::new(true);
+        let local_hash = local_identity.hash.clone().expect("local identity hash");
+
+        // Set up transport identity and enable transport
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.identity = Some(local_identity);
+            state.transport_enabled = true;
+        }
+
+        // We need a path table entry for the destination so the LINKREQUEST
+        // relay path lookup succeeds.
+        let dest_hash = vec![0xD1; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+        let next_hop = vec![0xD2; crate::reticulum::TRUNCATED_HASHLENGTH / 8];
+        let outbound_iface_name = "test_lr_outbound";
+        let receiving_iface_name = "test_lr_receiving";
+
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            // Register outbound interface stub
+            let mut stub_out = InterfaceStub::default();
+            stub_out.name = outbound_iface_name.to_string();
+            stub_out.out = true;
+            state.interfaces.push(stub_out);
+
+            // Register receiving interface stub
+            let mut stub_in = InterfaceStub::default();
+            stub_in.name = receiving_iface_name.to_string();
+            stub_in.out = true;
+            state.interfaces.push(stub_in);
+
+            // Create path table entry for dest_hash (indices must match IDX_PT_* constants)
+            let path_entry = vec![
+                PathEntryValue::Timestamp(now()),                                    // IDX_PT_TIMESTAMP = 0
+                PathEntryValue::NextHop(next_hop.clone()),                           // IDX_PT_NEXT_HOP = 1
+                PathEntryValue::Hops(2),                                              // IDX_PT_HOPS = 2
+                PathEntryValue::Expires(now() + 3600.0),                             // IDX_PT_EXPIRES = 3
+                PathEntryValue::RandomBlobs(Vec::new()),                             // IDX_PT_RANDBLOBS = 4
+                PathEntryValue::ReceivingInterface(Some(outbound_iface_name.to_string())), // IDX_PT_RVCD_IF = 5
+                PathEntryValue::PacketHash(Vec::new()),                              // IDX_PT_PACKET = 6
+            ];
+            state.path_table.insert(dest_hash.clone(), path_entry);
+        }
+
+        // Build a LINKREQUEST packet with HEADER_2 and our transport_id
+        // A LINKREQUEST data field needs at least ECPUBSIZE (32) bytes for
+        // link_id_from_lr_packet to compute correctly.
+        let lr_data = vec![0x55; 64]; // peer_pub + extra data
+        let dst_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8; // 16
+
+        // Build HEADER_2 raw bytes: [flags, hops, transport_id(16), dest_hash(16), context, data...]
+        let flags: u8 = (crate::packet::HEADER_2 << 6) | (MODE_TRANSPORT << 4) | (crate::packet::LINKREQUEST & 0x03);
+        let hops: u8 = 1;
+        let mut raw = vec![flags, hops];
+        raw.extend_from_slice(&local_hash[..dst_len]);  // transport_id
+        raw.extend_from_slice(&dest_hash);               // destination
+        raw.push(crate::packet::NONE);                   // context
+        raw.extend_from_slice(&lr_data);                 // data
+
+        // Send through Transport::inbound
+        let raw_for_inbound = raw.clone();
+        Transport::inbound(raw_for_inbound, Some(receiving_iface_name.to_string()));
+
+        // Verify a link_table entry was created
+        {
+            let state = TRANSPORT.lock().unwrap();
+            let has_link_entry = !state.link_table.is_empty();
+            assert!(
+                has_link_entry,
+                "LINKREQUEST relay must create a link_table entry"
+            );
+
+            // Verify the entry has the correct received_interface and next_hop_interface
+            if let Some((_link_id, entry)) = state.link_table.iter().next() {
+                let rcvd_if = match entry.get(IDX_LT_RCVD_IF) {
+                    Some(LinkEntryValue::ReceivedInterface(name)) => name.clone(),
+                    _ => None,
+                };
+                let nh_if = match entry.get(IDX_LT_NH_IF) {
+                    Some(LinkEntryValue::NextHopInterface(name)) => name.clone(),
+                    _ => None,
+                };
+                assert_eq!(
+                    rcvd_if.as_deref(), Some(receiving_iface_name),
+                    "link_table entry must record receiving interface"
+                );
+                assert_eq!(
+                    nh_if.as_deref(), Some(outbound_iface_name),
+                    "link_table entry must record outbound (next-hop) interface"
+                );
+            }
+        }
+
+        // Cleanup
+        {
+            let mut state = TRANSPORT.lock().unwrap();
+            state.link_table.clear();
+            state.path_table.remove(&dest_hash);
+            state.interfaces.retain(|i| i.name != outbound_iface_name && i.name != receiving_iface_name);
+        }
     }
 }

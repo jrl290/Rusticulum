@@ -22,8 +22,18 @@ fn main() {
 
     // Parse CLI arguments (compatible with Python rnsd)
     let config_dir = arg_value(&args, "--config").map(PathBuf::from);
-    let verbose: i32 = args.iter().filter(|a| *a == "-v" || *a == "--verbose").count() as i32;
-    let quiet: i32 = args.iter().filter(|a| *a == "-q" || *a == "--quiet").count() as i32;
+    let verbose: i32 = args.iter().map(|a| {
+        if a == "--verbose" { 1 }
+        else if a.starts_with("-") && !a.starts_with("--") {
+            a.chars().filter(|&c| c == 'v').count() as i32
+        } else { 0 }
+    }).sum();
+    let quiet: i32 = args.iter().map(|a| {
+        if a == "--quiet" { 1 }
+        else if a.starts_with("-") && !a.starts_with("--") {
+            a.chars().filter(|&c| c == 'q').count() as i32
+        } else { 0 }
+    }).sum();
     let service = args.iter().any(|a| a == "-s" || a == "--service");
 
     // Compute effective log level: base LOG_NOTICE (3) + verbose - quiet

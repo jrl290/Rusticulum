@@ -458,6 +458,7 @@ impl TcpClientInterface {
                 use std::os::unix::io::AsRawFd;
                 socket.as_raw_fd()
             };
+            crate::log(&format!("TCP write fd={} framed_len={}", write_fd, framed.len()), crate::LOG_DEBUG, false, false);
             match socket.write_all(&framed) {
                 Ok(_) => {
                     self.base.txb += framed.len() as u64;
