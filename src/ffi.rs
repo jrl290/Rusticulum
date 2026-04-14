@@ -279,7 +279,8 @@ pub fn transport_hops_to(dest_hash: &[u8]) -> i32 {
 
 /// Enable or disable early-dropping of inbound announce packets at the
 /// transport layer.  When `true`, all ANNOUNCE packets are silently
-/// discarded except PATH_RESPONSE replies to our own path requests.
+/// discarded except PATH_RESPONSE replies to our own path requests,
+/// and announces from watchlisted destinations.
 /// This is opt-in (default: `false`).
 pub fn set_drop_announces(enabled: bool) {
     Transport::set_drop_announces(enabled);
@@ -288,6 +289,18 @@ pub fn set_drop_announces(enabled: bool) {
 /// Query whether announce dropping is currently enabled.
 pub fn get_drop_announces() -> bool {
     Transport::drop_announces_enabled()
+}
+
+/// Add a destination hash to the announce watchlist.
+/// Announces from watchlisted destinations pass through even when
+/// drop_announces is enabled.
+pub fn watch_announce(destination_hash: Vec<u8>) {
+    Transport::watch_announce(destination_hash);
+}
+
+/// Remove a destination hash from the announce watchlist.
+pub fn unwatch_announce(destination_hash: &[u8]) {
+    Transport::unwatch_announce(destination_hash);
 }
 
 // ---------------------------------------------------------------------------

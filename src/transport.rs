@@ -311,6 +311,7 @@ pub struct TransportState {
     pub is_connected_to_shared_instance: bool,
     pub transport_enabled: bool,
     pub drop_announces: bool,
+    pub announce_watchlist: std::collections::HashSet<Vec<u8>>,
     pub discovery_announcer: Option<InterfaceAnnouncer>,
     pub interface_discovery: Option<InterfaceDiscovery>,
     pub interface_announce_handler: Option<Arc<InterfaceAnnounceHandler>>,
@@ -1029,6 +1030,20 @@ impl Transport {
     pub fn drop_announces_enabled() -> bool {
         let state = TRANSPORT.lock().unwrap();
         state.drop_announces
+    }
+
+    /// Add a destination hash to the announce watchlist.
+    /// When drop_announces is enabled, announces from watchlisted destinations
+    /// pass through regardless of context, so the app stays aware of them.
+    pub fn watch_announce(destination_hash: Vec<u8>) {
+        let mut state = TRANSPORT.lock().unwrap();
+        state.announce_watchlist.insert(destination_hash);
+    }
+
+    /// Remove a destination hash from the announce watchlist.
+    pub fn unwatch_announce(destination_hash: &[u8]) {
+        let mut state = TRANSPORT.lock().unwrap();
+        state.announce_watchlist.remove(destination_hash);
     }
 
     pub fn is_connected_to_shared_instance() -> bool {
@@ -2989,14 +3004,25 @@ impl Transport {
             return false;
         }
         // Early-drop: when drop_announces is enabled, silently discard
-        // announce packets before any logging or processing. PATH_RESPONSE
-        // replies to our own request_path() calls are always kept.
+        // announce packets before any logging or processing. Two exceptions
+        // always pass through:
+        //   1. PATH_RESPONSE replies to our own request_path() calls.
+        //   2. Announces from destinations on the watchlist (so the app
+        //      stays aware of peers it actively cares about).
         if packet.packet_type == ANNOUNCE {
             let should_drop = {
                 let state = TRANSPORT.lock().unwrap();
-                state.drop_announces
+                if !state.drop_announces {
+                    false
+                } else if packet.context == crate::packet::PATH_RESPONSE {
+                    false
+                } else if let Some(ref dest_hash) = packet.destination_hash {
+                    !state.announce_watchlist.contains(dest_hash.as_slice())
+                } else {
+                    true
+                }
             };
-            if should_drop && packet.context != crate::packet::PATH_RESPONSE {
+            if should_drop {
                 return false;
             }
         }
