@@ -52,6 +52,37 @@ pub const STATE_RESPONSIVE: u8 = 0x02;
 
 pub const LINK_TIMEOUT: f64 = crate::link::STALE_TIME * 1.25;
 pub const REVERSE_TIMEOUT: f64 = 8.0 * 60.0;
+
+/// Minimum interval (seconds) between announce dispatches to the same
+/// local client interface — used by Fix C (bulk announce forwarding)
+/// and Fix D (PATH_RESPONSE).
+///
+/// ## Why this exists
+///
+/// Python's `RNS.Transport` also forwards every incoming announce to
+/// all local clients immediately, with no intentional pacing.  Python
+/// doesn't trigger the burst limiter because Python is slow: each
+/// packet takes several milliseconds of GIL-serialised work, so a
+/// burst of 20 rmap announces naturally spreads over 100 ms+ by the
+/// time they exit the OS socket buffer.
+///
+/// Rust processes the same burst in microseconds and can blast all 20
+/// announces onto the wire in a single scheduler tick.  On the
+/// receiving side both Python and Rust clients use `TCPClientInterface`
+/// with `ingress_control = True` (the default — it is never set
+/// `False` anywhere in the RNS source).  `TCPClientInterface` tracks
+/// `incoming_announce_frequency()` over the last 6 samples; if the
+/// measured rate exceeds `IC_BURST_FREQ_NEW = 3.5/s` for a new
+/// interface (< 2 h old), it holds all further announces for 60 s
+/// then applies a 300-second penalty (`IC_BURST_PENALTY`).
+///
+/// Python's `incoming_announce_frequency()` formula is
+/// `dq_len / delta_sum` (not `(dq_len-1) / delta_sum`), so with only
+/// 2 entries in the deque it computes `2/T` rather than `1/T`.  To
+/// avoid triggering the burst hold on just the *second* announce, we
+/// need `2/T < 3.5`, i.e. `T > 0.571 s`.  We use 600 ms to give a
+/// comfortable margin, achieving a maximum effective rate of ~1.67/s.
+pub const LOCAL_CLIENT_ANNOUNCE_PACE: f64 = 0.60;
 pub const DESTINATION_TIMEOUT: f64 = 60.0 * 60.0 * 24.0 * 7.0;
 pub const MAX_RECEIPTS: usize = 1024;
 pub const MAX_RATE_TIMESTAMPS: usize = 16;
@@ -316,6 +347,12 @@ pub struct TransportState {
     pub interface_discovery: Option<InterfaceDiscovery>,
     pub interface_announce_handler: Option<Arc<InterfaceAnnounceHandler>>,
     pub outbound_handlers: HashMap<String, Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    /// Per-client earliest-next-dispatch time for announce pacing (enqueue scheduling).
+    pub client_announce_pacing: HashMap<String, f64>,
+    /// Per-client wall-clock time of the last actual paced dispatch (from jobs()).
+    pub client_announce_last_sent: HashMap<String, f64>,
+    /// Announces deferred until their pacing window opens: (dispatch_at, iface_name, raw_bytes).
+    pub pending_local_announces: Vec<(f64, String, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -557,10 +594,51 @@ impl Transport {
         };
 
         if let Some(handler) = handler {
-            handler(raw)
+            let result = handler(raw);
+            crate::log(&format!("[DISPATCH-DIAG] iface={} raw_len={} result={}", name, raw.len(), result), crate::LOG_EXTREME, false, false);
+            result
         } else {
+            crate::log(&format!("[DISPATCH-DIAG] NO HANDLER for iface={} raw_len={}", name, raw.len()), crate::LOG_EXTREME, false, false);
             false
         }
+    }
+
+    /// Send a pre-built raw wire frame directly on a named interface.
+    /// Bypasses `Transport::outbound` packet construction and routing —
+    /// the caller is responsible for building the complete frame
+    /// (flags + hops + destination_hash + context + ciphertext).
+    pub fn send_raw_on_interface(interface_name: &str, raw: &[u8]) -> bool {
+        crate::log(
+            &format!("send_raw_on_interface len={} iface={}", raw.len(), interface_name),
+            crate::LOG_EXTREME,
+            false,
+            false,
+        );
+        Self::dispatch_outbound(interface_name, raw)
+    }
+
+    /// Set delivery and/or timeout callbacks on a receipt already stored
+    /// in `state.receipts`.  Identified by the receipt's full hash.
+    /// Returns `true` if the receipt was found.
+    pub fn set_receipt_callbacks(
+        receipt_hash: &[u8],
+        delivery_callback: Option<Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync>>,
+        timeout_callback: Option<Arc<dyn Fn(&crate::packet::PacketReceipt) + Send + Sync>>,
+    ) -> bool {
+        if let Ok(mut state) = TRANSPORT.lock() {
+            for receipt in state.receipts.iter_mut() {
+                if receipt.hash == receipt_hash {
+                    if delivery_callback.is_some() {
+                        receipt.delivery_callback = delivery_callback;
+                    }
+                    if timeout_callback.is_some() {
+                        receipt.timeout_callback = timeout_callback;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn name_hash_for_aspect_filter(filter: &str) -> Option<Vec<u8>> {
@@ -972,6 +1050,9 @@ impl Transport {
         state.interfaces.retain(|iface| iface.name != name);
         state.local_client_interfaces.retain(|iface| iface.name != name);
         state.outbound_handlers.remove(name);
+        state.client_announce_pacing.remove(name);
+        state.client_announce_last_sent.remove(name);
+        state.pending_local_announces.retain(|(_, n, _)| n != name);
     }
 
     pub fn register_local_server_interface(name: &str) {
@@ -1088,10 +1169,8 @@ impl Transport {
     }
 
     pub fn path_request_handler(data: &[u8], packet: &Packet) {
-        use std::io::Write;
         // Path request handler for path request control destination
         // Parses incoming path requests and invokes path_request workflow
-        let _ = std::io::stderr().flush();
         
         if data.len() < crate::reticulum::TRUNCATED_HASHLENGTH / 8 {
             return;
@@ -1243,7 +1322,9 @@ impl Transport {
             };
 
             let packet_hash = match path_entry.get(IDX_PT_PACKET) {
-                Some(PathEntryValue::PacketHash(hash)) => hash.clone(),
+                Some(PathEntryValue::PacketHash(hash)) => {
+                    hash.clone()
+                },
                 _ => {
                     log("Could not retrieve packet hash from path table", LOG_ERROR, false, false);
                     return;
@@ -1384,13 +1465,74 @@ impl Transport {
                 AnnounceEntryValue::Retries(retries),
                 AnnounceEntryValue::ReceivedFrom(next_hop),
                 AnnounceEntryValue::Hops(announce_hops),
-                AnnounceEntryValue::Packet(packet),
+                AnnounceEntryValue::Packet(packet.clone()),
                 AnnounceEntryValue::LocalRebroadcasts(local_rebroadcasts),
                 AnnounceEntryValue::BlockRebroadcasts(block_rebroadcasts),
-                AnnounceEntryValue::AttachedInterface(attached_interface),
+                AnnounceEntryValue::AttachedInterface(attached_interface.clone()),
             ];
 
-            state.announce_table.insert(destination_hash, announce_entry);
+            state.announce_table.insert(destination_hash.clone(), announce_entry);
+
+            // Dispatch the PATH_RESPONSE to the requesting local client
+            // with pacing to avoid triggering the Python-side
+            // TCPClientInterface ingress burst limiter (IC_BURST_FREQ_NEW
+            // = 3.5/s).  Python's own LocalClientInterface disables
+            // ingress control, but our clients connect via TCP.
+            if is_from_local_client {
+                if let Some(ref req_iface) = attached_interface {
+                    let identity_hash = state.identity.as_ref().and_then(|i| i.hash.as_ref().cloned());
+                    let transport_id_bytes = identity_hash.unwrap_or_default();
+                    let dest_hash_bytes = packet.destination_hash.clone().unwrap_or_else(|| destination_hash.clone());
+                    let dest_type_bits: u8 = match packet.destination_type {
+                        Some(crate::destination::DestinationType::Single) => 0x00,
+                        Some(crate::destination::DestinationType::Group) => 0x01,
+                        Some(crate::destination::DestinationType::Plain) => 0x02,
+                        Some(crate::destination::DestinationType::Link) => 0x03,
+                        None => 0x00,
+                    };
+                    let flags: u8 = (crate::packet::HEADER_2 << 6)
+                        | ((packet.context_flag & 0x01) << 5)
+                        | (MODE_TRANSPORT << 4)
+                        | (dest_type_bits << 2)
+                        | ANNOUNCE;
+                    let announce_context = crate::packet::PATH_RESPONSE;
+
+                    let mut raw = Vec::with_capacity(2 + 16 + 16 + 1 + packet.data.len());
+                    raw.push(flags);
+                    raw.push(announce_hops);
+                    raw.extend_from_slice(&transport_id_bytes);
+                    raw.extend_from_slice(&dest_hash_bytes);
+                    raw.push(announce_context);
+                    raw.extend_from_slice(&packet.data);
+
+                    let iface_name = req_iface.clone();
+                    // A PATH_RESPONSE is an ANNOUNCE packet on the wire, so it
+                    // counts against the client's incoming_announce_frequency()
+                    // budget just like a regular announce.  A sender typically
+                    // issues two rapid PATH_REQUESTs (recipient + prop node)
+                    // within 200 ms.  If both responses arrive at the client
+                    // within 286 ms they trigger the 60-second burst hold.
+                    // Queue through the same pacing mechanism as Fix C so that
+                    // consecutive PATH_RESPONSEs are ≥ LOCAL_CLIENT_ANNOUNCE_PACE
+                    // apart in wall-clock time.  See the constant for background.
+                    let now_ts = now();
+                    let last = state.client_announce_pacing.get(&iface_name).copied()
+                        .unwrap_or(now_ts - LOCAL_CLIENT_ANNOUNCE_PACE);
+                    let dispatch_at = f64::max(now_ts, last + LOCAL_CLIENT_ANNOUNCE_PACE);
+                    state.client_announce_pacing.insert(iface_name.clone(), dispatch_at);
+                    if dispatch_at <= now_ts + 0.001 {
+                        drop(state);
+                        Transport::dispatch_outbound(&iface_name, &raw);
+                    } else {
+                        state.pending_local_announces.push((dispatch_at, iface_name, raw));
+                        drop(state);
+                    }
+                } else {
+                    drop(state);
+                }
+            } else {
+                drop(state);
+            }
             return;
         }
 
@@ -1650,6 +1792,13 @@ impl Transport {
         }
         state.jobs_running = true;
 
+        // DIAG: trace jobs() execution
+        let at_size = state.announce_table.len();
+        let ifaces_count = state.interfaces.len();
+        if at_size > 0 {
+            crate::log(&format!("[JOBS-DIAG] announce_table={} interfaces={}", at_size, ifaces_count), crate::LOG_EXTREME, false, false);
+        }
+
         let mut outgoing: Vec<Packet> = Vec::new();
         let mut path_requests: HashMap<Vec<u8>, Option<String>> = HashMap::new();
 
@@ -1780,6 +1929,11 @@ impl Transport {
                         new_packet.raw = raw;
                         new_packet.hops = hops;
                         new_packet.packed = true;
+                        // Preserve receiving_interface from the original announce so
+                        // outbound() won't echo the retransmit back to the source.
+                        // Matches Python Transport.py line ~1803:
+                        //   if packet.receiving_interface != local_interface:
+                        new_packet.receiving_interface = packet.receiving_interface.clone();
                         new_packet.update_hash();
                         outgoing.push(new_packet);
                     }
@@ -1798,6 +1952,66 @@ impl Transport {
             }
 
             state.announces_last_checked = now();
+        }
+
+        // Drain the paced-announce queue: dispatch at most one entry per
+        // interface per jobs() tick, and only if LOCAL_CLIENT_ANNOUNCE_PACE
+        // seconds have elapsed since the ACTUAL last send (tracked in
+        // client_announce_last_sent, not just the scheduled dispatch_at).
+        //
+        // The wall-clock guard is essential: jobs() fires every 250 ms and
+        // could dispatch two entries whose scheduled times are 350 ms apart
+        // within a single tick if the scheduler woke late.  Two packets
+        // reaching the client within < 286 ms would spike ia_freq above
+        // IC_BURST_FREQ_NEW (3.5/s) and trigger TCPClientInterface's 60-second
+        // burst hold + 300-second penalty.  By recording the actual send time
+        // and skipping entries that arrive too soon, we guarantee a minimum
+        // ~500 ms real-world gap between consecutive announces (~2/s).  See
+        // LOCAL_CLIENT_ANNOUNCE_PACE for full background.
+        if !state.pending_local_announces.is_empty() {
+            let now_ts = now();
+            let pacing = LOCAL_CLIENT_ANNOUNCE_PACE;
+            // Phase 1: read-only pass to find what to dispatch.
+            state.pending_local_announces.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut seen_ifaces: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut candidates: Vec<(String, Vec<u8>, f64)> = Vec::new(); // (iface, raw, dispatch_at)
+            for (dispatch_at, iface_name, raw) in &state.pending_local_announces {
+                if *dispatch_at > now_ts { continue; }
+                if seen_ifaces.contains(iface_name.as_str()) { continue; }
+                // Enforce wall-clock gap: check last_sent for this interface.
+                let last_sent = state.client_announce_last_sent
+                    .get(iface_name.as_str())
+                    .copied()
+                    .unwrap_or(0.0);
+                if last_sent > 0.0 && now_ts - last_sent < pacing {
+                    // Not enough real time since last send → skip this tick.
+                    continue;
+                }
+                seen_ifaces.insert(iface_name.clone());
+                candidates.push((iface_name.clone(), raw.clone(), *dispatch_at));
+            }
+            if !candidates.is_empty() {
+                // Phase 2: update state and collect raw bytes for dispatch.
+                let mut to_dispatch: Vec<(String, Vec<u8>)> = Vec::new();
+                for (iface_name, raw, dispatch_at) in candidates {
+                    // Remove the matching entry from pending queue.
+                    let at = dispatch_at;
+                    if let Some(pos) = state.pending_local_announces
+                        .iter()
+                        .position(|(t, n, _)| (*t - at).abs() < 1e-9 && n == &iface_name)
+                    {
+                        state.pending_local_announces.remove(pos);
+                    }
+                    // Record actual dispatch wall time.
+                    state.client_announce_last_sent.insert(iface_name.clone(), now_ts);
+                    to_dispatch.push((iface_name, raw));
+                }
+                drop(state);
+                for (name, raw) in to_dispatch {
+                    Transport::dispatch_outbound(&name, &raw);
+                }
+                state = TRANSPORT.lock().unwrap();
+            }
         }
 
         if state.packet_hashlist.len() > state.hashlist_maxsize / 2 {
@@ -1863,9 +2077,6 @@ impl Transport {
 
             let mut stale_links = Vec::new();
             let mut path_rediscovery_tasks: Vec<(Vec<u8>, Option<String>, bool, bool)> = Vec::new();
-            if !state.link_table.is_empty() {
-                crate::log(&format!("[LT-JOBS] link_table size={}", state.link_table.len()), crate::LOG_NOTICE, false, false);
-            }
             for (link_id, entry) in state.link_table.iter() {
                 let validated = match entry.get(IDX_LT_VALIDATED) {
                     Some(LinkEntryValue::Validated(v)) => *v,
@@ -2081,7 +2292,6 @@ impl Transport {
             }
 
             for link_id in stale_links {
-                crate::log(&format!("[LT-JOBS] REMOVING stale link={}", crate::hexrep(&link_id, false)), crate::LOG_NOTICE, false, false);
                 state.link_table.remove(&link_id);
             }
 
@@ -2145,6 +2355,15 @@ impl Transport {
         state.jobs_running = false;
 
         drop(state);
+
+        // DIAG: trace outgoing
+        if !outgoing.is_empty() {
+            for p in &outgoing {
+                crate::log(&format!("[JOBS-DIAG] outgoing ptype={} dest={} raw_len={} attached={:?}",
+                    p.packet_type, p.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+                    p.raw.len(), p.attached_interface), crate::LOG_EXTREME, false, false);
+            }
+        }
 
         // Send management announces (deferred to avoid calling Transport::outbound
         // while the TRANSPORT lock is held — destination.announce(send=true) calls
@@ -2224,9 +2443,16 @@ impl Transport {
                 _ => 0,
             };
 
+            // LINKREQUEST (2) and PROOF (3) are rare and critical for diagnosing
+            // link establishment.  Log them at NOTICE so they appear in production logs.
+            let outbound_log_level = if packet.packet_type == LINKREQUEST || packet.packet_type == PROOF {
+                crate::LOG_NOTICE
+            } else {
+                crate::LOG_VERBOSE
+            };
             crate::log(&format!("[OUTBOUND] ptype={} dest={} hops={} iface={:?} iface_exists={}",
                 packet.packet_type, dest_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-                hops, outbound_interface_name, outbound_interface_exists), crate::LOG_VERBOSE, false, false);
+                hops, outbound_interface_name, outbound_interface_exists), outbound_log_level, false, false);
 
             if hops > 1 && packet.header_type == crate::packet::HEADER_1 {
                 if let Some(next_hop) = entry.get(IDX_PT_NEXT_HOP) {
@@ -2291,10 +2517,15 @@ impl Transport {
             }
         } else {
             if packet.packet_type != ANNOUNCE {
+                let no_path_log_level = if packet.packet_type == LINKREQUEST {
+                    crate::LOG_NOTICE
+                } else {
+                    crate::LOG_VERBOSE
+                };
                 crate::log(&format!("[OUTBOUND] no path entry for ptype={} dest={:?} dtype={:?}",
                     packet.packet_type,
                     packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)),
-                    packet.destination_type), crate::LOG_VERBOSE, false, false);
+                    packet.destination_type), no_path_log_level, false, false);
             }
             let mut packet_hashes: Vec<Vec<u8>> = Vec::new();
 
@@ -2311,9 +2542,15 @@ impl Transport {
                 None
             };
 
-            if packet.packet_type == ANNOUNCE {
-                crate::log(&format!("[OUTBOUND-ANNOUNCE] interfaces_count={}", state.interfaces.len()), crate::LOG_VERBOSE, false, false);
-            }
+            // Build a set of local client interface names so we can skip them
+            // during untargeted announce broadcast.  Local clients receive
+            // announces via immediate dispatch in inbound() / path_request()
+            // instead, avoiding the burst that triggers ingress limiting.
+            let local_client_names: std::collections::HashSet<String> = state
+                .local_client_interfaces
+                .iter()
+                .map(|i| i.name.clone())
+                .collect();
 
             for interface in &mut state.interfaces {
                 // For announces, broadcast to ALL interfaces even if out_enabled=false
@@ -2345,16 +2582,34 @@ impl Transport {
                         }
                     }
 
+                    // Don't echo an announce retransmit back to the interface
+                    // it was originally received from.  Matches Python
+                    // Transport.py ~line 1803 / 1821.
+                    if packet.packet_type == ANNOUNCE {
+                        if let Some(ref recv_iface) = packet.receiving_interface {
+                            if &interface.name == recv_iface {
+                                should_transmit = false;
+                            }
+                        }
+                    }
+
+                    // Don't send untargeted announce broadcasts to local
+                    // client interfaces.  They receive fresh announces via
+                    // immediate dispatch in inbound() and PATH_RESPONSEs
+                    // via dispatch_outbound() in path_request().  Sending
+                    // announce_table retransmissions here causes a burst
+                    // that triggers the client's TCPClientInterface ingress
+                    // limiter.
                     if packet.packet_type == ANNOUNCE && packet.attached_interface.is_none() {
-                        if interface.mode == InterfaceStub::MODE_ACCESS_POINT {
+                        if local_client_names.contains(&interface.name) {
                             should_transmit = false;
                         }
                     }
 
-                    if packet.packet_type == ANNOUNCE {
-                        crate::log(&format!("[OUTBOUND-ANNOUNCE] iface={} out={} mode={} should_transmit={} attached={:?}",
-                            interface.name, interface.out, interface.mode, should_transmit, packet.attached_interface),
-                            crate::LOG_VERBOSE, false, false);
+                    if packet.packet_type == ANNOUNCE && packet.attached_interface.is_none() {
+                        if interface.mode == InterfaceStub::MODE_ACCESS_POINT {
+                            should_transmit = false;
+                        }
                     }
 
                     if should_transmit {
@@ -2417,7 +2672,12 @@ impl Transport {
             state.receipts.push(receipt);
         }
 
-        crate::log(&format!("Transport::outbound {} transmissions, sent={}", transmissions.len(), sent), crate::LOG_VERBOSE, false, false);
+        let tx_log_level = if packet.packet_type == LINKREQUEST || packet.packet_type == PROOF {
+            crate::LOG_NOTICE
+        } else {
+            crate::LOG_VERBOSE
+        };
+        crate::log(&format!("Transport::outbound {} transmissions, sent={}", transmissions.len(), sent), tx_log_level, false, false);
         let outbound_held_ms = outbound_lock_held_started.elapsed().as_millis();
         if outbound_held_ms > 500 {
         }
@@ -2986,7 +3246,9 @@ impl Transport {
         let raw_ptype = if raw.len() > 2 { raw[0] & 0x03 } else { 0xFF };
         let raw_ptype_str = match raw_ptype { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
         let raw_log_level = crate::LOG_NOTICE;
-        crate::log(&format!("inbound_raw len={} ptype_byte={} ({})", raw.len(), raw_ptype, raw_ptype_str), raw_log_level, false, false);
+        if raw_ptype != ANNOUNCE {
+            crate::log(&format!("inbound_raw len={} ptype_byte={} ({})", raw.len(), raw_ptype, raw_ptype_str), raw_log_level, false, false);
+        }
         // IFAC flag check: if interface doesn't have IFAC, drop packets with IFAC flag
         if raw.len() > 2 && (raw[0] & 0x80) == 0x80 {
             // IFAC flag set but we don't have IFAC configured - drop
@@ -3028,15 +3290,9 @@ impl Transport {
         }
 
         let ptype_str = match packet.packet_type { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
-        let inbound_log_level = crate::LOG_NOTICE;
         crate::log(&format!("Inbound {} hops={} dest={} ctx={}", ptype_str, packet.hops,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-            packet.context), inbound_log_level, false, false);
-        if packet.packet_type == 3 {
-            crate::log(&format!("[INBOUND-PROOF] context={} dest={} hops={} raw_len={}",
-                packet.context, packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-                packet.hops, packet.raw.len()), crate::LOG_NOTICE, false, false);
-        }
+            packet.context), crate::LOG_NOTICE, false, false);
         packet.hops = packet.hops.saturating_add(1);
 
         // Inline packet_filter + control destination check in a single lock acquisition
@@ -3118,7 +3374,7 @@ impl Transport {
         }
 
         // Handle control destination routing (lock already released)
-        if let Some(aspects) = control_aspects {
+        if let Some(ref aspects) = control_aspects {
             match aspects.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
                 ["path", "request"] => Transport::path_request_handler(&packet.data, &packet),
                 ["tunnel", "synthesize"] => Transport::tunnel_synthesize_handler(&packet.data, &packet),
@@ -3461,6 +3717,69 @@ impl Transport {
                             ];
                             state.announce_table.insert(destination_hash.clone(), announce_entry);
                         }
+
+                        // Python Transport.py lines 1790-1833: immediately send
+                        // HEADER_2 copies of this announce to all local client
+                        // interfaces (except the one that sent us the announce).
+                        // Local clients are excluded from the announce_table /
+                        // jobs() retransmit path to avoid the burst that
+                        // triggers the client's ingress limiter.
+                        if !state.local_client_interfaces.is_empty() {
+                            let identity_hash_bytes = state.identity.as_ref()
+                                .and_then(|i| i.hash.clone())
+                                .unwrap_or_default();
+                            let dest_type_bits: u8 = match packet.destination_type {
+                                Some(crate::destination::DestinationType::Single) => 0x00,
+                                Some(crate::destination::DestinationType::Group) => 0x01,
+                                Some(crate::destination::DestinationType::Plain) => 0x02,
+                                Some(crate::destination::DestinationType::Link) => 0x03,
+                                None => 0x00,
+                            };
+                            let flags: u8 = (crate::packet::HEADER_2 << 6)
+                                | ((packet.context_flag & 0x01) << 5)
+                                | (MODE_TRANSPORT << 4)
+                                | (dest_type_bits << 2)
+                                | ANNOUNCE;
+                            let dest_hash_bytes = packet.destination_hash.clone()
+                                .unwrap_or_else(|| destination_hash.clone());
+                            // Use NONE context for regular announces, PATH_RESPONSE
+                            // for path responses — matches Python logic.
+                            let announce_context = if packet.context == crate::packet::PATH_RESPONSE {
+                                crate::packet::PATH_RESPONSE
+                            } else {
+                                crate::packet::NONE
+                            };
+                            let mut announce_raw = Vec::with_capacity(2 + 16 + 16 + 1 + packet.data.len());
+                            announce_raw.push(flags);
+                            announce_raw.push(packet.hops);
+                            announce_raw.extend_from_slice(&identity_hash_bytes);
+                            announce_raw.extend_from_slice(&dest_hash_bytes);
+                            announce_raw.push(announce_context);
+                            announce_raw.extend_from_slice(&packet.data);
+
+                            let local_iface_names: Vec<String> = state.local_client_interfaces
+                                .iter()
+                                .filter(|i| packet.receiving_interface.as_deref() != Some(&i.name))
+                                .map(|i| i.name.clone())
+                                .collect();
+                            let now_ts = now();
+                            for iface_name in local_iface_names {
+                                // Schedule this announce no sooner than LOCAL_CLIENT_ANNOUNCE_PACE
+                                // after the previous one for this interface.  For a brand-new
+                                // client (no entry yet) use now_ts - PACE as baseline so the
+                                // FIRST announce dispatches immediately (dispatch_at = now_ts).
+                                // Subsequent ones are queued at PACE intervals.
+                                let last = state.client_announce_pacing.get(&iface_name).copied()
+                                    .unwrap_or(now_ts - LOCAL_CLIENT_ANNOUNCE_PACE);
+                                let dispatch_at = f64::max(now_ts, last + LOCAL_CLIENT_ANNOUNCE_PACE);
+                                state.client_announce_pacing.insert(iface_name.clone(), dispatch_at);
+                                if dispatch_at <= now_ts + 0.001 {
+                                    deferred_outbound.push((iface_name, announce_raw.clone()));
+                                } else {
+                                    state.pending_local_announces.push((dispatch_at, iface_name, announce_raw.clone()));
+                                }
+                            }
+                        }
                     } else {
                         crate::log(&format!("Path not updated dest={} new_hops={} existing_hops={} (keeping better path)", crate::hexrep(destination_hash, false), packet.hops, existing_hops), crate::LOG_DEBUG, false, false);
                     }
@@ -3469,12 +3788,6 @@ impl Transport {
         }
 
         if packet.packet_type != ANNOUNCE && packet.transport_id.is_some() {
-            if packet.packet_type == LINKREQUEST {
-                crate::log(&format!("[LR-TRACE] LINKREQUEST has transport_id={:?} my_hash={:?}",
-                    packet.transport_id.as_ref().map(|h| crate::hexrep(h, false)),
-                    state.identity.as_ref().and_then(|i| i.hash.as_ref()).map(|h| crate::hexrep(h, false))),
-                    crate::LOG_NOTICE, false, false);
-            }
             if let Some(identity) = &state.identity {
                 if identity
                     .hash
@@ -3607,10 +3920,6 @@ impl Transport {
                                     LinkEntryValue::ProofTimeout(proof_timeout),
                                 ];
                                 let link_id = crate::link::link_id_from_lr_packet(&packet);
-                                crate::log(&format!("[LR-TRACE] link_table INSERT link_id={} dest={} rcvd_if={:?} nh_if={:?} rem_hops={}",
-                                    crate::hexrep(&link_id, false), crate::hexrep(destination_hash, false),
-                                    packet.receiving_interface, outbound_interface_name, remaining_hops),
-                                    crate::LOG_NOTICE, false, false);
                                 state.link_table.insert(link_id, link_entry);
                             } else {
                                 let reverse_entry = vec![
@@ -3692,12 +4001,6 @@ impl Transport {
         }
 
         if packet.packet_type == LINKREQUEST {
-            if packet.transport_id.is_none() {
-                crate::log(&format!("[LR-TRACE] LINKREQUEST has NO transport_id, dest={:?} header_type={} hops={}",
-                    packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)),
-                    packet.header_type, packet.hops),
-                    crate::LOG_NOTICE, false, false);
-            }
             if let Some(destination_hash) = &packet.destination_hash {
                 for dest in &mut state.destinations {
                     if &dest.hash == destination_hash {
@@ -3768,7 +4071,7 @@ impl Transport {
                                             if new_raw.len() > 1 {
                                                 new_raw[1] = packet.hops;
                                             }
-                                            crate::log(&format!("[LRPROOF-RELAY] validated and forwarding link={} via rcvd_if={}", link_hex, name), crate::LOG_NOTICE, false, false);
+                                            crate::log(&format!("[LRPROOF-RELAY] validated and forwarding link={} via rcvd_if={}", link_hex, name), crate::LOG_DEBUG, false, false);
                                             deferred_outbound.push((name.clone(), new_raw));
                                             forwarded_via_link_table = true;
                                             // Mark the link entry as validated
@@ -3786,8 +4089,8 @@ impl Transport {
                                     link_hex, packet.receiving_interface, nh_if), crate::LOG_DEBUG, false, false);
                             }
                         } else {
-                            crate::log(&format!("[LRPROOF-RELAY] link={} not found in link_table (entry expired or never created), dropping",
-                                link_hex), crate::LOG_WARNING, false, false);
+                            crate::log(&format!("[LRPROOF-RELAY] link={} not in link_table (non-transport node), deferring to link handler",
+                                link_hex), crate::LOG_DEBUG, false, false);
                         }
                     }
                 }

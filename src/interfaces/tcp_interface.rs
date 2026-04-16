@@ -1235,6 +1235,15 @@ impl TcpServerInterface {
                             iface.process_outgoing(raw.to_vec()).is_ok()
                         }),
                     );
+                    // Register as a local client interface FIRST, before
+                    // adding to state.interfaces.  This ensures the
+                    // outbound() announce broadcast filter sees the
+                    // interface in local_client_interfaces by the time it
+                    // appears in the interfaces list (eliminates a race
+                    // where jobs()/outbound() bursts announce retransmits
+                    // to the new interface before it's marked as a local
+                    // client).
+                    crate::transport::Transport::register_local_client_interface(&iface_name);
                     {
                         let mut stub_config = crate::transport::InterfaceStubConfig::default();
                         stub_config.name = iface_name.clone();

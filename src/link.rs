@@ -112,26 +112,34 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
         (false, false, false)
     };
 
-    // Fire link_established callback OUTSIDE the lock so the callback
-    // can re-lock the Arc and modify the link (set resource_strategy, etc.)
+    // Fire link_established callback OUTSIDE the lock on a dedicated thread
+    // so the TCP read thread returns immediately. The callback (e.g. LXMF
+    // delivery_link_established) may acquire heavy locks like the router mutex.
     if should_fire_link_established {
         if let Ok(mut link_guard) = link.lock() {
             if let Some(callback) = link_guard.callbacks.link_established.take() {
                 drop(link_guard);
-                callback(Arc::clone(&link));
+                let link_clone = Arc::clone(&link);
+                std::thread::spawn(move || {
+                    callback(link_clone);
+                });
             }
         }
     }
 
-    // Fire remote_identified callback OUTSIDE the lock, passing the ORIGINAL
-    // Arc so backchannel_links stores the same Arc as RUNTIME_LINKS (not a clone).
+    // Fire remote_identified callback OUTSIDE the lock on a dedicated thread,
+    // passing the ORIGINAL Arc so backchannel_links stores the same Arc as
+    // RUNTIME_LINKS (not a clone).
     if should_fire_remote_identified {
         if let Ok(link_guard) = link.lock() {
             let identity = link_guard.remote_identity.lock().ok().and_then(|r| r.clone());
             let callback = link_guard.callbacks.remote_identified.clone();
             drop(link_guard);
             if let (Some(identity), Some(callback)) = (identity, callback) {
-                callback(Arc::clone(&link), identity);
+                let link_clone = Arc::clone(&link);
+                std::thread::spawn(move || {
+                    callback(link_clone, identity);
+                });
             }
         }
     }
@@ -513,18 +521,40 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
                             let keepalive_secs = link_guard.keepalive as u64;
 
                             if now >= last_inbound + keepalive_secs {
-                                // Check stale first
+                                // Match Python: send keepalive BEFORE the stale
+                                // check — the keepalive and stale transitions are
+                                // independent.  The keepalive gives the remote peer
+                                // one last chance to respond before we go stale.
+                                let mut send_keepalive = false;
+                                if link_guard.initiator && now >= link_guard.last_keepalive + keepalive_secs {
+                                    send_keepalive = true;
+                                }
+
                                 let stale_secs = link_guard.stale_time as u64;
                                 if now >= last_inbound + stale_secs {
-                                    // Match Python: transition to STALE but don't
-                                    // tear down yet — allow a STALE_GRACE period
-                                    // for any in-flight data to arrive.
+                                    // Transition to STALE.  Match Python: the grace
+                                    // period is rtt * KEEPALIVE_TIMEOUT_FACTOR +
+                                    // STALE_GRACE, giving the keepalive response
+                                    // time to arrive before we tear down.
+                                    let rtt_grace = link_guard.rtt.unwrap_or(0.0)
+                                        * link_guard.keepalive_timeout_factor
+                                        + STALE_GRACE;
                                     link_guard.state = STATE_STALE;
                                     link_guard.status = STATE_STALE;
                                     link_guard.stale_since = Some(now);
-                                    WatchdogAction::Continue
-                                } else if link_guard.initiator && now >= link_guard.last_keepalive + keepalive_secs {
-                                    // Send keepalive (initiator only)
+                                    link_guard.stale_grace = rtt_grace;
+                                    // Still send the keepalive if due — it's our
+                                    // last chance to get a response.
+                                    if send_keepalive {
+                                        if let Some(info) = link_guard.prepare_keepalive() {
+                                            WatchdogAction::SendKeepalive(info.0, info.1)
+                                        } else {
+                                            WatchdogAction::Continue
+                                        }
+                                    } else {
+                                        WatchdogAction::Continue
+                                    }
+                                } else if send_keepalive {
                                     if let Some(info) = link_guard.prepare_keepalive() {
                                         WatchdogAction::SendKeepalive(info.0, info.1)
                                     } else {
@@ -538,10 +568,12 @@ pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
                             }
                         }
                         STATE_STALE => {
+                            // Match Python: tear down once the RTT-based grace
+                            // period has elapsed.
                             let now = current_time().unwrap_or(0);
-                            let grace = STALE_GRACE as u64;
                             let stale_at = link_guard.stale_since.unwrap_or(0);
-                            if now >= stale_at + grace {
+                            let grace_secs = link_guard.stale_grace as u64;
+                            if now >= stale_at + grace_secs.max(1) {
                                 WatchdogAction::Teardown
                             } else {
                                 WatchdogAction::Continue
@@ -668,6 +700,7 @@ pub struct Link {
     pub keepalive: f64,
     pub stale_time: f64,
     pub stale_since: Option<u64>,
+    pub stale_grace: f64,
     pub establishment_timeout: f64,
     pub watchdog_lock: bool,
     pub track_phy_stats: bool,
@@ -736,6 +769,7 @@ impl Clone for Link {
             keepalive: self.keepalive,
             stale_time: self.stale_time,
             stale_since: self.stale_since,
+            stale_grace: self.stale_grace,
             establishment_timeout: self.establishment_timeout,
             watchdog_lock: self.watchdog_lock,
             track_phy_stats: self.track_phy_stats,
@@ -966,6 +1000,7 @@ impl Link {
             keepalive: KEEPALIVE,
             stale_time: STALE_TIME,
             stale_since: None,
+            stale_grace: STALE_GRACE,
             establishment_timeout: ESTABLISHMENT_TIMEOUT_PER_HOP,
             watchdog_lock: false,
             track_phy_stats: false,
@@ -1032,6 +1067,7 @@ impl Link {
             keepalive: KEEPALIVE,
             stale_time: STALE_TIME,
             stale_since: None,
+            stale_grace: STALE_GRACE,
             establishment_timeout: ESTABLISHMENT_TIMEOUT_PER_HOP,
             watchdog_lock: false,
             track_phy_stats: false,
@@ -1650,7 +1686,30 @@ impl Link {
     pub fn teardown(&mut self) {
         crate::log(&format!("LINK teardown link={} state={}", crate::hexrep(&self.link_id, false), self.state), crate::LOG_NOTICE, false, false);
         if self.state != STATE_CLOSED && self.state != STATE_PENDING {
-            // Send teardown packet
+            // Send teardown packet so the remote knows the link is closed
+            if let Ok(dest_guard) = self.destination.lock() {
+                let mut link_destination = dest_guard.clone();
+                link_destination.dest_type = DestinationType::Link;
+                link_destination.hash = self.link_id.clone();
+                link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
+                let link_id = self.link_id.clone();
+                thread::spawn(move || {
+                    let mut teardown_packet = Packet::new(
+                        Some(link_destination),
+                        link_id,
+                        DATA,
+                        crate::packet::LINKCLOSE,
+                        crate::transport::BROADCAST,
+                        packet::HEADER_1,
+                        None,
+                        None,
+                        false,
+                        0,
+                    );
+                    let _ = teardown_packet.send();
+                });
+            }
+            self.had_outbound(false);
         }
         self.state = STATE_CLOSED;
         self.status = STATE_CLOSED;
@@ -2152,7 +2211,14 @@ impl Link {
         if let Some(callback) = &self.callbacks.packet {
             // Prove the packet (sign hash and send PROOF back to sender)
             let _ = self.prove_packet(packet);
-            callback(&plaintext, packet);
+            // Spawn callback on a dedicated thread so the TCP read thread
+            // is not blocked by consumer locks (matches Destination::receive).
+            let cb = callback.clone();
+            let pt = plaintext.clone();
+            let pkt = packet.clone();
+            std::thread::spawn(move || {
+                cb(&pt, &pkt);
+            });
         }
         
         Ok(())

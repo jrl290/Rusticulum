@@ -690,7 +690,7 @@ impl Destination {
 		
 		// Sign the data
 		let signature = identity.sign(&signed_data);
-		
+
 		// Build announce_data: public_key + name_hash + random_hash + ratchet + signature + app_data
 		let mut announce_data = Vec::new();
 		announce_data.extend_from_slice(&public_key);
