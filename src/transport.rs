@@ -649,13 +649,13 @@ impl Transport {
         let aspect_strs: Vec<&str> = aspects.iter().map(|s| s.as_str()).collect();
         let name_without_identity = crate::destination::Destination::expand_name(None, &app_name, &aspect_strs);
         let full = crate::identity::full_hash(name_without_identity.as_bytes());
-        let len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+        let len = crate::identity::NAME_HASH_LENGTH / 8;
         Some(full[..len].to_vec())
     }
 
     fn extract_announce_name_hash(packet: &Packet) -> Option<Vec<u8>> {
         let pubkey_len = crate::identity::KEYSIZE / 8;
-        let name_hash_len = crate::reticulum::TRUNCATED_HASHLENGTH / 8;
+        let name_hash_len = crate::identity::NAME_HASH_LENGTH / 8;
         if packet.data.len() < pubkey_len + name_hash_len {
             return None;
         }
