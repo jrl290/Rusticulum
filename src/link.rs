@@ -9,6 +9,7 @@ use rmpv::encode::write_value as rmpv_write_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::thread;
 use x25519_dalek::{StaticSecret as X25519PrivateKey, PublicKey as X25519PublicKey};
@@ -87,6 +88,10 @@ pub struct LinkHandle {
     id: Arc<Mutex<Vec<u8>>>,
     /// Identity token for `same_link()` comparison.
     token: Arc<()>,
+    /// Cached status byte — written by the actor, read lock-free by callers.
+    /// Eliminates channel round-trips for status queries and prevents
+    /// actor self-deadlock when callbacks call status() on their own handle.
+    status_atomic: Arc<AtomicU8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,11 +180,13 @@ impl LinkHandle {
     pub fn spawn(link: Link) -> Self {
         let id = Arc::new(Mutex::new(link.link_id.clone()));
         let token = Arc::new(());
+        let status_atomic = Arc::new(AtomicU8::new(link.status));
         let (tx, rx) = mpsc::channel();
         let handle = LinkHandle {
             tx: tx.clone(),
             id: Arc::clone(&id),
             token: Arc::clone(&token),
+            status_atomic: Arc::clone(&status_atomic),
         };
         let self_handle = handle.clone();
         thread::Builder::new()
@@ -219,23 +226,17 @@ impl LinkHandle {
 
     /// Check if the link is currently active.
     pub fn is_active(&self) -> bool {
-        let (tx, rx) = oneshot();
-        if self.tx.send(LinkMsg::IsActive(tx)).is_err() { return false; }
-        rx.recv().unwrap_or(false)
+        self.status_atomic.load(Ordering::Relaxed) == STATE_ACTIVE
     }
 
     /// Check if the link is alive (not closed, not channel-dead).
     pub fn is_alive(&self) -> bool {
-        let (tx, rx) = oneshot();
-        if self.tx.send(LinkMsg::IsAlive(tx)).is_err() { return false; }
-        rx.recv().unwrap_or(false)
+        self.status_atomic.load(Ordering::Relaxed) != STATE_CLOSED
     }
 
     /// Get the current link status byte.
     pub fn status(&self) -> u8 {
-        let (tx, rx) = oneshot();
-        if self.tx.send(LinkMsg::Status(tx)).is_err() { return STATE_CLOSED; }
-        rx.recv().unwrap_or(STATE_CLOSED)
+        self.status_atomic.load(Ordering::Relaxed)
     }
 
     /// Check if two LinkHandles refer to the same underlying link.
@@ -636,6 +637,7 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                 // --- Fire-and-forget ---
                 LinkMsg::Teardown => {
                     link.teardown();
+                    self_handle.status_atomic.store(link.status, Ordering::Relaxed);
                     // Actor exits after teardown — link_closed callback fires inside teardown
                     break;
                 }
@@ -669,12 +671,20 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                     let handled = link.receive(&packet).is_ok();
                     let now_active = link.state == STATE_ACTIVE;
 
-                    // Fire link_established callback synchronously on actor thread.
-                    // FIFO channel ordering ensures any SetPacketCallback sent by the
-                    // callback is processed before the next Receive message.
+                    // Sync the atomic before firing any callback — callbacks may call
+                    // status()/is_active()/is_alive() on self_handle and must see the
+                    // updated value without going through the channel (which would deadlock).
+                    self_handle.status_atomic.store(link.status, Ordering::Relaxed);
+
+                    // Fire link_established callback on a dedicated thread — same pattern
+                    // as remote_identified. The callback may call back into LinkHandle
+                    // methods (snapshot, identify, request, etc.) which would deadlock
+                    // if called on the actor thread itself (the actor can't process its
+                    // own reply while it's blocked inside the callback).
                     if was_pending && now_active {
                         if let Some(cb) = link.callbacks.link_established.take() {
-                            cb(self_handle.clone());
+                            let h = self_handle.clone();
+                            thread::spawn(move || cb(h));
                         }
                     }
 
@@ -706,6 +716,9 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
         if !link.watchdog_lock {
             actor_watchdog_tick(&mut link, &self_handle);
         }
+
+        // Sync the atomic after watchdog may have changed state (stale, closed).
+        self_handle.status_atomic.store(link.status, Ordering::Relaxed);
 
         // Request timeout checks
         actor_check_request_timeouts(&mut link);
@@ -893,7 +906,7 @@ pub fn runtime_encrypt_for_destination(destination_hash: &[u8], plaintext: &[u8]
             Some(handle) => handle.clone(),
             None => {
                 let known: Vec<String> = links.keys().map(|k| crate::hexrep(k, false)).collect();
-                crate::log(&format!("RUNTIME encrypt FAILED: no link for {} known=[{}]", crate::hexrep(destination_hash, false), known.join(", ")), crate::LOG_ERROR, false, false);
+                crate::log(&format!("RUNTIME encrypt FAILED: no link for {} known=[{}]", crate::hexrep(destination_hash, false), known.join(", ")), crate::LOG_WARNING, false, false);
                 return Err("No runtime link found for destination".to_string());
             }
         }
