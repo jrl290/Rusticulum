@@ -643,7 +643,10 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                 LinkMsg::Teardown => {
                     link.teardown();
                     self_handle.status_atomic.store(link.status, Ordering::Relaxed);
-                    // Actor exits after teardown — link_closed callback fires inside teardown
+                    // Actor exits.  link_closed callback is spawned on a new thread
+                    // inside teardown() — same as link_established/remote_identified/packet —
+                    // so the callback can safely acquire external mutexes without
+                    // deadlocking the actor on its own queue.
                     break;
                 }
                 LinkMsg::SetLinkEstablishedCallback(cb) => {
@@ -2254,28 +2257,23 @@ impl Link {
     pub fn teardown(&mut self) {
         crate::log(&format!("LINK teardown link={} state={}", crate::hexrep(&self.link_id, false), self.state), crate::LOG_NOTICE, false, false);
         if self.state != STATE_CLOSED && self.state != STATE_PENDING {
-            // Send teardown packet so the remote knows the link is closed
-            if let Ok(dest_guard) = self.destination.lock() {
-                let mut link_destination = dest_guard.clone();
-                link_destination.dest_type = DestinationType::Link;
-                link_destination.hash = self.link_id.clone();
-                link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
-                let link_id = self.link_id.clone();
-                thread::spawn(move || {
-                    let mut teardown_packet = Packet::new(
-                        Some(link_destination),
-                        link_id,
-                        DATA,
-                        crate::packet::LINKCLOSE,
-                        crate::transport::BROADCAST,
-                        packet::HEADER_1,
-                        None,
-                        None,
-                        false,
-                        0,
-                    );
-                    let _ = teardown_packet.send();
-                });
+            // Send teardown packet so the remote knows the link is closed.
+            // Encrypt the link_id payload NOW (before unregister_runtime_link removes us
+            // from RUNTIME_LINKS) and dispatch directly, avoiding the spawn-then-lookup
+            // race that produced "RUNTIME encrypt FAILED" warnings.
+            if let Ok(ciphertext) = self.encrypt(&self.link_id.clone()) {
+                if let Some(ref iface) = self.attached_interface {
+                    let flags: u8 = (DestinationType::Link as u8) << 2;
+                    let mut raw = vec![flags, 0u8]; // flags byte, hops=0
+                    raw.extend_from_slice(&self.link_id);
+                    raw.push(crate::packet::LINKCLOSE);
+                    raw.extend_from_slice(&ciphertext);
+                    let raw_clone = raw.clone();
+                    let iface_clone = iface.clone();
+                    thread::spawn(move || {
+                        crate::transport::Transport::dispatch_outbound(&iface_clone, &raw_clone);
+                    });
+                }
             }
             self.had_outbound(false);
         }
@@ -2308,7 +2306,13 @@ impl Link {
             let handle = self.self_handle.clone()
                 .or_else(|| get_runtime_link_handle(&self.link_id));
             if let Some(handle) = handle {
-                callback(handle);
+                // Spawn on a new thread — same pattern as link_established — so the
+                // callback can safely acquire external mutexes without blocking the
+                // actor.  Calling it synchronously here would deadlock if the callback
+                // waits for a mutex held by a thread that is itself waiting for the
+                // actor to process a message.
+                let cb = callback.clone();
+                thread::spawn(move || cb(handle));
             }
         }
     }
@@ -3758,6 +3762,7 @@ mod tests {
         let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(23)).collect();
         let mut link = make_incoming_link(link_id.clone());
         link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
         link.rtt = Some(0.05);
         let handle = LinkHandle::from_arc_with_id(Arc::new(Mutex::new(link)), link_id.clone());
         let snap = handle.snapshot().expect("snapshot should succeed");
