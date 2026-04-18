@@ -92,6 +92,9 @@ pub struct LinkHandle {
     /// Eliminates channel round-trips for status queries and prevents
     /// actor self-deadlock when callbacks call status() on their own handle.
     status_atomic: Arc<AtomicU8>,
+    /// Whether we initiated this link (true) or it was incoming (false).
+    /// Immutable after creation — cached here to avoid channel round-trips.
+    pub initiator: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,12 +184,14 @@ impl LinkHandle {
         let id = Arc::new(Mutex::new(link.link_id.clone()));
         let token = Arc::new(());
         let status_atomic = Arc::new(AtomicU8::new(link.status));
+        let initiator = link.initiator;
         let (tx, rx) = mpsc::channel();
         let handle = LinkHandle {
             tx: tx.clone(),
             id: Arc::clone(&id),
             token: Arc::clone(&token),
             status_atomic: Arc::clone(&status_atomic),
+            initiator,
         };
         let self_handle = handle.clone();
         thread::Builder::new()
