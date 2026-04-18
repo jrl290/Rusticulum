@@ -549,7 +549,7 @@ pub fn link_request(
         take_handle(dest).ok_or_else(|| "destination lost".to_string())?;
 
     let link = crate::link::Link::new_outbound(dest_obj, crate::link::MODE_AES256_CBC)?;
-    let link_arc = Arc::new(Mutex::new(link));
+    let link_handle = crate::link::LinkHandle::spawn(link);
 
     let established = Arc::new(AtomicBool::new(false));
     let est_failed = Arc::new(AtomicBool::new(false));
@@ -557,31 +557,24 @@ pub fn link_request(
     // Set callbacks and initiate the link handshake.
     {
         let est = Arc::clone(&established);
-        let la = Arc::clone(&link_arc);
         let id = our_identity.clone();
 
-        let mut guard = link_arc.lock().map_err(|_| "link lock poisoned")?;
-        guard.callbacks.link_established = Some(Arc::new(move |_| {
+        link_handle.set_link_established_callback(Some(Arc::new(move |handle: crate::link::LinkHandle| {
             est.store(true, Ordering::SeqCst);
             // Identify once established.
-            if let Ok(mut l) = la.lock() {
-                let _ = l.identify(&id);
-            }
-        }));
+            let _ = handle.identify(&id);
+        })));
 
         let fail = Arc::clone(&est_failed);
-        guard.callbacks.link_closed = Some(Arc::new(move |_| {
+        link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
             fail.store(true, Ordering::SeqCst);
-        }));
+        })));
 
-        // Generate ephemeral keys and send the LINKREQUEST packet.
-        // This updates link_id from the packet hash, so we must register
-        // the runtime link AFTER this call (otherwise proof lookup fails).
-        guard.initiate()?;
+        link_handle.initiate()?;
     }
 
-    // Register with the real link_id (set by initiate → set_link_id_from_packet).
-    crate::link::register_runtime_link(Arc::clone(&link_arc));
+    // Register with the real link_id (set by initiate).
+    crate::link::register_runtime_link_handle(link_handle.clone());
 
     // Wait for link establishment.
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
@@ -593,9 +586,7 @@ pub fn link_request(
             return Err("Link establishment failed".to_string());
         }
         if Instant::now() >= deadline {
-            if let Ok(mut l) = link_arc.lock() {
-                l.teardown();
-            }
+            link_handle.teardown();
             return Err("Link establishment timed out".to_string());
         }
         thread::sleep(Duration::from_millis(100));
@@ -623,16 +614,13 @@ pub fn link_request(
             done_fail.store(true, Ordering::SeqCst);
         });
 
-    {
-        let guard = link_arc.lock().map_err(|_| "link lock poisoned")?;
-        guard.request(
-            path.to_string(),
-            payload.to_vec(),
-            Some(response_cb),
-            Some(failed_cb),
-            None,
-        )?;
-    }
+    link_handle.request(
+        path.to_string(),
+        payload.to_vec(),
+        Some(response_cb),
+        Some(failed_cb),
+        None,
+    )?;
 
     // Wait for request response.
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
@@ -647,9 +635,7 @@ pub fn link_request(
     }
 
     // Teardown the link.
-    if let Ok(mut l) = link_arc.lock() {
-        l.teardown();
-    }
+    link_handle.teardown();
 
     // Return the response.
     let result = response_data

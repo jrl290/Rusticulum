@@ -80,7 +80,7 @@ struct ResponsePayload(serde_bytes::ByteBuf, serde_bytes::ByteBuf);
 #[derive(Clone, Default)]
 pub struct Callbacks {
 	pub packet: Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>,
-	pub link_established: Option<Arc<dyn Fn(Arc<Mutex<crate::link::Link>>) + Send + Sync>>,
+	pub link_established: Option<Arc<dyn Fn(crate::link::LinkHandle) + Send + Sync>>,
 	pub proof_requested: Option<Arc<dyn Fn(&Packet) -> bool + Send + Sync>>,
 }
 
@@ -498,7 +498,7 @@ impl Destination {
 	/// Register callback for when a link is established
 	pub fn set_link_established_callback(
 		&mut self,
-		callback: Option<Arc<dyn Fn(Arc<Mutex<crate::link::Link>>) + Send + Sync>>,
+		callback: Option<Arc<dyn Fn(crate::link::LinkHandle) + Send + Sync>>,
 	) {
 		self.callbacks.link_established = callback;
 	}

@@ -2742,7 +2742,7 @@ impl Transport {
         None
     }
 
-    pub fn cache_request(packet_hash: Vec<u8>, _destination: Arc<Mutex<crate::link::Link>>) {
+    pub fn cache_request(packet_hash: Vec<u8>, _destination: crate::link::LinkHandle) {
         if let Some(packet) = Transport::get_cached_packet(&packet_hash, None) {
             let _ = Transport::inbound(packet.raw, packet.receiving_interface.clone());
         }

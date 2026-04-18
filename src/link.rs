@@ -8,47 +8,830 @@ use rmpv::decode::read_value as rmpv_read_value;
 use rmpv::encode::write_value as rmpv_write_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::sync::Weak;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::thread;
 use x25519_dalek::{StaticSecret as X25519PrivateKey, PublicKey as X25519PublicKey};
 use ed25519_dalek::{PublicKey as Ed25519PublicKey, Signature, Signer, Verifier};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-static RUNTIME_LINKS: Lazy<Mutex<HashMap<Vec<u8>, Weak<Mutex<Link>>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+// ---------------------------------------------------------------------------
+// LinkHandle — the public API for interacting with links
+// ---------------------------------------------------------------------------
 
-/// Strong references for incoming (non-initiator) links to keep Arc alive
-/// so that RUNTIME_LINKS Weak references remain valid.
-/// Each entry stores the link_id alongside the Arc so we can match during
-/// unregister WITHOUT locking the Arc (which would deadlock when teardown
-/// is called from dispatch_runtime_packet while the link Mutex is held).
-static INCOMING_LINK_ARCS: Lazy<Mutex<Vec<(Vec<u8>, Arc<Mutex<Link>>)>>> =
-    Lazy::new(|| Mutex::new(Vec::new()));
+/// Error returned when a link is no longer available (torn down, channel closed).
+#[derive(Debug, Clone)]
+pub struct LinkGone;
 
-pub fn register_runtime_link(link: Arc<Mutex<Link>>) {
-    if let Ok(link_guard) = link.lock() {
-        let is_incoming = !link_guard.initiator;
-        let link_id_hex = crate::hexrep(&link_guard.link_id, false);
-        let link_id = link_guard.link_id.clone();
-        let strong = Arc::strong_count(&link);
-        if let Ok(mut links) = RUNTIME_LINKS.lock() {
-            crate::log(&format!("RUNTIME register link={} strong_count={} incoming={} total={}", link_id_hex, strong, is_incoming, links.len() + 1), crate::LOG_NOTICE, false, false);
-            links.insert(link_id.clone(), Arc::downgrade(&link));
+impl std::fmt::Display for LinkGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Link is gone")
+    }
+}
+
+impl std::error::Error for LinkGone {}
+
+impl From<LinkGone> for String {
+    fn from(_: LinkGone) -> String {
+        "Link is gone".to_string()
+    }
+}
+
+/// Read-only snapshot of link state, returned by `LinkHandle::snapshot()`.
+/// Replaces direct field reads through `link.lock().field`.
+#[derive(Debug, Clone)]
+pub struct LinkSnapshot {
+    pub link_id: Vec<u8>,
+    pub state: u8,
+    pub status: u8,
+    pub initiator: bool,
+    pub rtt: Option<f64>,
+    pub activated_at: Option<u64>,
+    pub established_at: Option<u64>,
+    pub attached_interface: Option<String>,
+    pub mtu: Option<usize>,
+    pub traffic_timeout_factor: f64,
+    pub rssi: Option<i32>,
+    pub snr: Option<f64>,
+    pub q: Option<f64>,
+    pub track_phy_stats: bool,
+    pub request_time: Option<f64>,
+    pub establishment_cost: usize,
+}
+
+impl LinkSnapshot {
+    /// Build a `LinkInfo` from this snapshot, suitable for setting on a delivery destination.
+    pub fn to_link_info(&self) -> crate::destination::LinkInfo {
+        crate::destination::LinkInfo {
+            rtt: self.rtt,
+            traffic_timeout_factor: self.traffic_timeout_factor,
+            status_closed: self.status == STATE_CLOSED,
+            mtu: self.mtu,
+            attached_interface: self.attached_interface.clone(),
         }
-        drop(link_guard);
-        // For incoming links, store a strong reference so the Weak doesn't expire.
-        // Store link_id alongside so unregister can match without re-locking.
-        if is_incoming {
-            if let Ok(mut arcs) = INCOMING_LINK_ARCS.lock() {
-                arcs.push((link_id, Arc::clone(&link)));
+    }
+}
+
+/// A handle to a link.  Callers hold this instead of `Arc<Mutex<Link>>`.
+///
+/// Phase 3: wraps a channel sender to a link-actor thread.
+/// The actor owns the `Link` and processes all operations sequentially,
+/// eliminating mutex contention and deadlocks.
+///
+/// `Clone` is cheap — it clones a `Sender` and two `Arc`s.
+#[derive(Clone)]
+pub struct LinkHandle {
+    tx: mpsc::Sender<LinkMsg>,
+    /// Cached link_id — set after initiation, immutable after that.
+    id: Arc<Mutex<Vec<u8>>>,
+    /// Identity token for `same_link()` comparison.
+    token: Arc<()>,
+}
+
+// ---------------------------------------------------------------------------
+// LinkMsg — messages sent from LinkHandle to the link actor thread
+// ---------------------------------------------------------------------------
+
+type Reply<T> = mpsc::SyncSender<T>;
+
+fn oneshot<T>() -> (Reply<T>, mpsc::Receiver<T>) {
+    mpsc::sync_channel(1)
+}
+
+#[allow(clippy::large_enum_variant)]
+enum LinkMsg {
+    // --- Read operations (oneshot reply) ---
+    Snapshot(Reply<Result<LinkSnapshot, LinkGone>>),
+    Status(Reply<u8>),
+    IsActive(Reply<bool>),
+    IsAlive(Reply<bool>),
+    NoDataFor(Reply<Result<u64, LinkGone>>),
+    RemoteIdentity(Reply<Result<Option<Identity>, LinkGone>>),
+    DestinationHash(Reply<Result<Vec<u8>, LinkGone>>),
+    CloneDestination(Reply<Result<Destination, LinkGone>>),
+    BuildLinkDestination(Reply<Result<Destination, LinkGone>>),
+    GetLinkOutboundInfo(Reply<(Option<String>, bool)>),
+
+    // --- Crypto operations ---
+    Encrypt(Vec<u8>, Reply<Result<Vec<u8>, LinkGone>>),
+    Decrypt(Vec<u8>, Reply<Result<Vec<u8>, LinkGone>>),
+
+    // --- Mutating with response ---
+    Request {
+        path: String,
+        data: Vec<u8>,
+        response_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        failed_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        progress_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        reply: Reply<Result<Vec<u8>, LinkGone>>,
+    },
+    SendPacket(Vec<u8>, Reply<Result<(), LinkGone>>),
+    Identify(Identity, Reply<Result<(), LinkGone>>),
+    Initiate(Reply<Result<(), LinkGone>>),
+
+    // --- Resource operations ---
+    ReadyForNewResource(Reply<bool>),
+    RegisterOutgoingResource(Arc<Mutex<Resource>>),
+    RegisterIncomingResource(Arc<Mutex<Resource>>),
+    ResourceConcluded(Arc<Mutex<Resource>>, Reply<Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>>),
+    CancelOutgoingResource(Arc<Mutex<Resource>>),
+    CancelIncomingResource(Arc<Mutex<Resource>>),
+    SetExpectedRate(f64),
+    GetLastResourceWindow(Reply<Option<usize>>),
+    GetLastResourceEifr(Reply<Option<f64>>),
+
+    // --- Fire-and-forget ---
+    Teardown,
+    SetLinkEstablishedCallback(Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>),
+    SetLinkClosedCallback(Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>),
+    SetPacketCallback(Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>),
+    SetRemoteIdentifiedCallback(Option<Arc<dyn Fn(LinkHandle, Identity) + Send + Sync>>),
+    SetResourceStrategy(u8),
+    SetResourceCallbacks {
+        resource: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+        started: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+        concluded: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+    },
+    SetTrackPhyStats(bool),
+
+    // --- Internal (used by dispatch_runtime_packet) ---
+    Receive(Packet, Reply<ReceiveResult>),
+    ValidateProof {
+        proof: Vec<u8>,
+        receipt: crate::packet::PacketReceipt,
+        reply: Reply<(bool, crate::packet::PacketReceipt)>,
+    },
+}
+
+/// Result from a Receive message — tells the dispatcher what happened.
+struct ReceiveResult {
+    handled: bool,
+}
+
+impl LinkHandle {
+    /// Spawn a link actor and return a handle.
+    /// The actor thread owns the Link and processes all operations.
+    pub fn spawn(link: Link) -> Self {
+        let id = Arc::new(Mutex::new(link.link_id.clone()));
+        let token = Arc::new(());
+        let (tx, rx) = mpsc::channel();
+        let handle = LinkHandle {
+            tx: tx.clone(),
+            id: Arc::clone(&id),
+            token: Arc::clone(&token),
+        };
+        let self_handle = handle.clone();
+        thread::Builder::new()
+            .name(format!("link-actor-{}", crate::hexrep(&link.link_id, false)))
+            .spawn(move || {
+                link_actor(link, rx, self_handle);
+            })
+            .expect("Failed to spawn link actor thread");
+        handle
+    }
+
+    /// Build from an Arc<Mutex<Link>> — extracts the Link and spawns an actor.
+    pub fn from_arc(arc: Arc<Mutex<Link>>) -> Self {
+        let link = match Arc::try_unwrap(arc) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(arc) => arc.lock().map(|g| g.clone()).expect("link lock poisoned in from_arc"),
+        };
+        Self::spawn(link)
+    }
+
+    /// Build a handle, specifying the link_id explicitly (compatibility shim).
+    pub fn from_arc_with_id(arc: Arc<Mutex<Link>>, _id: Vec<u8>) -> Self {
+        Self::from_arc(arc)
+    }
+
+    /// Get the link_id. Returns a clone of the cached id.
+    pub fn link_id(&self) -> Vec<u8> {
+        self.id.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Read-only snapshot of link state.
+    pub fn snapshot(&self) -> Result<LinkSnapshot, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::Snapshot(tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Check if the link is currently active.
+    pub fn is_active(&self) -> bool {
+        let (tx, rx) = oneshot();
+        if self.tx.send(LinkMsg::IsActive(tx)).is_err() { return false; }
+        rx.recv().unwrap_or(false)
+    }
+
+    /// Check if the link is alive (not closed, not channel-dead).
+    pub fn is_alive(&self) -> bool {
+        let (tx, rx) = oneshot();
+        if self.tx.send(LinkMsg::IsAlive(tx)).is_err() { return false; }
+        rx.recv().unwrap_or(false)
+    }
+
+    /// Get the current link status byte.
+    pub fn status(&self) -> u8 {
+        let (tx, rx) = oneshot();
+        if self.tx.send(LinkMsg::Status(tx)).is_err() { return STATE_CLOSED; }
+        rx.recv().unwrap_or(STATE_CLOSED)
+    }
+
+    /// Check if two LinkHandles refer to the same underlying link.
+    pub fn same_link(&self, other: &LinkHandle) -> bool {
+        Arc::ptr_eq(&self.token, &other.token)
+    }
+
+    /// Encrypt plaintext using the link's session key.
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::Encrypt(plaintext.to_vec(), tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Decrypt ciphertext using the link's session key.
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::Decrypt(ciphertext.to_vec(), tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Send a request on this link.
+    pub fn request(
+        &self,
+        path: String,
+        data: Vec<u8>,
+        response_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        failed_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+        progress_callback: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>>,
+    ) -> Result<Vec<u8>, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::Request {
+            path,
+            data,
+            response_cb: response_callback,
+            failed_cb: failed_callback,
+            progress_cb: progress_callback,
+            reply: tx,
+        }).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Send a raw DATA packet on this link.
+    pub fn send_packet(&self, data: &[u8]) -> Result<(), LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::SendPacket(data.to_vec(), tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Tear down this link.
+    pub fn teardown(&self) {
+        let _ = self.tx.send(LinkMsg::Teardown);
+    }
+
+    /// Identify this link with the given identity.
+    pub fn identify(&self, identity: &Identity) -> Result<(), LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::Identify(identity.clone(), tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Initiate the link handshake (outbound links only).
+    /// Updates the cached link_id with the real value set by the handshake.
+    pub fn initiate(&self) -> Result<(), LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::Initiate(tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// How long since last data activity (seconds).
+    pub fn no_data_for(&self) -> Result<u64, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::NoDataFor(tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Get the remote identity if one has been identified.
+    pub fn remote_identity(&self) -> Result<Option<Identity>, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::RemoteIdentity(tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Get the destination hash of the link's destination.
+    pub fn destination_hash(&self) -> Result<Vec<u8>, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::DestinationHash(tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Clone the link's destination.
+    pub fn clone_destination(&self) -> Result<Destination, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::CloneDestination(tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    /// Build a link-type delivery destination from this link's state.
+    pub fn build_link_destination(&self) -> Result<Destination, LinkGone> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::BuildLinkDestination(tx)).map_err(|_| LinkGone)?;
+        rx.recv().map_err(|_| LinkGone)?
+    }
+
+    // -- Callback setup methods (fire-and-forget) --
+
+    pub fn set_link_established_callback(
+        &self,
+        callback: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
+    ) {
+        let _ = self.tx.send(LinkMsg::SetLinkEstablishedCallback(callback));
+    }
+
+    pub fn set_link_closed_callback(
+        &self,
+        callback: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
+    ) {
+        let _ = self.tx.send(LinkMsg::SetLinkClosedCallback(callback));
+    }
+
+    pub fn set_packet_callback(
+        &self,
+        callback: Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>,
+    ) {
+        let _ = self.tx.send(LinkMsg::SetPacketCallback(callback));
+    }
+
+    pub fn set_remote_identified_callback(
+        &self,
+        callback: Option<Arc<dyn Fn(LinkHandle, Identity) + Send + Sync>>,
+    ) {
+        let _ = self.tx.send(LinkMsg::SetRemoteIdentifiedCallback(callback));
+    }
+
+    pub fn set_resource_strategy(&self, strategy: u8) {
+        let _ = self.tx.send(LinkMsg::SetResourceStrategy(strategy));
+    }
+
+    pub fn set_resource_callbacks(
+        &self,
+        resource: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+        started: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+        concluded: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
+    ) {
+        let _ = self.tx.send(LinkMsg::SetResourceCallbacks { resource, started, concluded });
+    }
+
+    pub fn set_track_phy_stats(&self, track: bool) {
+        let _ = self.tx.send(LinkMsg::SetTrackPhyStats(track));
+    }
+
+    /// Cancel an incoming resource on this link.
+    pub fn cancel_incoming_resource(&self, resource: Arc<Mutex<Resource>>) {
+        let _ = self.tx.send(LinkMsg::CancelIncomingResource(resource));
+    }
+
+    /// Cancel an outgoing resource on this link.
+    pub fn cancel_outgoing_resource(&self, resource: Arc<Mutex<Resource>>) {
+        let _ = self.tx.send(LinkMsg::CancelOutgoingResource(resource));
+    }
+
+    /// Check if the link is ready for a new outgoing resource.
+    pub fn ready_for_new_resource(&self) -> bool {
+        let (tx, rx) = oneshot();
+        if self.tx.send(LinkMsg::ReadyForNewResource(tx)).is_err() { return false; }
+        rx.recv().unwrap_or(true)
+    }
+
+    /// Register an outgoing resource on the link.
+    pub fn register_outgoing_resource(&self, resource: Arc<Mutex<Resource>>) {
+        let _ = self.tx.send(LinkMsg::RegisterOutgoingResource(resource));
+    }
+
+    /// Register an incoming resource on the link.
+    pub fn register_incoming_resource(&self, resource: Arc<Mutex<Resource>>) {
+        let _ = self.tx.send(LinkMsg::RegisterIncomingResource(resource));
+    }
+
+    /// Conclude a resource transfer on this link.
+    pub fn resource_concluded(&self, resource: Arc<Mutex<Resource>>) -> Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>> {
+        let (tx, rx) = oneshot();
+        if self.tx.send(LinkMsg::ResourceConcluded(resource, tx)).is_err() { return None; }
+        rx.recv().ok().flatten()
+    }
+
+    /// Set the expected inflight rate on the link.
+    pub fn set_expected_rate(&self, rate: f64) {
+        let _ = self.tx.send(LinkMsg::SetExpectedRate(rate));
+    }
+
+    /// Get the last resource window size.
+    pub fn get_last_resource_window(&self) -> Option<usize> {
+        let (tx, rx) = oneshot();
+        if self.tx.send(LinkMsg::GetLastResourceWindow(tx)).is_err() { return None; }
+        rx.recv().ok().flatten()
+    }
+
+    /// Get the last resource EIFR.
+    pub fn get_last_resource_eifr(&self) -> Option<f64> {
+        let (tx, rx) = oneshot();
+        if self.tx.send(LinkMsg::GetLastResourceEifr(tx)).is_err() { return None; }
+        rx.recv().ok().flatten()
+    }
+
+    // --- Internal methods used by runtime functions ---
+
+    fn dispatch_receive(&self, packet: Packet) -> Option<ReceiveResult> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::Receive(packet, tx)).ok()?;
+        rx.recv().ok()
+    }
+
+    fn get_link_outbound_info(&self) -> Option<(Option<String>, bool)> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::GetLinkOutboundInfo(tx)).ok()?;
+        rx.recv().ok()
+    }
+
+    fn validate_proof(
+        &self,
+        proof: Vec<u8>,
+        receipt: crate::packet::PacketReceipt,
+    ) -> Option<(bool, crate::packet::PacketReceipt)> {
+        let (tx, rx) = oneshot();
+        self.tx.send(LinkMsg::ValidateProof { proof, receipt, reply: tx }).ok()?;
+        rx.recv().ok()
+    }
+}
+
+impl std::fmt::Debug for LinkHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkHandle")
+            .field("link_id", &crate::hexrep(&self.link_id(), false))
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Link actor loop
+// ---------------------------------------------------------------------------
+
+/// The actor loop — owns a `Link` and processes messages sequentially.
+/// Also performs watchdog duties (keepalive, stale detection, establishment timeout).
+fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHandle) {
+    const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+
+    // Give the Link a reference to its own handle for internal methods
+    link.self_handle = Some(self_handle.clone());
+
+    loop {
+        let msg = match rx.recv_timeout(WATCHDOG_INTERVAL) {
+            Ok(msg) => Some(msg),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        if link.state == STATE_CLOSED {
+            // Drain remaining messages briefly, then exit
+            if msg.is_none() { break; }
+        }
+
+        if let Some(msg) = msg {
+            match msg {
+                // --- Read operations ---
+                LinkMsg::Snapshot(reply) => {
+                    let _ = reply.send(Ok(LinkSnapshot {
+                        link_id: link.link_id.clone(),
+                        state: link.state,
+                        status: link.status,
+                        initiator: link.initiator,
+                        rtt: link.rtt,
+                        activated_at: link.activated_at,
+                        established_at: link.established_at,
+                        attached_interface: link.attached_interface.clone(),
+                        mtu: Some(link.mtu),
+                        traffic_timeout_factor: link.traffic_timeout_factor,
+                        rssi: link.rssi,
+                        snr: link.snr,
+                        q: link.q,
+                        track_phy_stats: link.track_phy_stats,
+                        request_time: link.request_time,
+                        establishment_cost: link.establishment_cost,
+                    }));
+                }
+                LinkMsg::Status(reply) => { let _ = reply.send(link.status); }
+                LinkMsg::IsActive(reply) => { let _ = reply.send(link.state == STATE_ACTIVE); }
+                LinkMsg::IsAlive(reply) => { let _ = reply.send(link.state != STATE_CLOSED); }
+                LinkMsg::NoDataFor(reply) => { let _ = reply.send(Ok(link.no_data_for())); }
+                LinkMsg::RemoteIdentity(reply) => {
+                    let ri = link.remote_identity.lock().ok().and_then(|r| r.clone());
+                    let _ = reply.send(Ok(ri));
+                }
+                LinkMsg::DestinationHash(reply) => {
+                    let result = link.destination.lock()
+                        .map(|d| d.hash.clone())
+                        .map_err(|_| LinkGone);
+                    let _ = reply.send(result);
+                }
+                LinkMsg::CloneDestination(reply) => {
+                    let result = link.destination.lock()
+                        .map(|d| d.clone())
+                        .map_err(|_| LinkGone);
+                    let _ = reply.send(result);
+                }
+                LinkMsg::BuildLinkDestination(reply) => {
+                    let result = link.destination.lock().map(|d| {
+                        let mut dest = d.clone();
+                        dest.dest_type = crate::destination::DestinationType::Link;
+                        dest.hash = link.link_id.clone();
+                        dest.hexhash = crate::hexrep(&dest.hash, false);
+                        dest.link = Some(crate::destination::LinkInfo {
+                            rtt: link.rtt,
+                            traffic_timeout_factor: link.traffic_timeout_factor,
+                            status_closed: false,
+                            mtu: Some(link.mtu),
+                            attached_interface: link.attached_interface.clone(),
+                        });
+                        dest
+                    }).map_err(|_| LinkGone);
+                    let _ = reply.send(result);
+                }
+                LinkMsg::GetLinkOutboundInfo(reply) => {
+                    let _ = reply.send((link.attached_interface.clone(), link.state == STATE_CLOSED));
+                }
+
+                // --- Crypto operations ---
+                LinkMsg::Encrypt(plaintext, reply) => {
+                    let result = if link.state != STATE_ACTIVE && link.state != STATE_STALE {
+                        Err(LinkGone)
+                    } else {
+                        link.encrypt(&plaintext).map_err(|_| LinkGone)
+                    };
+                    let _ = reply.send(result);
+                }
+                LinkMsg::Decrypt(ciphertext, reply) => {
+                    let result = link.decrypt(&ciphertext).map_err(|_| LinkGone);
+                    let _ = reply.send(result);
+                }
+
+                // --- Mutating with response ---
+                LinkMsg::Request { path, data, response_cb, failed_cb, progress_cb, reply } => {
+                    let result = link.request(path, data, response_cb, failed_cb, progress_cb)
+                        .map_err(|_| LinkGone);
+                    let _ = reply.send(result);
+                }
+                LinkMsg::SendPacket(data, reply) => {
+                    let result = link.send_packet(&data).map_err(|_| LinkGone);
+                    let _ = reply.send(result);
+                }
+                LinkMsg::Identify(identity, reply) => {
+                    let result = link.identify(&identity).map_err(|_| LinkGone);
+                    let _ = reply.send(result);
+                }
+                LinkMsg::Initiate(reply) => {
+                    match link.initiate() {
+                        Ok(()) => {
+                            // Update the shared cached id
+                            let new_id = link.link_id.clone();
+                            if let Ok(mut id) = self_handle.id.lock() {
+                                *id = new_id;
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(_) => { let _ = reply.send(Err(LinkGone)); }
+                    }
+                }
+
+                // --- Resource operations ---
+                LinkMsg::ReadyForNewResource(reply) => {
+                    let _ = reply.send(link.ready_for_new_resource());
+                }
+                LinkMsg::RegisterOutgoingResource(resource) => {
+                    link.register_outgoing_resource(resource);
+                }
+                LinkMsg::RegisterIncomingResource(resource) => {
+                    link.register_incoming_resource(resource);
+                }
+                LinkMsg::ResourceConcluded(resource, reply) => {
+                    let cb = link.resource_concluded(resource);
+                    let _ = reply.send(cb);
+                }
+                LinkMsg::CancelOutgoingResource(resource) => {
+                    link.cancel_outgoing_resource(resource);
+                }
+                LinkMsg::CancelIncomingResource(resource) => {
+                    link.cancel_incoming_resource(resource);
+                }
+                LinkMsg::SetExpectedRate(rate) => {
+                    link.set_expected_rate(rate);
+                }
+                LinkMsg::GetLastResourceWindow(reply) => {
+                    let _ = reply.send(link.get_last_resource_window());
+                }
+                LinkMsg::GetLastResourceEifr(reply) => {
+                    let _ = reply.send(link.get_last_resource_eifr());
+                }
+
+                // --- Fire-and-forget ---
+                LinkMsg::Teardown => {
+                    link.teardown();
+                    // Actor exits after teardown — link_closed callback fires inside teardown
+                    break;
+                }
+                LinkMsg::SetLinkEstablishedCallback(cb) => {
+                    link.callbacks.link_established = cb;
+                }
+                LinkMsg::SetLinkClosedCallback(cb) => {
+                    link.callbacks.link_closed = cb;
+                }
+                LinkMsg::SetPacketCallback(cb) => {
+                    link.set_packet_callback(cb);
+                }
+                LinkMsg::SetRemoteIdentifiedCallback(cb) => {
+                    link.callbacks.remote_identified = cb;
+                }
+                LinkMsg::SetResourceStrategy(strategy) => {
+                    link.resource_strategy = strategy;
+                }
+                LinkMsg::SetResourceCallbacks { resource, started, concluded } => {
+                    link.callbacks.resource = resource;
+                    link.callbacks.resource_started = started;
+                    link.callbacks.resource_concluded = concluded;
+                }
+                LinkMsg::SetTrackPhyStats(track) => {
+                    link.track_phy_stats = track;
+                }
+
+                // --- Internal: packet dispatch ---
+                LinkMsg::Receive(packet, reply) => {
+                    let was_pending = link.state != STATE_ACTIVE;
+                    let handled = link.receive(&packet).is_ok();
+                    let now_active = link.state == STATE_ACTIVE;
+
+                    // Fire link_established callback synchronously on actor thread.
+                    // FIFO channel ordering ensures any SetPacketCallback sent by the
+                    // callback is processed before the next Receive message.
+                    if was_pending && now_active {
+                        if let Some(cb) = link.callbacks.link_established.take() {
+                            cb(self_handle.clone());
+                        }
+                    }
+
+                    // Fire remote_identified callback on a dedicated thread.
+                    if link.pending_remote_identified {
+                        link.pending_remote_identified = false;
+                        if let Some(cb) = link.callbacks.remote_identified.clone() {
+                            let identity = link.remote_identity.lock().ok().and_then(|r| r.clone());
+                            if let Some(identity) = identity {
+                                let h = self_handle.clone();
+                                thread::spawn(move || cb(h, identity));
+                            }
+                        }
+                    }
+
+                    let _ = reply.send(ReceiveResult { handled });
+                }
+                LinkMsg::ValidateProof { proof, mut receipt, reply } => {
+                    let valid = receipt.validate_link_proof(&proof, &link);
+                    let _ = reply.send((valid, receipt));
+                }
             }
         }
-        // Start link watchdog (establishment timeout, keepalive, stale detection)
-        start_link_watchdog(Arc::clone(&link));
+
+        // --- Watchdog: runs on every timeout AND after every message ---
+        if link.state == STATE_CLOSED {
+            break;
+        }
+        if !link.watchdog_lock {
+            actor_watchdog_tick(&mut link, &self_handle);
+        }
+
+        // Request timeout checks
+        actor_check_request_timeouts(&mut link);
     }
+}
+
+/// Watchdog logic extracted for the actor loop.
+fn actor_watchdog_tick(link: &mut Link, _self_handle: &LinkHandle) {
+    let now = current_time().unwrap_or(0);
+
+    match link.state {
+        STATE_PENDING | STATE_HANDSHAKE => {
+            if let Some(request_time) = link.request_time {
+                if now_seconds() >= request_time + link.establishment_timeout {
+                    let state_name = if link.state == STATE_PENDING { "PENDING" } else { "HANDSHAKE" };
+                    crate::log(&format!("Link establishment timed out ({}): {}", state_name, crate::hexrep(&link.link_id, false)), crate::LOG_DEBUG, false, false);
+                    link.teardown_reason = REASON_TIMEOUT;
+                    link.teardown();
+                }
+            }
+        }
+        STATE_ACTIVE => {
+            let activated_at = link.activated_at.unwrap_or(0);
+            let last_inbound = link.last_inbound
+                .max(link.last_proof)
+                .max(activated_at);
+            let keepalive_secs = link.keepalive as u64;
+
+            if now >= last_inbound + keepalive_secs {
+                // Send keepalive if due
+                if link.initiator && now >= link.last_keepalive + keepalive_secs {
+                    if let Some((dest, _link_id)) = link.prepare_keepalive() {
+                        let mut keepalive_packet = Packet::new(
+                            Some(dest),
+                            vec![0xFF],
+                            DATA,
+                            crate::packet::KEEPALIVE,
+                            crate::transport::BROADCAST,
+                            packet::HEADER_1,
+                            None,
+                            None,
+                            false,
+                            0,
+                        );
+                        let _ = keepalive_packet.send();
+                    }
+                }
+
+                let stale_secs = link.stale_time as u64;
+                if now >= last_inbound + stale_secs {
+                    let rtt_grace = link.rtt.unwrap_or(0.0)
+                        * link.keepalive_timeout_factor
+                        + STALE_GRACE;
+                    link.state = STATE_STALE;
+                    link.status = STATE_STALE;
+                    link.stale_since = Some(now);
+                    link.stale_grace = rtt_grace;
+                }
+            }
+        }
+        STATE_STALE => {
+            let stale_at = link.stale_since.unwrap_or(0);
+            let grace_secs = link.stale_grace as u64;
+            if now >= stale_at + grace_secs.max(1) {
+                crate::log(&format!("Link timeout, tearing down {}", crate::hexrep(&link.link_id, false)), crate::LOG_DEBUG, false, false);
+                link.teardown();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Request timeout checks — replaces the old request_timeout_watchdog thread.
+fn actor_check_request_timeouts(link: &mut Link) {
+    let now = now_seconds();
+    let mut timed_out = Vec::new();
+    if let Ok(mut pending) = link.pending_requests.lock() {
+        pending.retain(|req| {
+            if now >= req.sent_at + req.timeout {
+                timed_out.push(req.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+    for timed_out_req in timed_out {
+        if let Some(callback) = timed_out_req.failed_callback {
+            let receipt = RequestReceipt {
+                request_id: timed_out_req.request_id.clone(),
+                response: None,
+                link: Arc::new(Mutex::new(link.clone())),
+                sent_at: timed_out_req.sent_at,
+                received_at: None,
+                progress: 0.0,
+            };
+            thread::spawn(move || {
+                callback(receipt);
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime link registry
+// ---------------------------------------------------------------------------
+
+static RUNTIME_LINKS: Lazy<Mutex<HashMap<Vec<u8>, LinkHandle>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Register a link handle in the global registry.
+/// The actor thread is already running (spawned in LinkHandle::spawn),
+/// so no separate watchdog thread is needed.
+pub fn register_runtime_link_handle(handle: LinkHandle) {
+    let link_id = handle.link_id();
+    let link_id_hex = crate::hexrep(&link_id, false);
+    if let Ok(mut links) = RUNTIME_LINKS.lock() {
+        crate::log(&format!("RUNTIME register link={} total={}", link_id_hex, links.len() + 1), crate::LOG_NOTICE, false, false);
+        links.insert(link_id, handle);
+    }
+}
+
+/// Legacy entry point: wraps an Arc<Mutex<Link>> in a LinkHandle and registers it.
+pub fn register_runtime_link(link: Arc<Mutex<Link>>) {
+    let handle = LinkHandle::from_arc(link);
+    register_runtime_link_handle(handle);
 }
 
 pub fn unregister_runtime_link(link_id: &[u8]) {
@@ -56,28 +839,25 @@ pub fn unregister_runtime_link(link_id: &[u8]) {
         let removed = links.remove(link_id).is_some();
         crate::log(&format!("RUNTIME unregister link={} removed={} remaining={}", crate::hexrep(link_id, false), removed, links.len()), crate::LOG_NOTICE, false, false);
     }
-    // Remove strong reference from INCOMING_LINK_ARCS using the stored link_id,
-    // WITHOUT locking the Arc. Locking the Arc here would deadlock when teardown
-    // is called from dispatch_runtime_packet while link_guard is held.
-    if let Ok(mut arcs) = INCOMING_LINK_ARCS.lock() {
-        let before = arcs.len();
-        arcs.retain(|(id, _arc)| id != link_id);
-        if arcs.len() < before {
-            crate::log(&format!("INCOMING_LINK_ARCS cleaned link={} remaining={}", crate::hexrep(link_id, false), arcs.len()), crate::LOG_DEBUG, false, false);
-        }
-    }
+}
+
+/// Look up a LinkHandle by link_id. Returns a clone of the handle.
+pub fn get_runtime_link_handle(link_id: &[u8]) -> Option<LinkHandle> {
+    let links = RUNTIME_LINKS.lock().ok()?;
+    links.get(link_id).cloned()
 }
 
 /// Returns (attached_interface, is_closed) for a link by its link_id.
-/// Used by Transport::outbound to filter link packets to only the correct interface,
-/// matching Python's `packet.destination.attached_interface` check.
+/// Used by Transport::outbound to filter link packets to only the correct interface.
 pub fn get_link_outbound_info(link_id: &[u8]) -> Option<(Option<String>, bool)> {
     let links = RUNTIME_LINKS.lock().ok()?;
-    let link = links.get(link_id)?.upgrade()?;
-    let link_guard = link.lock().ok()?;
-    Some((link_guard.attached_interface.clone(), link_guard.state == STATE_CLOSED))
+    let handle = links.get(link_id)?;
+    handle.get_link_outbound_info()
 }
 
+/// Dispatch a received packet to the link actor via channel message.
+/// The actor fires callbacks (link_established, remote_identified) internally
+/// and processes everything in FIFO order — no lock-based races.
 pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
     let destination_hash = match packet.destination_hash.as_ref() {
         Some(hash) => hash.clone(),
@@ -85,89 +865,41 @@ pub fn dispatch_runtime_packet(packet: &Packet) -> bool {
     };
     crate::log(&format!("[LINK-DISPATCH] packet type={} ctx={} dst={}", packet.packet_type, packet.context, crate::hexrep(&destination_hash, false)), crate::LOG_DEBUG, false, false);
 
-    let link = {
-        let mut links = match RUNTIME_LINKS.lock() {
+    let handle = {
+        let links = match RUNTIME_LINKS.lock() {
             Ok(links) => links,
             Err(_) => return false,
         };
 
-        match links.get(&destination_hash).and_then(|w| w.upgrade()) {
-            Some(link) => link,
-            None => {
-                links.remove(&destination_hash);
-                return false;
-            }
+        match links.get(&destination_hash) {
+            Some(handle) => handle.clone(),
+            None => return false,
         }
     };
 
-    let (handled, should_fire_link_established, should_fire_remote_identified) = if let Ok(mut link_guard) = link.lock() {
-        let was_pending = link_guard.state != STATE_ACTIVE;
-        let ok = link_guard.receive(packet).is_ok();
-        let now_active = link_guard.state == STATE_ACTIVE;
-        let fire = was_pending && now_active && !link_guard.initiator && link_guard.callbacks.link_established.is_some();
-        let fire_remote = link_guard.pending_remote_identified;
-        if fire_remote { link_guard.pending_remote_identified = false; }
-        (ok, fire, fire_remote)
-    } else {
-        (false, false, false)
-    };
-
-    // Fire link_established callback OUTSIDE the lock on a dedicated thread
-    // so the TCP read thread returns immediately. The callback (e.g. LXMF
-    // delivery_link_established) may acquire heavy locks like the router mutex.
-    if should_fire_link_established {
-        if let Ok(mut link_guard) = link.lock() {
-            if let Some(callback) = link_guard.callbacks.link_established.take() {
-                drop(link_guard);
-                let link_clone = Arc::clone(&link);
-                std::thread::spawn(move || {
-                    callback(link_clone);
-                });
-            }
-        }
+    match handle.dispatch_receive(packet.clone()) {
+        Some(result) => result.handled,
+        None => false,
     }
-
-    // Fire remote_identified callback OUTSIDE the lock on a dedicated thread,
-    // passing the ORIGINAL Arc so backchannel_links stores the same Arc as
-    // RUNTIME_LINKS (not a clone).
-    if should_fire_remote_identified {
-        if let Ok(link_guard) = link.lock() {
-            let identity = link_guard.remote_identity.lock().ok().and_then(|r| r.clone());
-            let callback = link_guard.callbacks.remote_identified.clone();
-            drop(link_guard);
-            if let (Some(identity), Some(callback)) = (identity, callback) {
-                let link_clone = Arc::clone(&link);
-                std::thread::spawn(move || {
-                    callback(link_clone, identity);
-                });
-            }
-        }
-    }
-
-    handled
 }
 
 pub fn runtime_encrypt_for_destination(destination_hash: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let link = {
-        let mut links = RUNTIME_LINKS
+    let handle = {
+        let links = RUNTIME_LINKS
             .lock()
             .map_err(|_| "Runtime link registry lock poisoned".to_string())?;
 
-        match links.get(destination_hash).and_then(|w| w.upgrade()) {
-            Some(link) => link,
+        match links.get(destination_hash) {
+            Some(handle) => handle.clone(),
             None => {
                 let known: Vec<String> = links.keys().map(|k| crate::hexrep(k, false)).collect();
                 crate::log(&format!("RUNTIME encrypt FAILED: no link for {} known=[{}]", crate::hexrep(destination_hash, false), known.join(", ")), crate::LOG_ERROR, false, false);
-                links.remove(destination_hash);
                 return Err("No runtime link found for destination".to_string());
             }
         }
     };
 
-    let link_guard = link
-        .lock()
-        .map_err(|_| "Runtime link lock poisoned".to_string())?;
-    link_guard.encrypt(plaintext)
+    handle.encrypt(plaintext).map_err(|_| "Link gone (actor dead)".to_string())
 }
 
 pub fn validate_runtime_proof_for_receipt(
@@ -175,8 +907,8 @@ pub fn validate_runtime_proof_for_receipt(
     proof: &[u8],
     receipt: &mut crate::packet::PacketReceipt,
 ) -> bool {
-    let link = {
-        let mut links = match RUNTIME_LINKS.lock() {
+    let handle = {
+        let links = match RUNTIME_LINKS.lock() {
             Ok(links) => links,
             Err(_) => {
                 crate::log("validate_runtime_proof: RUNTIME_LINKS lock poisoned", crate::LOG_ERROR, false, false);
@@ -184,58 +916,47 @@ pub fn validate_runtime_proof_for_receipt(
             }
         };
 
-        match links.get(destination_hash).and_then(|w| w.upgrade()) {
-            Some(link) => link,
+        match links.get(destination_hash) {
+            Some(handle) => handle.clone(),
             None => {
                 crate::log(&format!("validate_runtime_proof: no link for {}",
                     crate::hexrep(destination_hash, false)), crate::LOG_DEBUG, false, false);
-                links.remove(destination_hash);
                 return false;
             }
         }
     };
 
-    let proof_hash_hex = if proof.len() >= 32 {
-        crate::hexrep(&proof[..32], false)
-    } else {
-        format!("<short:{}>" , proof.len())
-    };
-
-    let validated = if let Ok(link_guard) = link.lock() {
-        let result = receipt.validate_link_proof(proof, &link_guard);
-        if result {
-            crate::log(&format!("validate_runtime_proof: MATCH proof_hash={} receipt_hash={} link={}",
-                proof_hash_hex, crate::hexrep(&receipt.hash, false),
-                crate::hexrep(&link_guard.link_id, false)), crate::LOG_NOTICE, false, false);
+    // Clone receipt, send to actor for validation, write back the mutated copy
+    let receipt_clone = receipt.clone();
+    match handle.validate_proof(proof.to_vec(), receipt_clone) {
+        Some((valid, updated_receipt)) => {
+            if valid {
+                *receipt = updated_receipt;
+            }
+            valid
         }
-        result
-    } else {
-        crate::log("validate_runtime_proof: link lock failed", crate::LOG_ERROR, false, false);
-        false
-    };
-
-    validated
+        None => {
+            crate::log("validate_runtime_proof: actor dead", crate::LOG_ERROR, false, false);
+            false
+        }
+    }
 }
 
 pub fn runtime_decrypt_for_destination(destination_hash: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-    let link = {
-        let mut links = RUNTIME_LINKS
+    let handle = {
+        let links = RUNTIME_LINKS
             .lock()
             .map_err(|_| "Runtime link registry lock poisoned".to_string())?;
 
-        match links.get(destination_hash).and_then(|w| w.upgrade()) {
-            Some(link) => link,
+        match links.get(destination_hash) {
+            Some(handle) => handle.clone(),
             None => {
-                links.remove(destination_hash);
                 return Err("No runtime link found for destination".to_string());
             }
         }
     };
 
-    let link_guard = link
-        .lock()
-        .map_err(|_| "Runtime link lock poisoned".to_string())?;
-    link_guard.decrypt(ciphertext)
+    handle.decrypt(ciphertext).map_err(|_| "Link gone (actor dead)".to_string())
 }
 
 // Link state constants
@@ -365,13 +1086,13 @@ pub fn link_id_from_lr_packet(packet: &Packet) -> Vec<u8> {
 /// Callbacks for link lifecycle events
 #[derive(Clone, Default)]
 pub struct LinkCallbacks {
-    pub link_established: Option<Arc<dyn Fn(Arc<Mutex<Link>>) + Send + Sync>>,
-    pub link_closed: Option<Arc<dyn Fn(Arc<Mutex<Link>>) + Send + Sync>>,
+    pub link_established: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
+    pub link_closed: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
     pub packet: Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>,
     pub resource: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
     pub resource_started: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
     pub resource_concluded: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
-    pub remote_identified: Option<Arc<dyn Fn(Arc<Mutex<Link>>, Identity) + Send + Sync>>,
+    pub remote_identified: Option<Arc<dyn Fn(LinkHandle, Identity) + Send + Sync>>,
 }
 
 /// Python RNS wire format for a REQUEST packet payload:
@@ -400,219 +1121,9 @@ impl RequestReceipt {
     }
 }
 
-/// Background thread that monitors pending requests for timeouts
-fn request_timeout_watchdog(
-    pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
-    link: Arc<Mutex<Link>>,
-) {
-    loop {
-        thread::sleep(Duration::from_millis((REQUEST_TIMEOUT_CHECK_INTERVAL * 1000.0) as u64));
-        
-        let mut timed_out_requests = Vec::new();
-        
-        // Check for timed out requests
-        {
-            let pending = match pending_requests.lock() {
-                Ok(p) => p,
-                Err(_) => break, // Exit if lock is poisoned
-            };
-            
-            // If no pending requests, exit the watchdog thread
-            if pending.is_empty() {
-                break;
-            }
-            
-            let now = now_seconds();
-            for request in pending.iter() {
-                if now > request.sent_at + request.timeout {
-                    timed_out_requests.push(request.clone());
-                }
-            }
-        }
-        
-        // Process timed out requests
-        if !timed_out_requests.is_empty() {
-            let mut pending = match pending_requests.lock() {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-            
-            for timed_out in timed_out_requests {
-                // Remove from pending list
-                pending.retain(|r| r.request_id != timed_out.request_id);
-                
-                // Call failed callback
-                if let Some(callback) = timed_out.failed_callback {
-                    // Create receipt for callback
-                    let receipt = RequestReceipt {
-                        request_id: timed_out.request_id.clone(),
-                        response: None,
-                        link: Arc::clone(&link),
-                        sent_at: timed_out.sent_at,
-                        received_at: None,
-                        progress: 0.0,
-                    };
-                    
-                    // Spawn thread to avoid blocking the watchdog
-                    thread::spawn(move || {
-                        callback(receipt);
-                    });
-                }
-            }
-        }
-    }
-}
-
-/// Link watchdog thread — monitors link state and sends keepalives.
-/// Matches Python's __watchdog_job.
-pub fn start_link_watchdog(link: Arc<Mutex<Link>>) {
-    let link_weak = Arc::downgrade(&link);
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(1));
-
-            let link_arc = match link_weak.upgrade() {
-                Some(l) => l,
-                None => break, // Link dropped
-            };
-
-            // Determine what action to take while holding the lock briefly
-            enum WatchdogAction {
-                Continue,
-                Exit,
-                SendKeepalive(Destination, Vec<u8>),
-                Teardown,
-            }
-
-            let action = {
-                let mut link_guard = match link_arc.lock() {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-
-                if link_guard.state == STATE_CLOSED {
-                    break;
-                }
-
-                if link_guard.watchdog_lock {
-                    WatchdogAction::Continue
-                } else {
-                    match link_guard.state {
-                        STATE_PENDING | STATE_HANDSHAKE => {
-                            if let Some(request_time) = link_guard.request_time {
-                                if now_seconds() >= request_time + link_guard.establishment_timeout {
-                                    let state_name = if link_guard.state == STATE_PENDING { "PENDING" } else { "HANDSHAKE" };
-                                    crate::log(&format!("Link establishment timed out ({}): {}", state_name, crate::hexrep(&link_guard.link_id, false)), crate::LOG_DEBUG, false, false);
-                                    link_guard.teardown_reason = REASON_TIMEOUT;
-                                    WatchdogAction::Teardown
-                                } else {
-                                    WatchdogAction::Continue
-                                }
-                            } else {
-                                WatchdogAction::Continue
-                            }
-                        }
-                        STATE_ACTIVE => {
-                            let activated_at = link_guard.activated_at.unwrap_or(0);
-                            let last_inbound = link_guard.last_inbound
-                                .max(link_guard.last_proof)
-                                .max(activated_at);
-                            let now = current_time().unwrap_or(0);
-                            let keepalive_secs = link_guard.keepalive as u64;
-
-                            if now >= last_inbound + keepalive_secs {
-                                // Match Python: send keepalive BEFORE the stale
-                                // check — the keepalive and stale transitions are
-                                // independent.  The keepalive gives the remote peer
-                                // one last chance to respond before we go stale.
-                                let mut send_keepalive = false;
-                                if link_guard.initiator && now >= link_guard.last_keepalive + keepalive_secs {
-                                    send_keepalive = true;
-                                }
-
-                                let stale_secs = link_guard.stale_time as u64;
-                                if now >= last_inbound + stale_secs {
-                                    // Transition to STALE.  Match Python: the grace
-                                    // period is rtt * KEEPALIVE_TIMEOUT_FACTOR +
-                                    // STALE_GRACE, giving the keepalive response
-                                    // time to arrive before we tear down.
-                                    let rtt_grace = link_guard.rtt.unwrap_or(0.0)
-                                        * link_guard.keepalive_timeout_factor
-                                        + STALE_GRACE;
-                                    link_guard.state = STATE_STALE;
-                                    link_guard.status = STATE_STALE;
-                                    link_guard.stale_since = Some(now);
-                                    link_guard.stale_grace = rtt_grace;
-                                    // Still send the keepalive if due — it's our
-                                    // last chance to get a response.
-                                    if send_keepalive {
-                                        if let Some(info) = link_guard.prepare_keepalive() {
-                                            WatchdogAction::SendKeepalive(info.0, info.1)
-                                        } else {
-                                            WatchdogAction::Continue
-                                        }
-                                    } else {
-                                        WatchdogAction::Continue
-                                    }
-                                } else if send_keepalive {
-                                    if let Some(info) = link_guard.prepare_keepalive() {
-                                        WatchdogAction::SendKeepalive(info.0, info.1)
-                                    } else {
-                                        WatchdogAction::Continue
-                                    }
-                                } else {
-                                    WatchdogAction::Continue
-                                }
-                            } else {
-                                WatchdogAction::Continue
-                            }
-                        }
-                        STATE_STALE => {
-                            // Match Python: tear down once the RTT-based grace
-                            // period has elapsed.
-                            let now = current_time().unwrap_or(0);
-                            let stale_at = link_guard.stale_since.unwrap_or(0);
-                            let grace_secs = link_guard.stale_grace as u64;
-                            if now >= stale_at + grace_secs.max(1) {
-                                WatchdogAction::Teardown
-                            } else {
-                                WatchdogAction::Continue
-                            }
-                        }
-                        _ => WatchdogAction::Continue,
-                    }
-                }
-            };
-
-            match action {
-                WatchdogAction::Exit => break,
-                WatchdogAction::SendKeepalive(dest, _link_id) => {
-                    let mut keepalive_packet = Packet::new(
-                        Some(dest),
-                        vec![0xFF],
-                        DATA,
-                        crate::packet::KEEPALIVE,
-                        crate::transport::BROADCAST,
-                        packet::HEADER_1,
-                        None,
-                        None,
-                        false,
-                        0,
-                    );
-                    let _ = keepalive_packet.send();
-                }
-                WatchdogAction::Teardown => {
-                    if let Ok(mut link_guard) = link_arc.lock() {
-                        crate::log(&format!("Link timeout, tearing down {}", crate::hexrep(&link_guard.link_id, false)), crate::LOG_DEBUG, false, false);
-                        link_guard.teardown();
-                    }
-                    break;
-                }
-                WatchdogAction::Continue => {}
-            }
-        }
-    });
-}
+// Old request_timeout_watchdog and start_link_watchdog removed —
+// both are now handled by the actor loop (actor_check_request_timeouts
+// and actor_watchdog_tick).
 
 #[derive(Clone)]
 struct PendingRequest {
@@ -712,6 +1223,17 @@ pub struct Link {
     
     // Channel support
     pub channel: Option<()>, // Placeholder for Channel integration
+
+    /// Inbound DATA packets (plaintext + original packet) that arrived before
+    /// `callbacks.packet` was set (e.g. between link activation and
+    /// `delivery_link_established`).  Drained when `set_packet_callback` wires
+    /// the handler.
+    pub early_packets: Vec<(Vec<u8>, Packet)>,
+    
+    /// Handle to this link's actor — set by the actor loop.
+    /// Used by internal methods (teardown, handle_data_packet) that need
+    /// to provide a LinkHandle to callbacks or Resource::accept().
+    pub self_handle: Option<LinkHandle>,
 }
 
 impl Clone for Link {
@@ -775,6 +1297,8 @@ impl Clone for Link {
             track_phy_stats: self.track_phy_stats,
             pending_remote_identified: false,
             channel: self.channel.clone(),
+            early_packets: Vec::new(),
+            self_handle: self.self_handle.clone(),
         }
     }
 }
@@ -859,8 +1383,8 @@ impl Link {
         crate::transport::Transport::register_link(link.clone());
 
         // Also register as runtime link so dispatch_runtime_packet can find it
-        let link_arc = Arc::new(Mutex::new(link.clone()));
-        register_runtime_link(Arc::clone(&link_arc));
+        let handle = LinkHandle::spawn(link.clone());
+        register_runtime_link_handle(handle);
 
 
         Ok(link)
@@ -1006,6 +1530,8 @@ impl Link {
             track_phy_stats: false,
             pending_remote_identified: false,
             channel: None,
+            early_packets: Vec::new(),
+            self_handle: None,
         })
     }
     
@@ -1073,6 +1599,8 @@ impl Link {
             track_phy_stats: false,
             pending_remote_identified: false,
             channel: None,
+            early_packets: Vec::new(),
+            self_handle: None,
         })
     }
     
@@ -1516,7 +2044,7 @@ impl Link {
     /// Set link established callback
     pub fn set_link_established_callback(
         &mut self,
-        callback: Option<Arc<dyn Fn(Arc<Mutex<Link>>) + Send + Sync>>,
+        callback: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
     ) {
         self.callbacks.link_established = callback;
     }
@@ -1524,14 +2052,36 @@ impl Link {
     /// Set link closed callback
     pub fn set_link_closed_callback(
         &mut self,
-        callback: Option<Arc<dyn Fn(Arc<Mutex<Link>>) + Send + Sync>>,
+        callback: Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>,
     ) {
         self.callbacks.link_closed = callback;
     }
     
-    /// Set packet received callback
+    /// Set packet received callback.
+    /// If any DATA packets arrived before the callback was set, they are
+    /// proved and dispatched now (draining the early_packets queue).
     pub fn set_packet_callback(&mut self, callback: Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>) {
         self.callbacks.packet = callback;
+
+        // Drain early-arrival queue
+        if self.callbacks.packet.is_some() && !self.early_packets.is_empty() {
+            let queued: Vec<(Vec<u8>, Packet)> = std::mem::take(&mut self.early_packets);
+            crate::log(&format!("[LINK] draining {} early packet(s) on link={}",
+                queued.len(), crate::hexrep(&self.link_id, false)),
+                crate::LOG_NOTICE, false, false);
+            for (plaintext, packet) in &queued {
+                let _ = self.prove_packet(packet);
+            }
+            // Fire callbacks outside the tight loop so prove_packet
+            // results are already on the wire.
+            let cb = self.callbacks.packet.as_ref().unwrap().clone();
+            for (plaintext, packet) in queued {
+                let cb2 = cb.clone();
+                std::thread::spawn(move || {
+                    cb2(&plaintext, &packet);
+                });
+            }
+        }
     }
     
     /// Set resource callback
@@ -1558,7 +2108,7 @@ impl Link {
     /// Set remote identified callback
     pub fn set_remote_identified_callback(
         &mut self,
-        callback: Option<Arc<dyn Fn(Arc<Mutex<Link>>, Identity) + Send + Sync>>,
+        callback: Option<Arc<dyn Fn(LinkHandle, Identity) + Send + Sync>>,
     ) {
         self.callbacks.remote_identified = callback;
     }
@@ -1736,7 +2286,12 @@ impl Link {
         }
         
         if let Some(callback) = &self.callbacks.link_closed {
-            callback(Arc::new(Mutex::new(self.clone())));
+            // Use the actor's own handle, or try the registry.
+            let handle = self.self_handle.clone()
+                .or_else(|| get_runtime_link_handle(&self.link_id));
+            if let Some(handle) = handle {
+                callback(handle);
+            }
         }
     }
     
@@ -1857,7 +2412,7 @@ impl Link {
             if is_req {
                 if let Some(resource) = Resource::accept(
                     &advertisement_packet,
-                    Arc::new(Mutex::new(self.clone())),
+                    self.self_handle.as_ref().unwrap().clone(),
                     self.callbacks.resource_concluded.clone(),
                     None,
                     crate::resource::ResourceAdvertisement::read_request_id(&advertisement_packet),
@@ -1961,7 +2516,7 @@ impl Link {
 
                 if let Some(resource) = Resource::accept(
                     &advertisement_packet,
-                    Arc::new(Mutex::new(self.clone())),
+                    self.self_handle.as_ref().unwrap().clone(),
                     concluded_callback,
                     None,
                     request_id_opt,
@@ -1977,7 +2532,7 @@ impl Link {
                 ACCEPT_APP => {
                     if let Some(resource) = Resource::accept(
                         &advertisement_packet,
-                        Arc::new(Mutex::new(self.clone())),
+                        self.self_handle.as_ref().unwrap().clone(),
                         self.callbacks.resource_concluded.clone(),
                         None,
                         None,
@@ -1994,7 +2549,7 @@ impl Link {
                 ACCEPT_ALL => {
                     if let Some(resource) = Resource::accept(
                         &advertisement_packet,
-                        Arc::new(Mutex::new(self.clone())),
+                        self.self_handle.as_ref().unwrap().clone(),
                         self.callbacks.resource_concluded.clone(),
                         None,
                         None,
@@ -2219,6 +2774,14 @@ impl Link {
             std::thread::spawn(move || {
                 cb(&pt, &pkt);
             });
+        } else {
+            // Callback not yet wired (link_established hasn't fired).
+            // Queue the packet so it can be replayed once the callback
+            // is set via set_packet_callback.
+            crate::log(&format!("[LINK] queuing early packet ({} bytes) on link={}",
+                plaintext.len(), crate::hexrep(&self.link_id, false)),
+                crate::LOG_NOTICE, false, false);
+            self.early_packets.push((plaintext.clone(), packet.clone()));
         }
         
         Ok(())
@@ -2588,15 +3151,8 @@ impl Link {
 
         let mut pending = self.pending_requests.lock().map_err(|_| "Pending request lock poisoned")?;
         
-        // Spawn timeout watchdog thread if this is the first request
-        if pending.is_empty() {
-            let pending_requests = Arc::clone(&self.pending_requests);
-            let link = Arc::new(Mutex::new(self.clone()));
-            
-            thread::spawn(move || {
-                request_timeout_watchdog(pending_requests, link);
-            });
-        }
+        // Request timeout checking is now handled by the actor loop
+        // (actor_check_request_timeouts).
         
         pending.push(PendingRequest {
             request_id: request_id.clone(),
@@ -2790,13 +3346,11 @@ impl Link {
             self.had_outbound(false);
         }
 
-        if let Some(callback) = &self.callbacks.link_established {
-            let callback = Arc::clone(callback);
-            let link_clone = Arc::new(Mutex::new(self.clone()));
-            thread::spawn(move || {
-                callback(link_clone);
-            });
-        }
+        // NOTE: We do NOT fire the link_established callback here because
+        // dispatch_runtime_packet now fires it for BOTH initiator and
+        // non-initiator when it detects the state transition to ACTIVE.
+        // This eliminates the disconnected-clone bug where a new
+        // Arc::new(Mutex::new(self.clone())) was passed to the callback.
 
         Ok(())
     }
@@ -3106,8 +3660,7 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// Build a minimal incoming Link with a unique link_id. `initiator=false`
-    /// causes `register_runtime_link` to store a strong ref in INCOMING_LINK_ARCS.
+    /// Build a minimal incoming Link with a unique link_id. `initiator=false`.
     fn make_incoming_link(link_id: Vec<u8>) -> Link {
         let dest = crate::destination::Destination::default();
         let mut link = Link::new_inbound(dest).expect("new_inbound");
@@ -3118,14 +3671,6 @@ mod tests {
 
     /// Regression test: `unregister_runtime_link` must not deadlock when called
     /// while the caller already holds the link's Mutex.
-    ///
-    /// This reproduces the exact scenario from `dispatch_runtime_packet`:
-    ///   1. Lock the link Arc<Mutex<Link>> (simulating dispatch holding link_guard)
-    ///   2. Call `unregister_runtime_link` from within that lock
-    ///
-    /// Before the fix, the old `retain()` closure called `arc.lock()` on the same
-    /// Arc, causing a non-reentrant Mutex deadlock that permanently blocked the
-    /// TCP read-loop thread and prevented any subsequent frames from being read.
     #[test]
     fn unregister_runtime_link_no_deadlock_while_holding_link_mutex() {
         let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(13)).collect();
@@ -3134,42 +3679,32 @@ mod tests {
 
         register_runtime_link(Arc::clone(&link_arc));
 
-        // Spawn a thread that holds the link mutex while calling unregister —
-        // this is the same sequence as dispatch_runtime_packet → teardown().
         let (tx, rx) = mpsc::channel::<()>();
         let link_arc_clone = Arc::clone(&link_arc);
         let link_id_clone = link_id.clone();
         std::thread::spawn(move || {
-            // Hold the link mutex (simulating link_guard in dispatch_runtime_packet)
             let _guard = link_arc_clone.lock().unwrap();
-            // Call unregister while the mutex is held — must not deadlock.
             unregister_runtime_link(&link_id_clone);
             let _ = tx.send(());
         });
 
-        // Allow up to 2 seconds; a deadlock would never send on the channel.
         rx.recv_timeout(std::time::Duration::from_secs(2))
             .expect("unregister_runtime_link deadlocked while link mutex was held");
     }
 
     /// After `register_runtime_link` + `unregister_runtime_link`, the entry must
-    /// be absent from both RUNTIME_LINKS and INCOMING_LINK_ARCS.
+    /// be absent from RUNTIME_LINKS.
     #[test]
-    fn unregister_runtime_link_removes_from_both_stores() {
+    fn unregister_runtime_link_removes_from_registry() {
         let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(17)).collect();
         let link = make_incoming_link(link_id.clone());
         let link_arc = Arc::new(Mutex::new(link));
 
         register_runtime_link(Arc::clone(&link_arc));
 
-        // Verify both stores have the entry.
         assert!(
             RUNTIME_LINKS.lock().unwrap().contains_key(&link_id),
             "RUNTIME_LINKS should contain the link after register"
-        );
-        assert!(
-            INCOMING_LINK_ARCS.lock().unwrap().iter().any(|(id, _)| id == &link_id),
-            "INCOMING_LINK_ARCS should contain the link after register"
         );
 
         unregister_runtime_link(&link_id);
@@ -3178,17 +3713,11 @@ mod tests {
             !RUNTIME_LINKS.lock().unwrap().contains_key(&link_id),
             "RUNTIME_LINKS should not contain the link after unregister"
         );
-        assert!(
-            !INCOMING_LINK_ARCS.lock().unwrap().iter().any(|(id, _)| id == &link_id),
-            "INCOMING_LINK_ARCS should not contain the link after unregister"
-        );
     }
 
-    /// Outbound links (initiator=true) must NOT be inserted into INCOMING_LINK_ARCS,
-    /// since they don't need a strong-reference keeper (the initiator holds its
-    /// own Arc elsewhere).
+    /// Both inbound and outbound links should appear in RUNTIME_LINKS.
     #[test]
-    fn register_runtime_link_outbound_not_stored_in_incoming_arcs() {
+    fn register_runtime_link_outbound_stored_in_registry() {
         let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(19)).collect();
         let dest = crate::destination::Destination::default();
         let mut link = Link::new_inbound(dest).expect("new_inbound");
@@ -3198,14 +3727,26 @@ mod tests {
         let link_arc = Arc::new(Mutex::new(link));
         register_runtime_link(Arc::clone(&link_arc));
 
-        let in_arcs = INCOMING_LINK_ARCS.lock().unwrap().iter().any(|(id, _)| id == &link_id);
         let in_runtime = RUNTIME_LINKS.lock().unwrap().contains_key(&link_id);
 
-        // Clean up before asserting so a failed assert doesn't leave state.
         unregister_runtime_link(&link_id);
 
-        assert!(!in_arcs, "outbound link must not appear in INCOMING_LINK_ARCS");
         assert!(in_runtime, "outbound link must appear in RUNTIME_LINKS");
+    }
+
+    /// LinkHandle::snapshot returns correct state.
+    #[test]
+    fn link_handle_snapshot_basic() {
+        let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(23)).collect();
+        let mut link = make_incoming_link(link_id.clone());
+        link.state = STATE_ACTIVE;
+        link.rtt = Some(0.05);
+        let handle = LinkHandle::from_arc_with_id(Arc::new(Mutex::new(link)), link_id.clone());
+        let snap = handle.snapshot().expect("snapshot should succeed");
+        assert_eq!(snap.link_id, link_id);
+        assert_eq!(snap.state, STATE_ACTIVE);
+        assert!(handle.is_active());
+        assert!(handle.is_alive());
     }
 
     /// `prove_with_identity` must populate `link_destination.link` with a `LinkInfo`

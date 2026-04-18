@@ -30,7 +30,7 @@ pub enum ResourceStatus {
 
 pub struct Resource {
     pub status: ResourceStatus,
-    pub link: Arc<Mutex<crate::link::Link>>,
+    pub link: crate::link::LinkHandle,
     pub sdu: usize,
     pub size: usize,
     pub total_size: usize,
@@ -152,19 +152,7 @@ impl Resource {
     pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
 
     fn packet_destination(&self) -> Option<crate::destination::Destination> {
-        self.link
-            .lock()
-            .ok()
-            .and_then(|link| {
-                let link_id = link.link_id.clone();
-                link.destination.lock().ok().map(|destination| {
-                    let mut link_destination = destination.clone();
-                    link_destination.dest_type = crate::destination::DestinationType::Link;
-                    link_destination.hash = link_id;
-                    link_destination.hexhash = crate::hexrep(&link_destination.hash, false);
-                    link_destination
-                })
-            })
+        self.link.build_link_destination().ok()
     }
 
     pub fn reject(advertisement_packet: &Packet) {
@@ -190,7 +178,7 @@ impl Resource {
 
     pub fn accept(
         advertisement_packet: &Packet,
-        link: Arc<Mutex<crate::link::Link>>,
+        link: crate::link::LinkHandle,
         callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
         progress_callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
         request_id: Option<Vec<u8>>,
@@ -245,10 +233,8 @@ impl Resource {
         resource.receiving_part = false;
         resource.consecutive_completed_height = -1;
 
-        if let Ok(link) = resource.link.lock() {
-            resource.window = link.get_last_resource_window().unwrap_or(resource.window);
-            resource.previous_eifr = link.get_last_resource_eifr();
-        }
+        resource.window = resource.link.get_last_resource_window().unwrap_or(resource.window);
+        resource.previous_eifr = resource.link.get_last_resource_eifr();
 
         let resource = Arc::new(Mutex::new(resource));
 
@@ -300,7 +286,7 @@ impl Resource {
 
     pub fn new_internal(
         data: Option<ResourceData>,
-        link: Arc<Mutex<crate::link::Link>>,
+        link: crate::link::LinkHandle,
         metadata: Option<Vec<u8>>,
         advertise: bool,
         auto_compress: AutoCompressOption,
@@ -398,7 +384,7 @@ impl Resource {
 
         // Set SDU from link MTU BEFORE prepare_data, so total_parts is
         // calculated with the same SDU that prepare_outgoing will use.
-        let link_mtu = resource.link.lock().ok().and_then(|l| l.mtu());
+        let link_mtu = resource.link.snapshot().ok().and_then(|s| s.mtu);
         if let Some(mtu) = link_mtu {
             resource.sdu = mtu.saturating_sub(reticulum::HEADER_MAXSIZE + reticulum::IFAC_MIN_SIZE);
         } else {
@@ -411,7 +397,7 @@ impl Resource {
         resource.max_retries = Resource::MAX_RETRIES;
         resource.max_adv_retries = Resource::MAX_ADV_RETRIES;
         resource.retries_left = resource.max_retries;
-        resource.timeout_factor = resource.link.lock().ok().and_then(|l| l.traffic_timeout_factor()).unwrap_or(Resource::PART_TIMEOUT_FACTOR);
+        resource.timeout_factor = resource.link.snapshot().ok().map(|s| s.traffic_timeout_factor).unwrap_or(Resource::PART_TIMEOUT_FACTOR);
         resource.part_timeout_factor = Resource::PART_TIMEOUT_FACTOR;
         resource.sender_grace_time = Resource::SENDER_GRACE_TIME;
         resource.hmu_retry_ok = false;
@@ -427,7 +413,12 @@ impl Resource {
         resource.very_slow_rate_rounds = 0;
         resource.receiver_min_consecutive_height = 0;
 
-        resource.timeout = timeout.unwrap_or_else(|| resource.link.lock().ok().and_then(|l| l.rtt()).unwrap_or(0.0) * resource.link.lock().ok().and_then(|l| l.traffic_timeout_factor()).unwrap_or(1.0));
+        resource.timeout = timeout.unwrap_or_else(|| {
+            let snap = resource.link.snapshot().ok();
+            let rtt = snap.as_ref().and_then(|s| s.rtt).unwrap_or(0.0);
+            let ttf = snap.as_ref().map(|s| s.traffic_timeout_factor).unwrap_or(1.0);
+            rtt * ttf
+        });
 
         if resource.data.is_some() {
             resource.initiator = true;
@@ -569,7 +560,7 @@ impl Resource {
 
             let mut data_with_random = self.random_hash.clone();
             data_with_random.extend_from_slice(&payload);
-            self.data = Some(self.link.lock().unwrap().encrypt(&data_with_random).unwrap_or(data_with_random));
+            self.data = Some(self.link.encrypt(&data_with_random).unwrap_or(data_with_random));
             self.encrypted = true;
 
             self.size = self.data.as_ref().unwrap().len();
@@ -701,7 +692,7 @@ impl Resource {
             loop {
                 let ready = {
                     if let Ok(r) = arc_for_adv.lock() {
-                        r.link.lock().map(|l| l.ready_for_new_resource()).unwrap_or(false)
+                        r.link.ready_for_new_resource()
                     } else {
                         return;
                     }
@@ -756,7 +747,7 @@ impl Resource {
 
             // Register the SAME Arc with the link (not a clone)
             if let Ok(r) = arc_for_adv.lock() {
-                r.link.lock().unwrap().register_outgoing_resource(arc_for_adv.clone());
+                r.link.register_outgoing_resource(arc_for_adv.clone());
             }
 
             // Start watchdog on the SAME Arc
@@ -765,7 +756,7 @@ impl Resource {
     }
 
     fn advertise_job(&mut self) {
-        while !self.link.lock().unwrap().ready_for_new_resource() {
+        while !self.link.ready_for_new_resource() {
             self.status = ResourceStatus::Queued;
             thread::sleep(Duration::from_millis(250));
         }
@@ -792,7 +783,7 @@ impl Resource {
             self.rtt = None;
             self.status = ResourceStatus::Advertised;
             self.retries_left = self.max_adv_retries;
-            self.link.lock().unwrap().register_outgoing_resource(Arc::new(Mutex::new(self.clone())));
+            self.link.register_outgoing_resource(Arc::new(Mutex::new(self.clone())));
         } else {
             self.cancel();
             return;
@@ -841,10 +832,9 @@ impl Resource {
                     }
 
                     // Check if the underlying link is still alive
-                    let link_dead = if let Ok(link_guard) = r.link.lock() {
-                        link_guard.state == crate::link::STATE_CLOSED || link_guard.state == crate::link::STATE_STALE
-                    } else {
-                        true
+                    let link_dead = {
+                        let status = r.link.status();
+                        status == crate::link::STATE_CLOSED || status == crate::link::STATE_STALE
                     };
                     if link_dead {
                         r.cancel();
@@ -1007,21 +997,20 @@ impl Resource {
     }
 
     pub fn update_eifr(&mut self) {
-        let rtt = self.rtt.unwrap_or_else(|| self.link.lock().ok().and_then(|l| l.rtt()).unwrap_or(0.0));
+        let snap = self.link.snapshot().ok();
+        let rtt = self.rtt.unwrap_or_else(|| snap.as_ref().and_then(|s| s.rtt).unwrap_or(0.0));
         let expected_inflight_rate = if self.req_data_rtt_rate != 0.0 {
             self.req_data_rtt_rate * 8.0
         } else if let Some(prev) = self.previous_eifr {
             prev
         } else if rtt > 0.0 {
-            (self.link.lock().ok().and_then(|l| l.establishment_cost()).unwrap_or(0.0) * 8.0) / rtt
+            (snap.as_ref().map(|s| s.establishment_cost as f64).unwrap_or(0.0) * 8.0) / rtt
         } else {
             0.0
         };
 
         self.eifr = Some(expected_inflight_rate);
-        if let Ok(mut link) = self.link.lock() {
-            link.set_expected_rate(expected_inflight_rate);
-        }
+        self.link.set_expected_rate(expected_inflight_rate);
     }
 
     /// Process HMU packet and update hashmap. Returns true if request_next
@@ -1356,7 +1345,7 @@ impl Resource {
                 let rtt = self.req_resp.unwrap() - self.req_sent;
                 self.part_timeout_factor = Resource::PART_TIMEOUT_FACTOR_AFTER_RTT;
                 if self.rtt.is_none() {
-                    self.rtt = self.link.lock().ok().and_then(|l| l.rtt());
+                    self.rtt = self.link.snapshot().ok().and_then(|s| s.rtt);
                     start_watchdog = true;
                 } else if let Some(current) = self.rtt {
                     if rtt < current {
@@ -1493,7 +1482,7 @@ impl Resource {
             }
 
             let mut data = if self.encrypted {
-                match self.link.lock().unwrap().decrypt(&stream) {
+                match self.link.decrypt(&stream) {
                     Ok(d) => d,
                     Err(_e) => stream
                 }
@@ -1574,7 +1563,7 @@ impl Resource {
             crate::log(&format!("Resource assembly concluded status={:?} data_len={}",
                 self.status, self.data.as_ref().map(|d| d.len()).unwrap_or(0)), crate::LOG_DEBUG, false, false);
             let resource_arc = Arc::new(Mutex::new(self.clone()));
-            let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
+            let concluded_cb = self.link.resource_concluded(resource_arc.clone());
             if let Some(cb) = &concluded_cb {
                 cb(resource_arc);
             } else {
@@ -1645,7 +1634,7 @@ impl Resource {
                     crate::log("[RESOURCE] proof MATCHED, setting Complete", crate::LOG_NOTICE, false, false);
                     self.status = ResourceStatus::Complete;
                     let resource_arc = Arc::new(Mutex::new(self.clone()));
-                    let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
+                    let concluded_cb = self.link.resource_concluded(resource_arc.clone());
                     if let Some(cb) = concluded_cb {
                         cb(resource_arc);
                     }
@@ -1695,7 +1684,7 @@ impl Resource {
         if (self.status as u8) < (ResourceStatus::Complete as u8) {
             self.status = ResourceStatus::Failed;
             if self.initiator {
-                if self.link.lock().unwrap().is_active() {
+                if self.link.is_active() {
                     let mut packet = Packet::new(
                         self.packet_destination(),
                         self.hash.clone(),
@@ -1710,14 +1699,14 @@ impl Resource {
                     );
                     let _ = packet.send();
                 }
-                self.link.lock().unwrap().cancel_outgoing_resource(Arc::new(Mutex::new(self.clone())));
+                self.link.cancel_outgoing_resource(Arc::new(Mutex::new(self.clone())));
             } else {
-                self.link.lock().unwrap().cancel_incoming_resource(Arc::new(Mutex::new(self.clone())));
+                self.link.cancel_incoming_resource(Arc::new(Mutex::new(self.clone())));
             }
 
             if let Some(cb) = &self.callback {
                 let resource_arc = Arc::new(Mutex::new(self.clone()));
-                let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
+                let concluded_cb = self.link.resource_concluded(resource_arc.clone());
                 if let Some(ccb) = concluded_cb {
                     ccb(resource_arc.clone());
                 }
@@ -1730,10 +1719,10 @@ impl Resource {
         if (self.status as u8) < (ResourceStatus::Complete as u8) {
             if self.initiator {
                 self.status = ResourceStatus::Rejected;
-                self.link.lock().unwrap().cancel_outgoing_resource(Arc::new(Mutex::new(self.clone())));
+                self.link.cancel_outgoing_resource(Arc::new(Mutex::new(self.clone())));
                 if let Some(cb) = &self.callback {
                     let resource_arc = Arc::new(Mutex::new(self.clone()));
-                    let concluded_cb = self.link.lock().unwrap().resource_concluded(resource_arc.clone());
+                    let concluded_cb = self.link.resource_concluded(resource_arc.clone());
                     if let Some(ccb) = concluded_cb {
                         ccb(resource_arc.clone());
                     }
