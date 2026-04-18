@@ -28,6 +28,21 @@ pub enum ResourceStatus {
     Rejected = 0x09,
 }
 
+/// Pre-fetched link state passed to `Resource::accept` / `new_internal` so
+/// they can avoid round-tripping through the link-actor channel.  When
+/// `accept` is called from the actor's own `receive()` handler, sending a
+/// `Snapshot` message would deadlock because the actor can't process its own
+/// reply while blocked.
+#[derive(Clone, Debug)]
+pub struct ResourceLinkContext {
+    pub mtu: usize,
+    pub rtt: Option<f64>,
+    pub traffic_timeout_factor: f64,
+    pub establishment_cost: usize,
+    pub last_resource_window: Option<usize>,
+    pub last_resource_eifr: Option<f64>,
+}
+
 pub struct Resource {
     pub status: ResourceStatus,
     pub link: crate::link::LinkHandle,
@@ -182,10 +197,11 @@ impl Resource {
         callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
         progress_callback: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>>,
         request_id: Option<Vec<u8>>,
+        link_ctx: Option<ResourceLinkContext>,
     ) -> Option<Arc<Mutex<Resource>>> {
         let plaintext = advertisement_packet.plaintext.as_ref()?;
         let adv = ResourceAdvertisement::unpack(plaintext).ok()?;
-        let mut resource = Resource::new_internal(None, link, None, true, AutoCompressOption::Enabled, callback, progress_callback, None, adv.i as usize, Some(adv.o.clone()), request_id, adv.p, 0).ok()?;
+        let mut resource = Resource::new_internal(None, link, None, true, AutoCompressOption::Enabled, callback, progress_callback, None, adv.i as usize, Some(adv.o.clone()), request_id, adv.p, 0, link_ctx.as_ref()).ok()?;
 
         resource.status = ResourceStatus::Transferring;
         resource.flags_from_adv(&adv);
@@ -233,8 +249,16 @@ impl Resource {
         resource.receiving_part = false;
         resource.consecutive_completed_height = -1;
 
-        resource.window = resource.link.get_last_resource_window().unwrap_or(resource.window);
-        resource.previous_eifr = resource.link.get_last_resource_eifr();
+        resource.window = if let Some(ctx) = link_ctx.as_ref() {
+            ctx.last_resource_window.unwrap_or(resource.window)
+        } else {
+            resource.link.get_last_resource_window().unwrap_or(resource.window)
+        };
+        resource.previous_eifr = if let Some(ctx) = link_ctx.as_ref() {
+            ctx.last_resource_eifr
+        } else {
+            resource.link.get_last_resource_eifr()
+        };
 
         let resource = Arc::new(Mutex::new(resource));
 
@@ -298,6 +322,7 @@ impl Resource {
         request_id: Option<Vec<u8>>,
         is_response: bool,
         sent_metadata_size: usize,
+        link_ctx: Option<&ResourceLinkContext>,
     ) -> Result<Resource, String> {
         let mut resource = Resource {
             status: ResourceStatus::None,
@@ -384,7 +409,10 @@ impl Resource {
 
         // Set SDU from link MTU BEFORE prepare_data, so total_parts is
         // calculated with the same SDU that prepare_outgoing will use.
-        let link_mtu = resource.link.snapshot().ok().and_then(|s| s.mtu);
+        // Use pre-fetched link_ctx when available to avoid deadlocking the
+        // link actor (accept() is called from within the actor's receive()).
+        let link_mtu = link_ctx.map(|c| Some(c.mtu))
+            .unwrap_or_else(|| resource.link.snapshot().ok().and_then(|s| s.mtu));
         if let Some(mtu) = link_mtu {
             resource.sdu = mtu.saturating_sub(reticulum::HEADER_MAXSIZE + reticulum::IFAC_MIN_SIZE);
         } else {
@@ -397,7 +425,9 @@ impl Resource {
         resource.max_retries = Resource::MAX_RETRIES;
         resource.max_adv_retries = Resource::MAX_ADV_RETRIES;
         resource.retries_left = resource.max_retries;
-        resource.timeout_factor = resource.link.snapshot().ok().map(|s| s.traffic_timeout_factor).unwrap_or(Resource::PART_TIMEOUT_FACTOR);
+        resource.timeout_factor = link_ctx.map(|c| c.traffic_timeout_factor)
+            .or_else(|| resource.link.snapshot().ok().map(|s| s.traffic_timeout_factor))
+            .unwrap_or(Resource::PART_TIMEOUT_FACTOR);
         resource.part_timeout_factor = Resource::PART_TIMEOUT_FACTOR;
         resource.sender_grace_time = Resource::SENDER_GRACE_TIME;
         resource.hmu_retry_ok = false;
@@ -414,10 +444,15 @@ impl Resource {
         resource.receiver_min_consecutive_height = 0;
 
         resource.timeout = timeout.unwrap_or_else(|| {
-            let snap = resource.link.snapshot().ok();
-            let rtt = snap.as_ref().and_then(|s| s.rtt).unwrap_or(0.0);
-            let ttf = snap.as_ref().map(|s| s.traffic_timeout_factor).unwrap_or(1.0);
-            rtt * ttf
+            if let Some(ctx) = link_ctx {
+                let rtt = ctx.rtt.unwrap_or(0.0);
+                rtt * ctx.traffic_timeout_factor
+            } else {
+                let snap = resource.link.snapshot().ok();
+                let rtt = snap.as_ref().and_then(|s| s.rtt).unwrap_or(0.0);
+                let ttf = snap.as_ref().map(|s| s.traffic_timeout_factor).unwrap_or(1.0);
+                rtt * ttf
+            }
         });
 
         if resource.data.is_some() {
@@ -648,9 +683,13 @@ impl Resource {
 
     pub fn advertise(&mut self) {
         let resource = Arc::new(Mutex::new(self.clone()));
+        // Clone the Arc so both the locking closure and advertise_job receive
+        // the SAME allocation (advertise_job registers it with the link and
+        // starts the watchdog, avoiding the stale-clone problem).
+        let arc_for_job = resource.clone();
         thread::spawn(move || {
             if let Ok(mut r) = resource.lock() {
-                r.advertise_job();
+                r.advertise_job(arc_for_job);
             }
         });
 
@@ -755,7 +794,13 @@ impl Resource {
         });
     }
 
-    fn advertise_job(&mut self) {
+    /// Drive advertisement on the background thread.
+    ///
+    /// `self_arc` must be the `Arc<Mutex<Self>>` that wraps `self` so that the
+    /// same allocation is registered with the link and handed to the watchdog.
+    /// This avoids the stale-clone problem where the link and watchdog would
+    /// track a disconnected copy that never sees state updates.
+    fn advertise_job(&mut self, self_arc: Arc<Mutex<Self>>) {
         while !self.link.ready_for_new_resource() {
             self.status = ResourceStatus::Queued;
             thread::sleep(Duration::from_millis(250));
@@ -783,13 +828,16 @@ impl Resource {
             self.rtt = None;
             self.status = ResourceStatus::Advertised;
             self.retries_left = self.max_adv_retries;
-            self.link.register_outgoing_resource(Arc::new(Mutex::new(self.clone())));
+            // Register the same Arc (not a new clone) so the link and watchdog
+            // always see up-to-date state.
+            self.link.register_outgoing_resource(self_arc.clone());
         } else {
             self.cancel();
             return;
         }
 
-        self.watchdog_job();
+        // Start watchdog on the same Arc.
+        Resource::start_watchdog(self_arc);
     }
 
     pub fn watchdog_job(&mut self) {
@@ -884,7 +932,9 @@ impl Resource {
                             if !r.initiator {
                                 let retries_used = r.max_retries - r.retries_left;
                                 let extra_wait = retries_used as f64 * Resource::PER_RETRY_DELAY;
-                                r.update_eifr();
+                                // Watchdog runs on its own thread (not the actor), so passing
+                                // None is safe — snapshot() will not deadlock here.
+                                r.update_eifr(None);
                                 let expected_tof_remaining = (r.outstanding_parts as f64 * r.sdu as f64 * 8.0) / r.eifr.unwrap_or(1.0);
 
                                 let st = if r.req_resp_rtt_rate != 0.0 {
@@ -996,15 +1046,27 @@ impl Resource {
         });
     }
 
-    pub fn update_eifr(&mut self) {
-        let snap = self.link.snapshot().ok();
-        let rtt = self.rtt.unwrap_or_else(|| snap.as_ref().and_then(|s| s.rtt).unwrap_or(0.0));
+    /// Update the expected inflight rate.
+    ///
+    /// `link_ctx` must be supplied when called from the actor thread (e.g. from
+    /// `receive_part`) to avoid a `snapshot()` round-trip that would deadlock
+    /// the actor.  Pass `None` from external threads (e.g. the watchdog) where
+    /// a blocking `snapshot()` is safe.
+    pub fn update_eifr(&mut self, link_ctx: Option<&ResourceLinkContext>) {
+        // When a pre-fetched context is available use it directly; otherwise
+        // call snapshot() which is safe only from non-actor threads.
+        let snap = if link_ctx.is_none() { self.link.snapshot().ok() } else { None };
+        let ctx_rtt  = link_ctx.and_then(|c| c.rtt);
+        let snap_rtt = snap.as_ref().and_then(|s| s.rtt);
+        let rtt = self.rtt.unwrap_or_else(|| ctx_rtt.or(snap_rtt).unwrap_or(0.0));
+        let ctx_cost  = link_ctx.map(|c| c.establishment_cost as f64);
+        let snap_cost = snap.as_ref().map(|s| s.establishment_cost as f64);
         let expected_inflight_rate = if self.req_data_rtt_rate != 0.0 {
             self.req_data_rtt_rate * 8.0
         } else if let Some(prev) = self.previous_eifr {
             prev
         } else if rtt > 0.0 {
-            (snap.as_ref().map(|s| s.establishment_cost as f64).unwrap_or(0.0) * 8.0) / rtt
+            (ctx_cost.or(snap_cost).unwrap_or(0.0) * 8.0) / rtt
         } else {
             0.0
         };
@@ -1329,7 +1391,11 @@ impl Resource {
     /// Returns (needs_request_next, needs_start_watchdog) so caller can defer
     /// these operations to a background thread (they require link encryption
     /// which would deadlock if called while the link lock is held).
-    pub fn receive_part(&mut self, packet: &Packet) -> (bool, bool) {
+    ///
+    /// `link_ctx` must be a pre-fetched snapshot of link state.  It is used
+    /// instead of calling `self.link.snapshot()` (which would deadlock when
+    /// this method is called from the actor thread).
+    pub fn receive_part(&mut self, packet: &Packet, link_ctx: &ResourceLinkContext) -> (bool, bool) {
         let mut start_watchdog = false;
         let mut call_update_eifr = false;
         let mut call_request_next = false;
@@ -1345,7 +1411,10 @@ impl Resource {
                 let rtt = self.req_resp.unwrap() - self.req_sent;
                 self.part_timeout_factor = Resource::PART_TIMEOUT_FACTOR_AFTER_RTT;
                 if self.rtt.is_none() {
-                    self.rtt = self.link.snapshot().ok().and_then(|s| s.rtt);
+                    // Use the pre-fetched link context instead of snapshot() to
+                    // avoid deadlocking the actor (receive_part is called from
+                    // handle_data_packet which runs on the actor thread).
+                    self.rtt = link_ctx.rtt;
                     start_watchdog = true;
                 } else if let Some(current) = self.rtt {
                     if rtt < current {
@@ -1460,9 +1529,10 @@ impl Resource {
             }
         }
 
-        // update_eifr is safe to call inline (no network I/O)
+        // update_eifr is called with the pre-fetched link context so it does
+        // not call snapshot() and thus does not deadlock the actor thread.
         if call_update_eifr {
-            self.update_eifr();
+            self.update_eifr(Some(link_ctx));
         }
         // Return flags so caller can defer these to a background thread
         // (they require link encryption which deadlocks if the link lock is held)
@@ -1833,6 +1903,7 @@ impl Resource {
             self.request_id.clone(),
             self.is_response,
             self.metadata_size,
+            None,
         );
         if let Ok(next) = next {
             self.next_segment = Some(Arc::new(Mutex::new(next)));

@@ -98,6 +98,15 @@ pub struct LinkHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Actor-thread guard — catches reply-awaited calls made from the actor thread
+// in debug builds.  Zero overhead in release builds.
+// ---------------------------------------------------------------------------
+
+std::thread_local! {
+    static ACTOR_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// ---------------------------------------------------------------------------
 // LinkMsg — messages sent from LinkHandle to the link actor thread
 // ---------------------------------------------------------------------------
 
@@ -170,6 +179,13 @@ enum LinkMsg {
         receipt: crate::packet::PacketReceipt,
         reply: Reply<(bool, crate::packet::PacketReceipt)>,
     },
+    /// Fire-and-forget: send a request response (msgpack-encoded `response`
+    /// bytes paired with `request_id`) back to the remote peer.
+    /// Used by the background thread that runs the request handler callback.
+    SendResponse {
+        request_id: Vec<u8>,
+        response: Vec<u8>,
+    },
 }
 
 /// Result from a Receive message — tells the dispatcher what happened.
@@ -224,6 +240,11 @@ impl LinkHandle {
 
     /// Read-only snapshot of link state.
     pub fn snapshot(&self) -> Result<LinkSnapshot, LinkGone> {
+        debug_assert!(
+            !ACTOR_THREAD.with(|f| f.get()),
+            "snapshot() called from the actor thread — this will deadlock! \
+             Use resource_link_context() or read link fields directly."
+        );
         let (tx, rx) = oneshot();
         self.tx.send(LinkMsg::Snapshot(tx)).map_err(|_| LinkGone)?;
         rx.recv().map_err(|_| LinkGone)?
@@ -432,6 +453,13 @@ impl LinkHandle {
         let _ = self.tx.send(LinkMsg::SetExpectedRate(rate));
     }
 
+    /// Send a pre-computed request response back to the remote peer.
+    /// Called from the background thread that runs a request handler callback
+    /// so the response is sent after the actor finishes processing `Receive`.
+    pub fn send_response(&self, request_id: Vec<u8>, response: Vec<u8>) {
+        let _ = self.tx.send(LinkMsg::SendResponse { request_id, response });
+    }
+
     /// Get the last resource window size.
     pub fn get_last_resource_window(&self) -> Option<usize> {
         let (tx, rx) = oneshot();
@@ -487,6 +515,10 @@ impl std::fmt::Debug for LinkHandle {
 /// Also performs watchdog duties (keepalive, stale detection, establishment timeout).
 fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHandle) {
     const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+
+    // Mark this thread as the actor thread so debug builds can catch any
+    // reply-awaited LinkMsg sent from within actor callbacks.
+    ACTOR_THREAD.with(|f| f.set(true));
 
     // Give the Link a reference to its own handle for internal methods
     link.self_handle = Some(self_handle.clone());
@@ -713,6 +745,12 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                 LinkMsg::ValidateProof { proof, mut receipt, reply } => {
                     let valid = receipt.validate_link_proof(&proof, &link);
                     let _ = reply.send((valid, receipt));
+                }
+
+                // Fire-and-forget: send a request response assembled by the
+                // background thread that ran the request handler callback.
+                LinkMsg::SendResponse { request_id, response } => {
+                    let _ = link.send_request_response(&request_id, &response);
                 }
             }
         }
@@ -1255,6 +1293,22 @@ pub struct Link {
     /// Used by internal methods (teardown, handle_data_packet) that need
     /// to provide a LinkHandle to callbacks or Resource::accept().
     pub self_handle: Option<LinkHandle>,
+}
+
+impl Link {
+    /// Build a `ResourceLinkContext` snapshot directly from this `Link`'s
+    /// fields.  Used when the actor calls `Resource::accept` inside its own
+    /// `receive()` handler — going through the channel would deadlock.
+    pub fn resource_link_context(&self) -> crate::resource::ResourceLinkContext {
+        crate::resource::ResourceLinkContext {
+            mtu: self.mtu,
+            rtt: self.rtt,
+            traffic_timeout_factor: self.traffic_timeout_factor,
+            establishment_cost: self.establishment_cost,
+            last_resource_window: self.last_resource_window,
+            last_resource_eifr: self.last_resource_eifr,
+        }
+    }
 }
 
 impl Clone for Link {
@@ -2356,11 +2410,14 @@ impl Link {
             crate::hexrep(&self.link_id, false)), crate::LOG_NOTICE, false, false);
 
         if packet.context == crate::packet::RESOURCE {
+            // Pre-fetch link state so receive_part can update resource RTT without
+            // calling self.link.snapshot() (which would deadlock the actor).
+            let link_ctx = self.resource_link_context();
             let mut deferred_actions: Vec<(Arc<Mutex<Resource>>, bool, bool)> = Vec::new();
             if let Ok(resources) = self.incoming_resources.lock() {
                 for resource in resources.iter() {
                     if let Ok(mut resource_guard) = resource.lock() {
-                        let (needs_request_next, needs_start_watchdog) = resource_guard.receive_part(packet);
+                        let (needs_request_next, needs_start_watchdog) = resource_guard.receive_part(packet, &link_ctx);
                         if needs_request_next || needs_start_watchdog {
                             deferred_actions.push((resource.clone(), needs_request_next, needs_start_watchdog));
                         }
@@ -2432,12 +2489,14 @@ impl Link {
                 is_req, is_resp), crate::LOG_NOTICE, false, false);
 
             if is_req {
+                let link_ctx = self.resource_link_context();
                 if let Some(resource) = Resource::accept(
                     &advertisement_packet,
                     self.self_handle.as_ref().unwrap().clone(),
                     self.callbacks.resource_concluded.clone(),
                     None,
                     crate::resource::ResourceAdvertisement::read_request_id(&advertisement_packet),
+                    Some(link_ctx),
                 ) {
                     // Register on real link so RESOURCE data packets find it
                     self.register_incoming_resource(resource);
@@ -2542,6 +2601,7 @@ impl Link {
                     concluded_callback,
                     None,
                     request_id_opt,
+                    Some(self.resource_link_context()),
                 ) {
                     self.register_incoming_resource(resource);
                 }
@@ -2552,17 +2612,22 @@ impl Link {
                 ACCEPT_NONE => {
                 }
                 ACCEPT_APP => {
+                    let link_ctx = self.resource_link_context();
                     if let Some(resource) = Resource::accept(
                         &advertisement_packet,
                         self.self_handle.as_ref().unwrap().clone(),
                         self.callbacks.resource_concluded.clone(),
                         None,
                         None,
+                        Some(link_ctx),
                     ) {
                         // Register on real link so RESOURCE data packets find it
                         self.register_incoming_resource(resource.clone());
-                        if let Some(callback) = &self.callbacks.resource {
-                            callback(resource);
+                        // Spawn callback off the actor thread so the user's handler
+                        // can freely call LinkHandle methods (snapshot, send_packet,
+                        // etc.) without deadlocking the actor on its own queue.
+                        if let Some(callback) = self.callbacks.resource.clone() {
+                            std::thread::spawn(move || callback(resource));
                         }
                     } else {
                         Resource::reject(&advertisement_packet);
@@ -2575,6 +2640,7 @@ impl Link {
                         self.callbacks.resource_concluded.clone(),
                         None,
                         None,
+                        Some(self.resource_link_context()),
                     ) {
                         self.register_incoming_resource(resource);
                     }
@@ -2900,9 +2966,23 @@ impl Link {
             h
         };
 
-        let response = if let Some(handler) = handler {
-            let remote_identity_guard = self.remote_identity.lock().ok();
-            let remote_identity_ref = remote_identity_guard.as_ref().and_then(|guard| guard.as_ref());
+        // Determine response: run the `allowed` check on the actor thread (it only
+        // reads remote_identity which is already locked), then either:
+        // - Spawn a background thread to run the callback (so the callback can freely
+        //   call LinkHandle methods without deadlocking the actor).  The thread sends
+        //   `LinkMsg::SendResponse` when done.
+        // - Send an empty response inline for the !allowed / no-callback cases (those
+        //   paths only call self.encrypt() and Transport::dispatch_outbound, both of
+        //   which are safe on the actor thread).
+        if let Some(handler) = handler {
+            // Clone the identity up-front so the MutexGuard is dropped before we
+            // call send_request_response (&mut self), which avoids the
+            // immutable-then-mutable borrow conflict on self.remote_identity.
+            let remote_identity_owned: Option<crate::identity::Identity> = {
+                let guard = self.remote_identity.lock().ok();
+                guard.as_ref().and_then(|g| g.as_ref()).cloned()
+            };
+            let remote_identity_ref = remote_identity_owned.as_ref();
             let allowed = match handler.allow_policy {
                 crate::destination::ALLOW_NONE => false,
                 crate::destination::ALLOW_ALL => true,
@@ -2922,23 +3002,46 @@ impl Link {
 
             if !allowed {
                 crate::log(&format!("[REQ] request denied for path '{}' (not allowed)", handler.path), crate::LOG_NOTICE, false, false);
-                Vec::new()
+                return self.send_request_response(&request_id, &[]);
             } else if let Some(callback) = handler.callback {
+                // Spawn callback on a background thread so it can freely call
+                // LinkHandle methods (snapshot, send_packet, request, etc.) without
+                // deadlocking the actor on its own channel.
+                let link_handle = self.self_handle.as_ref().unwrap().clone();
                 let path_hex = crate::hexrep(&path_hash, false);
-                callback(
-                    &path_hex,
-                    &request_data,
-                    &request_id,
-                    remote_identity_ref,
-                    timestamp,
-                )
+                let request_id_c = request_id.clone();
+                let request_data_c = request_data.clone();
+                // Clone the identity so the spawned thread owns it (avoids
+                // lifetime issues with `remote_identity_guard`).
+                let remote_identity_owned: Option<crate::identity::Identity> =
+                    remote_identity_ref.cloned();
+                std::thread::spawn(move || {
+                    let identity_ref = remote_identity_owned.as_ref();
+                    let response = callback(
+                        &path_hex,
+                        &request_data_c,
+                        &request_id_c,
+                        identity_ref,
+                        timestamp,
+                    );
+                    // send_response enqueues LinkMsg::SendResponse; the actor
+                    // processes it after it has finished handling `Receive`.
+                    link_handle.send_response(request_id_c, response);
+                });
+                return Ok(()); // response sent asynchronously from the spawned thread
             } else {
-                Vec::new()
+                return self.send_request_response(&request_id, &[]);
             }
-        } else {
-            Vec::new()
-        };
+        }
+        // No handler registered — send empty response.
+        self.send_request_response(&request_id, &[])
+    }
 
+    /// Build and send the msgpack-encoded response for a request.
+    ///
+    /// This is safe to call from the actor thread because it uses `self.encrypt()`
+    /// (direct field access, no channel round-trip) and `Transport::dispatch_outbound`.
+    fn send_request_response(&mut self, request_id: &[u8], response: &[u8]) -> Result<(), String> {
         // Python RNS response wire format: msgpack array [request_id_bytes, response_value]
         // CRITICAL: The response must be encoded as [Binary(request_id), <native_msgpack_value>]
         // where the response value is embedded as its native msgpack type (array, int, nil, etc.)
