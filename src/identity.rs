@@ -115,13 +115,6 @@ impl Token {
         mac.update(signed_parts);
         let computed_hmac = mac.finalize().into_bytes();
 
-        crate::log(&format!("[TOKEN-DECRYPT] signing_key={} received_hmac={} computed_hmac={} signed_parts_len={}",
-            crate::hexrep(&self.signing_key, false),
-            crate::hexrep(received_hmac, false),
-            crate::hexrep(&computed_hmac, false),
-            signed_parts.len(),
-        ), crate::LOG_NOTICE, false, false);
-
         if computed_hmac.as_slice() != received_hmac {
             return Err("Token HMAC was invalid".to_string());
         }
