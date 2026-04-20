@@ -182,6 +182,14 @@ pub fn identity_hash(handle: u64) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "identity has no hash (no keys loaded)".to_string())
 }
 
+/// Sign `data` with the identity's Ed25519 signing key.
+/// Returns 64-byte signature.
+pub fn identity_sign(handle: u64, data: &[u8]) -> Result<Vec<u8>, String> {
+    let id: Identity =
+        get_handle(handle).ok_or_else(|| "invalid identity handle".to_string())?;
+    Ok(id.sign(data))
+}
+
 /// Destroy an identity handle.
 pub fn identity_destroy(handle: u64) -> Result<(), String> {
     if destroy_handle(handle) {
@@ -512,8 +520,7 @@ pub fn destination_destroy(dest_handle: u64) -> bool {
 // Link-based request (synchronous one-shot)
 // ---------------------------------------------------------------------------
 
-/// Open a Link to a remote destination, identify with a local identity,
-/// send a request on a named path, wait for the response, tear down the
+/// Open a Link to a remote destination, send a request on a named path, wait for the response, tear down the
 /// link, and return the raw response bytes.
 ///
 /// This is a blocking call — callers should invoke it from a background
@@ -522,7 +529,7 @@ pub fn destination_destroy(dest_handle: u64) -> bool {
 /// * `dest_hash`  — 16-byte truncated RNS hash of the remote destination.
 /// * `app_name`   — RNS app name, e.g. `"rfed"`.
 /// * `aspects`    — aspect list, e.g. `vec!["notify"]`.
-/// * `identity_handle` — handle to the local identity used for `identify()`.
+/// * `identity_handle` — handle to the local identity (used to authorise the link with the server, if needed).
 /// * `path`       — request path, e.g. `"/rfed/notify/register"`.
 /// * `payload`    — request payload bytes.
 /// * `timeout_secs` — seconds to wait for establishment and for the response.
@@ -557,12 +564,9 @@ pub fn link_request(
     // Set callbacks and initiate the link handshake.
     {
         let est = Arc::clone(&established);
-        let id = our_identity.clone();
 
-        link_handle.set_link_established_callback(Some(Arc::new(move |handle: crate::link::LinkHandle| {
+        link_handle.set_link_established_callback(Some(Arc::new(move |_handle: crate::link::LinkHandle| {
             est.store(true, Ordering::SeqCst);
-            // Identify once established.
-            let _ = handle.identify(&id);
         })));
 
         let fail = Arc::clone(&est_failed);
