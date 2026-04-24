@@ -159,7 +159,7 @@ enum LinkMsg {
     GetLastResourceEifr(Reply<Option<f64>>),
 
     // --- Fire-and-forget ---
-    Teardown,
+    Teardown(String),
     SetLinkEstablishedCallback(Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>),
     SetLinkClosedCallback(Option<Arc<dyn Fn(LinkHandle) + Send + Sync>>),
     SetPacketCallback(Option<Arc<dyn Fn(&[u8], &Packet) + Send + Sync>>),
@@ -313,8 +313,11 @@ impl LinkHandle {
     }
 
     /// Tear down this link.
+    #[track_caller]
     pub fn teardown(&self) {
-        let _ = self.tx.send(LinkMsg::Teardown);
+        let loc = std::panic::Location::caller();
+        let caller = format!("{}:{}", loc.file(), loc.line());
+        let _ = self.tx.send(LinkMsg::Teardown(caller));
     }
 
     /// Identify this link with the given identity.
@@ -672,7 +675,8 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                 }
 
                 // --- Fire-and-forget ---
-                LinkMsg::Teardown => {
+                LinkMsg::Teardown(caller) => {
+                    crate::log(&format!("LINK teardown-caller link={} state={} from={}", crate::hexrep(&link.link_id, false), link.state, caller), crate::LOG_NOTICE, false, false);
                     link.teardown();
                     self_handle.status_atomic.store(link.status, Ordering::Relaxed);
                     // Actor exits.  link_closed callback is spawned on a new thread
@@ -882,6 +886,15 @@ pub fn register_runtime_link_handle(handle: LinkHandle) {
     let link_id = handle.link_id();
     let link_id_hex = crate::hexrep(&link_id, false);
     if let Ok(mut links) = RUNTIME_LINKS.lock() {
+        if links.contains_key(&link_id) {
+            crate::log(
+                &format!("RUNTIME duplicate link registration suppressed link={} total={}", link_id_hex, links.len()),
+                crate::LOG_WARNING,
+                false,
+                false,
+            );
+            return;
+        }
         crate::log(&format!("RUNTIME register link={} total={}", link_id_hex, links.len() + 1), crate::LOG_NOTICE, false, false);
         links.insert(link_id, handle);
     }

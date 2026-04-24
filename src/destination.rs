@@ -812,6 +812,37 @@ impl Destination {
 			crate::log(&format!("[DEST] incoming_link_request: REJECTED accept_link_requests=false dest={}", crate::hexrep(&self.hash, false)), crate::LOG_NOTICE, false, false);
 			return Ok(());
 		}
+
+		// Duplicate LINKREQUESTs for the same link_id can arrive via multiple relays.
+		// Ignore duplicates while a live link with this id is already tracked.
+		let requested_link_id = crate::link::link_id_from_lr_packet(_packet);
+		if self.links.iter().any(|l| l.link_id == requested_link_id && l.status != crate::link::STATE_CLOSED) {
+			crate::log(
+				&format!(
+					"[DEST] incoming_link_request: duplicate suppressed link_id={} dest={}",
+					crate::hexrep(&requested_link_id, false),
+					crate::hexrep(&self.hash, false)
+				),
+				crate::LOG_NOTICE,
+				false,
+				false,
+			);
+			return Ok(());
+		}
+
+		if crate::link::get_runtime_link_handle(&requested_link_id).is_some() {
+			crate::log(
+				&format!(
+					"[DEST] incoming_link_request: runtime duplicate suppressed link_id={} dest={}",
+					crate::hexrep(&requested_link_id, false),
+					crate::hexrep(&self.hash, false)
+				),
+				crate::LOG_NOTICE,
+				false,
+				false,
+			);
+			return Ok(());
+		}
 		
 		crate::log(&format!("[DEST] incoming_link_request: data_len={} dest={}", _data.len(), crate::hexrep(&self.hash, false)), crate::LOG_NOTICE, false, false);
 		
