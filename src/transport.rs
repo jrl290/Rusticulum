@@ -140,6 +140,7 @@ pub struct InterfaceStub {
     pub name: String,
     pub address: Option<String>,
     pub port: Option<u16>,
+    pub online: bool,
     pub bitrate: Option<f64>,
     pub rxb: u64,
     pub txb: u64,
@@ -244,6 +245,7 @@ pub struct InterfaceStubConfig {
     pub name: String,
     pub address: Option<String>,
     pub port: Option<u16>,
+    pub online: Option<bool>,
     pub mode: u8,
     pub out: bool,
     pub bitrate: Option<u64>,
@@ -1013,6 +1015,7 @@ impl Transport {
         iface.name = config.name;
         iface.address = config.address;
         iface.port = config.port;
+        iface.online = config.online.unwrap_or(false);
         iface.mode = config.mode;
         iface.out = config.out;
         iface.bitrate = config.bitrate.map(|b| b as f64);
@@ -1070,6 +1073,7 @@ impl Transport {
         iface.name = name.to_string();
         iface.mode = InterfaceStub::MODE_FULL;
         iface.out = false;
+        iface.online = true;
         iface.parent_is_local_shared = true;
         state.interfaces.push(iface);
     }
@@ -1082,8 +1086,19 @@ impl Transport {
         let mut iface = InterfaceStub::default();
         iface.name = name.to_string();
         iface.mode = InterfaceStub::MODE_FULL;
+        iface.online = true;
         iface.is_connected_to_shared_instance = true;
         state.local_client_interfaces.push(iface);
+    }
+
+    pub fn set_interface_online(name: &str, online: bool) {
+        let mut state = TRANSPORT.lock().unwrap();
+        if let Some(iface) = state.interfaces.iter_mut().find(|i| i.name == name) {
+            iface.online = online;
+        }
+        if let Some(iface) = state.local_client_interfaces.iter_mut().find(|i| i.name == name) {
+            iface.online = online;
+        }
     }
 
     pub fn get_interface_list() -> Vec<InterfaceStub> {

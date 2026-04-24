@@ -286,6 +286,9 @@ impl TcpClientInterface {
 
         self.socket = Some(stream);
         self.base.online = true;
+        if let Some(name) = &self.base.name {
+            Transport::set_interface_online(name, true);
+        }
         self.writing = false;
         self.never_connected = false;
 
@@ -469,6 +472,9 @@ impl TcpClientInterface {
                     #[cfg(not(unix))]
                     crate::log(&format!("TCP write failed, marking offline: {}", e), crate::LOG_ERROR, false, false);
                     self.base.online = false;
+                    if let Some(name) = &self.base.name {
+                        Transport::set_interface_online(name, false);
+                    }
                     self.socket = None;
                     self.writing = false;
                     return Err(format!("Failed to send data: {}", e));
@@ -497,6 +503,9 @@ impl TcpClientInterface {
                     Ok(0) => {
                         // Connection closed
                         self.base.online = false;
+                        if let Some(name) = &self.base.name {
+                            Transport::set_interface_online(name, false);
+                        }
                         if self.initiator && !self.detached {
                             println!("Socket for {} was closed, attempting to reconnect...", self.to_string());
                             self.reconnect();
@@ -589,6 +598,9 @@ impl TcpClientInterface {
                     }
                     Err(e) => {
                         self.base.online = false;
+                        if let Some(name) = &self.base.name {
+                            Transport::set_interface_online(name, false);
+                        }
                         
                         if self.initiator {
                             println!("Attempting to reconnect...");
@@ -867,6 +879,9 @@ impl TcpClientInterface {
                 {
                     let mut iface = interface.lock().unwrap();
                     iface.base.online = false;
+                    if let Some(name) = &iface.base.name {
+                        Transport::set_interface_online(name, false);
+                    }
                     iface.socket = None;
                 }
 
@@ -949,6 +964,9 @@ impl TcpClientInterface {
     /// Detach interface
     pub fn detach(&mut self) {
         self.base.online = false;
+        if let Some(name) = &self.base.name {
+            Transport::set_interface_online(name, false);
+        }
         self.detached = true;
         
         if let Some(ref mut socket) = self.socket {
@@ -1249,6 +1267,7 @@ impl TcpServerInterface {
                         stub_config.name = iface_name.clone();
                         stub_config.mode = client_mode;
                         stub_config.out = true;
+                        stub_config.online = Some(true);
                         stub_config.announce_cap = Some(crate::reticulum::ANNOUNCE_CAP / 100.0);
                         crate::transport::Transport::register_interface_stub_config(stub_config);
                     }

@@ -1600,6 +1600,7 @@ impl Reticulum {
                     match crate::interfaces::tcp_interface::TcpServerInterface::new(&config_map) {
                         Ok(mut interface) => {
                             Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
+                            stub_config.online = Some(interface.base.online);
                             interface.update_spawn_config();
                             let interface = Arc::new(Mutex::new(interface));
                             self.system_interfaces.push(SystemInterface::TcpServer(interface));
@@ -1622,6 +1623,7 @@ impl Reticulum {
                     match crate::interfaces::tcp_interface::TcpClientInterface::new(&config_map) {
                         Ok(mut interface) => {
                             Self::apply_interface_stub_to_base(&mut interface.base, mode, &stub_config);
+                            stub_config.online = Some(interface.base.online && !interface.detached);
                             let kiss_framing = interface.kiss_framing;
                             let is_online = interface.base.online;
                             let interface_repr = interface.to_string();
