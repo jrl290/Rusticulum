@@ -138,6 +138,8 @@ pub struct InterfaceStats {
 #[derive(Clone, Debug, Default)]
 pub struct InterfaceStub {
     pub name: String,
+    pub address: Option<String>,
+    pub port: Option<u16>,
     pub bitrate: Option<f64>,
     pub rxb: u64,
     pub txb: u64,
@@ -240,6 +242,8 @@ impl InterfaceStub {
 #[derive(Clone, Debug, Default)]
 pub struct InterfaceStubConfig {
     pub name: String,
+    pub address: Option<String>,
+    pub port: Option<u16>,
     pub mode: u8,
     pub out: bool,
     pub bitrate: Option<u64>,
@@ -1007,6 +1011,8 @@ impl Transport {
 
         let mut iface = InterfaceStub::default();
         iface.name = config.name;
+        iface.address = config.address;
+        iface.port = config.port;
         iface.mode = config.mode;
         iface.out = config.out;
         iface.bitrate = config.bitrate.map(|b| b as f64);

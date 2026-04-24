@@ -1549,6 +1549,22 @@ impl Reticulum {
             stub_config.ifac_key = ifac_key;
             stub_config.ifac_signature = ifac_signature;
 
+            // Extract address and port for TCP interfaces
+            match typ {
+                "TCPClientInterface" => {
+                    stub_config.address = config_map.get("target_host").map(|h| h.to_string());
+                    stub_config.port = config_map.get("target_port")
+                        .and_then(|p| p.parse::<u16>().ok());
+                }
+                "TCPServerInterface" => {
+                    stub_config.address = config_map.get("listen_ip").map(|a| a.to_string())
+                        .or_else(|| config_map.get("bind_ip").map(|a| a.to_string()));
+                    stub_config.port = config_map.get("listen_port")
+                        .and_then(|p| p.parse::<u16>().ok());
+                }
+                _ => {}
+            }
+
             match typ {
                 "UDPInterface" => {
                     match crate::interfaces::udp_interface::UdpInterface::new(None, &config_map) {
