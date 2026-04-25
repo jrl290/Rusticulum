@@ -439,7 +439,14 @@ pub fn prettytime(mut time_s: f64, verbose: bool, compact: bool) -> String {
         let seconds_str = if seconds.fract() == 0.0 {
             format!("{:.0}", seconds)
         } else {
-            format!("{:.2}", seconds)
+            let mut s = format!("{:.2}", seconds);
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+            s
         };
         components.push(if verbose {
             format!("{} second{}", seconds_str, ss)
@@ -515,9 +522,15 @@ pub fn prettyshorttime(time_s: f64, verbose: bool, compact: bool) -> String {
 
     if microseconds > 0.0 && (!compact || displayed < 2) {
         let micro_str = if microseconds.fract() == 0.0 {
-            format!("{:.0}", microseconds)
+            // Python oracle keeps one decimal place for whole microsecond
+            // values in prettyshorttime, e.g. "234.0µs".
+            format!("{:.1}", microseconds)
         } else {
-            format!("{:.2}", microseconds)
+            let mut s = format!("{:.2}", microseconds);
+            if s.ends_with('0') {
+                s.pop();
+            }
+            s
         };
         components.push(if verbose {
             format!("{} microsecond{}", micro_str, sus)

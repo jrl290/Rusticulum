@@ -1,5 +1,11 @@
+#![cfg(feature = "python-oracle-tests")]
+// Optional parity tests against Python Reticulum helpers.
+// Enable with:
+//   cargo test --release --features python-oracle-tests --test python_oracle
+
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use pyo3::types::PyTuple;
 use std::path::PathBuf;
 
 fn init_python(py: Python<'_>) {
@@ -14,7 +20,8 @@ fn call_rns_func(py: Python<'_>, func: &str, args: Vec<PyObject>) -> PyObject {
     init_python(py);
     let rns = py.import("RNS").unwrap();
     let callable = rns.getattr(func).unwrap();
-    callable.call1(args).unwrap().into()
+    let tuple = PyTuple::new(py, args);
+    callable.call1(tuple).unwrap().into()
 }
 
 #[test]
