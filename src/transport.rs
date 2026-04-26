@@ -1238,7 +1238,34 @@ impl Transport {
         }
         
         let _ = std::io::stderr().flush();
-        
+
+        // Diagnostic: log the source interface, requesting transport id and
+        // first 8 bytes of the tag so operators can identify a path-request
+        // flood source from rfed.log without needing a packet capture.  Kept
+        // at NOTICE because it fires per-request and we want it visible while
+        // diagnosing the current "Linking…" stall.  Demote/remove once the
+        // flood source is identified and addressed.
+        {
+            let iface = packet.receiving_interface.as_deref().unwrap_or("?");
+            let dst8 = crate::hexrep(&destination_hash[..destination_hash.len().min(4)], false);
+            let tag8 = tag_bytes
+                .as_ref()
+                .map(|t| crate::hexrep(&t[..t.len().min(8)], false))
+                .unwrap_or_else(|| "-".to_string());
+            let req8 = requesting_transport_instance
+                .map(|r| crate::hexrep(&r[..r.len().min(8)], false))
+                .unwrap_or_else(|| "-".to_string());
+            crate::log(
+                &format!(
+                    "[PR] iface={} dst={} req={} tag={} hops={}",
+                    iface, dst8, req8, tag8, packet.hops
+                ),
+                crate::LOG_NOTICE,
+                false,
+                false,
+            );
+        }
+
         if let Some(tag_bytes) = tag_bytes {
             let unique_tag = [destination_hash, tag_bytes.as_slice()].concat();
             
