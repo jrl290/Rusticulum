@@ -3311,9 +3311,21 @@ impl Transport {
         }
 
         let ptype_str = match packet.packet_type { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
-        crate::log(&format!("Inbound {} hops={} dest={} ctx={} dtype={:?}", ptype_str, packet.hops,
-            packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-            packet.context, packet.destination_type), crate::LOG_NOTICE, false, false);
+        // Suppress per-packet ANNOUNCE log spam — the global summary in
+        // `announce_log` aggregates the volume. Other ptypes are always logged.
+        if packet.packet_type == ANNOUNCE {
+            crate::announce_log::count_inbound_announce();
+            crate::announce_log::flush_if_due();
+            if crate::announce_log::is_whitelisted(packet.destination_hash.as_deref()) {
+                crate::log(&format!("Inbound {} hops={} dest={} ctx={} dtype={:?}", ptype_str, packet.hops,
+                    packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+                    packet.context, packet.destination_type), crate::LOG_NOTICE, false, false);
+            }
+        } else {
+            crate::log(&format!("Inbound {} hops={} dest={} ctx={} dtype={:?}", ptype_str, packet.hops,
+                packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
+                packet.context, packet.destination_type), crate::LOG_NOTICE, false, false);
+        }
         let _trace_dest_hex = packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default();
         let _trace_is_target = _trace_dest_hex.starts_with("6b9f66014d9853");
         packet.hops = packet.hops.saturating_add(1);
@@ -3427,10 +3439,16 @@ impl Transport {
                     Some(&pub_key),
                     packet.context_flag,
                 ) {
-                    crate::log(&format!("Announce INVALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
+                    crate::announce_log::count_invalid();
+                    if crate::announce_log::is_whitelisted(packet.destination_hash.as_deref()) {
+                        crate::log(&format!("Announce INVALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
+                    }
                     announce_should_add = false;
                 } else {
-                    crate::log(&format!("Announce VALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
+                    crate::announce_log::count_valid();
+                    if crate::announce_log::is_whitelisted(packet.destination_hash.as_deref()) {
+                        crate::log(&format!("Announce VALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
+                    }
                 }
             }
 
@@ -3712,7 +3730,10 @@ impl Transport {
                             PathEntryValue::PacketHash(packet.packet_hash.clone().unwrap_or_default()),
                         ];
                         state.path_table.insert(destination_hash.clone(), entry);
-                        crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
+                        crate::announce_log::count_path_added();
+                        if crate::announce_log::is_whitelisted(Some(destination_hash.as_slice())) {
+                            crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
+                        }
                         Transport::cache(&packet, true, Some("announce".to_string()));
 
                         // ── FIX: CANCEL PENDING LINK ON PATH IMPROVEMENT ──────────────────────
