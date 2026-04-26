@@ -1126,79 +1126,90 @@ impl Resource {
     /// to lock the resource for receive_part.
     ///
     /// Returns Some(packet) if a REQ should be sent, None otherwise.
+    ///
+    /// NOTE: This builds the Packet via `self.packet_destination()`, which
+    /// performs an mpsc round-trip to the link actor. **Do NOT call this
+    /// from a context where the resource lock is held by a thread that is
+    /// not the link actor** — that would deadlock if the actor is blocked
+    /// trying to acquire the same resource lock. Use
+    /// `prepare_request_next_data()` plus an externally-built destination
+    /// in that case (see `link::handle_data_packet`).
     pub fn prepare_request_next(&mut self) -> Option<Packet> {
+        let request_data = self.prepare_request_next_data()?;
+        Some(Packet::new(
+            self.packet_destination(),
+            request_data,
+            crate::packet::DATA,
+            RESOURCE_REQ,
+            BROADCAST,
+            crate::packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        ))
+    }
+
+    /// Build only the RESOURCE_REQ payload bytes — does NOT touch
+    /// `self.link`, so it is safe to call while the resource lock is held
+    /// by a non-actor thread. The caller is responsible for constructing
+    /// the outgoing `Packet` with a pre-built link `Destination`.
+    pub fn prepare_request_next_data(&mut self) -> Option<Vec<u8>> {
 
         // Both prepare_request_next and receive_part require &mut self, so they
         // can never run concurrently — receiving_part must be false here.
         debug_assert!(!self.receiving_part, "prepare_request_next entered while receive_part was active");
 
-        if self.status != ResourceStatus::Failed {
-            if !self.waiting_for_hmu {
-                self.outstanding_parts = 0;
-                let mut hashmap_exhausted = Resource::HASHMAP_IS_NOT_EXHAUSTED;
-                let mut requested_hashes = Vec::new();
+        if self.status == ResourceStatus::Failed || self.waiting_for_hmu {
+            return None;
+        }
 
-                let mut pn = (self.consecutive_completed_height + 1).max(0) as usize;
-                let _search_start = pn;
-                let search_size = self.window;
+        self.outstanding_parts = 0;
+        let mut hashmap_exhausted = Resource::HASHMAP_IS_NOT_EXHAUSTED;
+        let mut requested_hashes = Vec::new();
 
-                for _ in 0..search_size {
-                    if pn >= self.parts.len() {
-                        break;
+        let mut pn = (self.consecutive_completed_height + 1).max(0) as usize;
+        let _search_start = pn;
+        let search_size = self.window;
+
+        for _ in 0..search_size {
+            if pn >= self.parts.len() {
+                break;
+            }
+            if self.parts[pn].is_none() {
+                let idx = pn * Resource::MAPHASH_LEN;
+                if idx + Resource::MAPHASH_LEN <= self.hashmap.len() {
+                    let part_hash = self.hashmap[idx..idx + Resource::MAPHASH_LEN].to_vec();
+                    if !part_hash.iter().all(|b| *b == 0) {
+                        requested_hashes.extend_from_slice(&part_hash);
+                        self.outstanding_parts += 1;
+                    } else {
+                        hashmap_exhausted = Resource::HASHMAP_IS_EXHAUSTED;
                     }
-                    if self.parts[pn].is_none() {
-                        let idx = pn * Resource::MAPHASH_LEN;
-                        if idx + Resource::MAPHASH_LEN <= self.hashmap.len() {
-                            let part_hash = self.hashmap[idx..idx + Resource::MAPHASH_LEN].to_vec();
-                            if !part_hash.iter().all(|b| *b == 0) {
-                                requested_hashes.extend_from_slice(&part_hash);
-                                self.outstanding_parts += 1;
-                            } else {
-                                hashmap_exhausted = Resource::HASHMAP_IS_EXHAUSTED;
-                            }
-                        } else {
-                            hashmap_exhausted = Resource::HASHMAP_IS_EXHAUSTED;
-                        }
-                    }
-                    pn += 1;
-                    if self.outstanding_parts >= self.window || hashmap_exhausted == Resource::HASHMAP_IS_EXHAUSTED {
-                        break;
-                    }
+                } else {
+                    hashmap_exhausted = Resource::HASHMAP_IS_EXHAUSTED;
                 }
-
-                let mut hmu_part = vec![hashmap_exhausted];
-                if hashmap_exhausted == Resource::HASHMAP_IS_EXHAUSTED {
-                    let last_idx = (self.hashmap_height.saturating_sub(1)) * Resource::MAPHASH_LEN;
-                    if last_idx + Resource::MAPHASH_LEN <= self.hashmap.len() {
-                        hmu_part.extend_from_slice(&self.hashmap[last_idx..last_idx + Resource::MAPHASH_LEN]);
-                        self.waiting_for_hmu = true;
-                    }
-                }
-
-                let mut request_data = hmu_part;
-                request_data.extend_from_slice(&self.hash);
-                request_data.extend_from_slice(&requested_hashes);
-
-                let _requested_count = requested_hashes.len() / Resource::MAPHASH_LEN;
-                let _wants_hmu = hashmap_exhausted == Resource::HASHMAP_IS_EXHAUSTED;
-
-                let request_packet = Packet::new(
-                    self.packet_destination(),
-                    request_data,
-                    crate::packet::DATA,
-                    RESOURCE_REQ,
-                    BROADCAST,
-                    crate::packet::HEADER_1,
-                    None,
-                    None,
-                    false,
-                    0,
-                );
-
-                return Some(request_packet);
+            }
+            pn += 1;
+            if self.outstanding_parts >= self.window || hashmap_exhausted == Resource::HASHMAP_IS_EXHAUSTED {
+                break;
             }
         }
-        None
+
+        let mut hmu_part = vec![hashmap_exhausted];
+        if hashmap_exhausted == Resource::HASHMAP_IS_EXHAUSTED {
+            let last_idx = (self.hashmap_height.saturating_sub(1)) * Resource::MAPHASH_LEN;
+            if last_idx + Resource::MAPHASH_LEN <= self.hashmap.len() {
+                hmu_part.extend_from_slice(&self.hashmap[last_idx..last_idx + Resource::MAPHASH_LEN]);
+                self.waiting_for_hmu = true;
+            }
+        }
+
+        let mut request_data = hmu_part;
+        request_data.extend_from_slice(&self.hash);
+        request_data.extend_from_slice(&requested_hashes);
+
+        Some(request_data)
     }
 
     /// Record a successful REQ send.

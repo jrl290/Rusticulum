@@ -1322,6 +1322,28 @@ impl Link {
             last_resource_eifr: self.last_resource_eifr,
         }
     }
+
+    /// Build a `Destination` configured for sending packets on this link,
+    /// directly from the actor's owned `Link` fields.  Equivalent to the
+    /// `LinkMsg::BuildLinkDestination` actor handler but avoids the mpsc
+    /// round-trip — safe (and required) when called from inside the actor
+    /// thread itself, e.g. before spawning a deferred sender that holds the
+    /// resource lock and therefore cannot wait for the actor.
+    pub fn build_link_destination_direct(&self) -> Option<crate::destination::Destination> {
+        let dest_guard = self.destination.lock().ok()?;
+        let mut dest = dest_guard.clone();
+        dest.dest_type = crate::destination::DestinationType::Link;
+        dest.hash = self.link_id.clone();
+        dest.hexhash = crate::hexrep(&dest.hash, false);
+        dest.link = Some(crate::destination::LinkInfo {
+            rtt: self.rtt,
+            traffic_timeout_factor: self.traffic_timeout_factor,
+            status_closed: false,
+            mtu: Some(self.mtu),
+            attached_interface: self.attached_interface.clone(),
+        });
+        Some(dest)
+    }
 }
 
 impl Clone for Link {
@@ -2440,29 +2462,61 @@ impl Link {
             // Defer request_next and start_watchdog to background threads.
             // These need the link for encryption, and the link lock is currently
             // held by dispatch_runtime_packet — calling them inline would deadlock.
+            //
+            // IMPORTANT: build the link Destination NOW, while we are inside
+            // the actor (i.e. `self` is the owned Link), and pass the result
+            // into the spawned thread.  The deferred thread takes the
+            // resource lock and would deadlock if it tried to round-trip
+            // through the actor for `packet_destination()` while the actor
+            // is blocked trying to take the resource lock for the next
+            // inbound RESOURCE part.  See rfed.log 2026-04-25 23:11:36
+            // post-mortem (rfed-stall-deadlock memory note).
+            let req_next_destination = if deferred_actions.iter().any(|(_, n, _)| *n) {
+                self.build_link_destination_direct()
+            } else {
+                None
+            };
             for (resource_arc, needs_request_next, needs_start_watchdog) in deferred_actions {
                 if needs_start_watchdog {
                     Resource::start_watchdog(resource_arc.clone());
                 }
                 if needs_request_next {
                     let r = resource_arc.clone();
+                    let dest = req_next_destination.clone();
                     std::thread::spawn(move || {
                         // Brief delay so the caller can release the link lock.
                         // Without this, the deferred thread would immediately
                         // contend on the link lock that the TCP reader still holds.
                         std::thread::sleep(std::time::Duration::from_millis(5));
-                        // Phase 1: Lock resource, prepare packet, then RELEASE lock
-                        let maybe_packet = match r.lock() {
+                        // Phase 1: Lock resource, prepare REQ payload bytes,
+                        // then RELEASE the lock.  We use the *_data variant
+                        // so we never call self.link.* while holding the
+                        // resource lock — that would deadlock against the
+                        // actor processing the next inbound RESOURCE part.
+                        let maybe_data = match r.lock() {
                             Ok(mut guard) => {
-                                guard.prepare_request_next()
+                                guard.prepare_request_next_data()
                             }
                             Err(e) => {
                                 crate::log(&format!("Resource lock poisoned in deferred REQ: {}", e), crate::LOG_ERROR, false, false);
                                 None
                             }
                         };
-                        // Phase 2: Send packet WITHOUT holding resource lock (avoids deadlock with dispatch_runtime_packet)
-                        if let Some(mut packet) = maybe_packet {
+                        // Phase 2: Build the Packet OUTSIDE the resource lock
+                        // using the destination snapshot built in the actor.
+                        if let Some(request_data) = maybe_data {
+                            let mut packet = crate::packet::Packet::new(
+                                dest,
+                                request_data,
+                                crate::packet::DATA,
+                                crate::packet::RESOURCE_REQ,
+                                crate::transport::BROADCAST,
+                                crate::packet::HEADER_1,
+                                None,
+                                None,
+                                false,
+                                0,
+                            );
                             match packet.send() {
                                 Ok(_) => {
                                     // Phase 3: Re-lock resource to record success
@@ -2781,20 +2835,38 @@ impl Link {
                 // the link mutex and request_next needs to encrypt via
                 // the same link, which would deadlock.
                 if let Some(r) = needs_request_next {
+                    // Build the link Destination NOW (inside the actor) and
+                    // pass it into the spawned thread, so the deferred sender
+                    // never has to round-trip through the actor while
+                    // holding the resource lock.  See deadlock note in the
+                    // RESOURCE handler above.
+                    let dest = self.build_link_destination_direct();
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(5));
-                        // Phase 1: Lock resource, prepare packet, then RELEASE lock
-                        let maybe_packet = match r.lock() {
+                        // Phase 1: Lock resource, build REQ payload bytes, RELEASE
+                        let maybe_data = match r.lock() {
                             Ok(mut guard) => {
-                                guard.prepare_request_next()
+                                guard.prepare_request_next_data()
                             }
                             Err(e) => {
                                 crate::log(&format!("Resource lock poisoned in deferred HMU REQ: {}", e), crate::LOG_ERROR, false, false);
                                 None
                             }
                         };
-                        // Phase 2: Send packet WITHOUT holding resource lock
-                        if let Some(mut packet) = maybe_packet {
+                        // Phase 2: Build Packet outside resource lock and send
+                        if let Some(request_data) = maybe_data {
+                            let mut packet = crate::packet::Packet::new(
+                                dest,
+                                request_data,
+                                crate::packet::DATA,
+                                crate::packet::RESOURCE_REQ,
+                                crate::transport::BROADCAST,
+                                crate::packet::HEADER_1,
+                                None,
+                                None,
+                                false,
+                                0,
+                            );
                             match packet.send() {
                                 Ok(_) => {
                                     if let Ok(mut guard) = r.lock() {
