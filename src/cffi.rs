@@ -261,6 +261,18 @@ pub extern "C" fn rns_transport_hops_to(dest_hash: *const u8, len: u32) -> i32 {
     ffi::transport_hops_to(&h)
 }
 
+/// Query whether a configured interface (by name) is currently online.
+/// Returns: 1 = online, 0 = offline, -1 = unknown / no such interface.
+#[no_mangle]
+pub extern "C" fn rns_interface_online(name: *const c_char) -> i32 {
+    let n = unsafe { cstr_to_string(name) };
+    if n.is_empty() {
+        set_error("interface name is empty".into());
+        return -1;
+    }
+    ffi::interface_online(&n)
+}
+
 // =========================================================================
 // Settings (stateless)
 // =========================================================================

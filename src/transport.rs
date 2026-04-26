@@ -311,7 +311,12 @@ pub struct TransportState {
     pub path_states: HashMap<Vec<u8>, u8>,
     pub blackholed_identities: HashMap<Vec<u8>, BlackholeEntry>,
     pub discovery_path_requests: HashMap<Vec<u8>, DiscoveryPathRequest>,
+    /// FIFO queue of recently-seen path-request tags (for eviction order).
     pub discovery_pr_tags: Vec<Vec<u8>>,
+    /// O(1) lookup mirror of `discovery_pr_tags`. Kept in sync on insert/evict
+    /// to avoid an O(n) linear scan per inbound path-request packet, which
+    /// previously starved the Transport mutex under path-request floods.
+    pub discovery_pr_tags_set: HashSet<Vec<u8>>,
     pub max_pr_tags: usize,
     pub control_destinations: Vec<Destination>,
     pub control_hashes: Vec<Vec<u8>>,
@@ -1239,7 +1244,7 @@ impl Transport {
             
             let is_new = {
                 let mut state = TRANSPORT.lock().unwrap();
-                if !state.discovery_pr_tags.contains(&unique_tag) {
+                if state.discovery_pr_tags_set.insert(unique_tag.clone()) {
                     state.discovery_pr_tags.push(unique_tag);
                     true
                 } else {
@@ -2059,7 +2064,11 @@ impl Transport {
 
         if state.discovery_pr_tags.len() > state.max_pr_tags {
             let keep_from = state.discovery_pr_tags.len().saturating_sub(state.max_pr_tags);
-            state.discovery_pr_tags = state.discovery_pr_tags[keep_from..].to_vec();
+            // Drain evicted entries and remove them from the lookup set as well.
+            let evicted: Vec<Vec<u8>> = state.discovery_pr_tags.drain(..keep_from).collect();
+            for tag in &evicted {
+                state.discovery_pr_tags_set.remove(tag);
+            }
         }
 
         if now() > state.cache_last_cleaned + state.cache_clean_interval {
@@ -3277,9 +3286,12 @@ impl Transport {
         // Log raw packet type from header byte before any processing
         let raw_ptype = if raw.len() > 2 { raw[0] & 0x03 } else { 0xFF };
         let raw_ptype_str = match raw_ptype { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
-        let raw_log_level = crate::LOG_NOTICE;
+        // Demoted to DEBUG: this fired per-packet at NOTICE and was the dominant
+        // log-volume contributor under path-request floods. The richer
+        // "Inbound DATA/LINKREQUEST/PROOF hops=… dest=…" line below carries
+        // the same useful information for ops triage.
         if raw_ptype != ANNOUNCE {
-            crate::log(&format!("inbound_raw len={} ptype_byte={} ({})", raw.len(), raw_ptype, raw_ptype_str), raw_log_level, false, false);
+            crate::log(&format!("inbound_raw len={} ptype_byte={} ({})", raw.len(), raw_ptype, raw_ptype_str), crate::LOG_DEBUG, false, false);
         }
         // IFAC flag check: if interface doesn't have IFAC, drop packets with IFAC flag
         if raw.len() > 2 && (raw[0] & 0x80) == 0x80 {
@@ -3418,11 +3430,11 @@ impl Transport {
             crate::log(&format!("Inbound FILTERED ptype={} ctx={}", packet.packet_type, packet.context), crate::LOG_NOTICE, false, false);
             return false;
         }
-        if _trace_is_target { crate::log("[TRACE] target passed filter", crate::LOG_NOTICE, false, false); }
+        if _trace_is_target { crate::log("[TRACE] target passed filter", crate::LOG_DEBUG, false, false); }
 
         // Handle control destination routing (lock already released)
         if let Some(ref aspects) = control_aspects {
-            if _trace_is_target { crate::log(&format!("[TRACE] target HIT control aspects={:?}", aspects), crate::LOG_NOTICE, false, false); }
+            if _trace_is_target { crate::log(&format!("[TRACE] target HIT control aspects={:?}", aspects), crate::LOG_DEBUG, false, false); }
             match aspects.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
                 ["path", "request"] => Transport::path_request_handler(&packet.data, &packet),
                 ["tunnel", "synthesize"] => Transport::tunnel_synthesize_handler(&packet.data, &packet),
