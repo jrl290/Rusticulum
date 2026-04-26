@@ -191,6 +191,14 @@ enum LinkMsg {
         request_id: Vec<u8>,
         response: Vec<u8>,
     },
+    /// Fire-and-forget: dispatch an assembled REQUEST resource into the
+    /// link's request handler. Sent by the resource_concluded callback for
+    /// inbound multi-segment requests (Python parity:
+    /// RNS/Link.py:request_resource_concluded → handle_request).
+    HandleRequestPacket {
+        request_id: Vec<u8>,
+        plaintext: Vec<u8>,
+    },
 }
 
 /// Result from a Receive message — tells the dispatcher what happened.
@@ -481,6 +489,13 @@ impl LinkHandle {
     /// so the response is sent after the actor finishes processing `Receive`.
     pub fn send_response(&self, request_id: Vec<u8>, response: Vec<u8>) {
         let _ = self.tx.send(LinkMsg::SendResponse { request_id, response });
+    }
+
+    /// Dispatch an assembled REQUEST resource into the link's request handler.
+    /// Used by the resource_concluded callback for inbound multi-segment
+    /// requests (Python parity: request_resource_concluded → handle_request).
+    pub fn handle_request_packet(&self, request_id: Vec<u8>, plaintext: Vec<u8>) {
+        let _ = self.tx.send(LinkMsg::HandleRequestPacket { request_id, plaintext });
     }
 
     /// Get the last resource window size.
@@ -786,6 +801,13 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                     } else {
                         let _ = link.send_request_response(&request_id, &response);
                     }
+                }
+
+                // Dispatch an assembled REQUEST resource — sent by the
+                // request_resource_concluded callback after a multi-segment
+                // inbound request has finished assembling.
+                LinkMsg::HandleRequestPacket { request_id, plaintext } => {
+                    let _ = link.handle_request_packet(request_id, &plaintext);
                 }
             }
         }
@@ -2632,12 +2654,52 @@ impl Link {
 
             if is_req {
                 let link_ctx = self.resource_link_context();
+                let adv_request_id =
+                    crate::resource::ResourceAdvertisement::read_request_id(&advertisement_packet);
+
+                // Python parity: RNS/Link.py:request_resource_concluded.
+                // When a multi-segment REQUEST resource finishes assembling,
+                // unpack it and dispatch into handle_request_packet so the
+                // registered request handler runs.
+                let link_handle = self.self_handle.as_ref().unwrap().clone();
+                let request_concluded_cb: Option<Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>> =
+                    Some(Arc::new(move |resource: Arc<Mutex<Resource>>| {
+                        let (data_opt, status, res_request_id_opt) = {
+                            let res = resource.lock().unwrap();
+                            (res.data.clone(), res.status, res.request_id.clone())
+                        };
+                        if status != crate::resource::ResourceStatus::Complete {
+                            crate::log(&format!(
+                                "[REQ-RES] incoming request resource failed status={:?}", status
+                            ), crate::LOG_DEBUG, false, false);
+                            return;
+                        }
+                        let data = match data_opt {
+                            Some(d) => d,
+                            None => {
+                                crate::log("[REQ-RES] concluded but data is None", crate::LOG_NOTICE, false, false);
+                                return;
+                            }
+                        };
+                        // Python derives request_id = truncated_hash(packed_request)
+                        // (RNS/Link.py:request_resource_concluded). Mirror that
+                        // and fall back to the resource advertisement's
+                        // request_id when the helper isn't available.
+                        let request_id = crate::identity::Identity::truncated_hash(&data);
+                        let request_id = if request_id.is_empty() {
+                            res_request_id_opt.unwrap_or_default()
+                        } else {
+                            request_id
+                        };
+                        link_handle.handle_request_packet(request_id, data);
+                    }));
+
                 if let Some(resource) = Resource::accept(
                     &advertisement_packet,
                     self.self_handle.as_ref().unwrap().clone(),
-                    self.callbacks.resource_concluded.clone(),
+                    request_concluded_cb,
                     None,
-                    crate::resource::ResourceAdvertisement::read_request_id(&advertisement_packet),
+                    adv_request_id,
                     Some(link_ctx),
                 ) {
                     // Register on real link so RESOURCE data packets find it
