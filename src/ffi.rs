@@ -281,6 +281,17 @@ pub fn transport_hops_to(dest_hash: &[u8]) -> i32 {
     if h == 255 { -1 } else { h as i32 }
 }
 
+/// Query whether a configured interface (by name) is currently online.
+/// Returns: 1 = online, 0 = offline, -1 = no interface with that name.
+pub fn interface_online(name: &str) -> i32 {
+    for iface in Transport::get_interface_list() {
+        if iface.name == name {
+            return if iface.online { 1 } else { 0 };
+        }
+    }
+    -1
+}
+
 // ---------------------------------------------------------------------------
 // Announce filtering
 // ---------------------------------------------------------------------------
@@ -594,6 +605,20 @@ pub fn link_request(
             return Err("Link establishment timed out".to_string());
         }
         thread::sleep(Duration::from_millis(100));
+    }
+
+    // Identify the link with our identity BEFORE issuing the request.
+    //
+    // Without this, the remote handler sees `caller=None` and any path that
+    // authenticates by caller hash (e.g. rfed `/rfed/pull`, which keys the
+    // deferred-blob queue by subscriber identity) silently returns nothing.
+    // That used to manifest as a malformed 19-byte response packet on the
+    // wire — see Reticulum-rust commit 8eca76d (now reverted) for the
+    // downstream symptom. Mirrors the LXMF propagation sync path which
+    // explicitly identifies before requesting.
+    if let Err(e) = link_handle.identify(&our_identity) {
+        link_handle.teardown();
+        return Err(format!("identify failed: {:?}", e));
     }
 
     // Send the request and wait for the response.

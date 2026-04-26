@@ -774,7 +774,18 @@ fn link_actor(mut link: Link, rx: mpsc::Receiver<LinkMsg>, self_handle: LinkHand
                 // Fire-and-forget: send a request response assembled by the
                 // background thread that ran the request handler callback.
                 LinkMsg::SendResponse { request_id, response } => {
-                    let _ = link.send_request_response(&request_id, &response);
+                    // Match Python RNS: a handler that returns no bytes is
+                    // treated as "no response" — we emit no packet at all and
+                    // let the requester time out cleanly. Sending an empty
+                    // payload through send_request_response would either
+                    // produce a malformed wire packet (original bug) or a
+                    // non-Python `[id, nil]` packet (earlier band-aid);
+                    // neither is protocol-conformant.
+                    if response.is_empty() {
+                        crate::log("[REQ] handler returned 0 bytes — no response packet sent (matches Python None)", crate::LOG_NOTICE, false, false);
+                    } else {
+                        let _ = link.send_request_response(&request_id, &response);
+                    }
                 }
             }
         }
@@ -3150,8 +3161,11 @@ impl Link {
             };
 
             if !allowed {
-                crate::log(&format!("[REQ] request denied for path '{}' (not allowed)", handler.path), crate::LOG_NOTICE, false, false);
-                return self.send_request_response(&request_id, &[]);
+                // Python RNS (RNS/Link.py:handle_request) silently logs and
+                // returns when a request is not allowed — it does NOT send a
+                // response packet. Mirror that: client times out cleanly.
+                crate::log(&format!("[REQ] request denied for path '{}' (not allowed) — no response sent (matches Python)", handler.path), crate::LOG_NOTICE, false, false);
+                return Ok(());
             } else if let Some(callback) = handler.callback {
                 // Spawn callback on a background thread so it can freely call
                 // LinkHandle methods (snapshot, send_packet, request, etc.) without
@@ -3179,11 +3193,13 @@ impl Link {
                 });
                 return Ok(()); // response sent asynchronously from the spawned thread
             } else {
-                return self.send_request_response(&request_id, &[]);
+                // Handler registered but no callback — same as Python's
+                // "response is None" path: send nothing, let client time out.
+                return Ok(());
             }
         }
-        // No handler registered — send empty response.
-        self.send_request_response(&request_id, &[])
+        // No handler registered for this path — Python silently ignores; do the same.
+        Ok(())
     }
 
     /// Build and send the msgpack-encoded response for a request.
@@ -3204,16 +3220,16 @@ impl Link {
         // First element: request_id as Binary
         rmp::encode::write_bin(&mut response_data, &request_id).map_err(|e| e.to_string())?;
         // Second element: raw msgpack response value (already encoded by handler).
-        // CRITICAL: if the handler returned no bytes (denied / no handler / empty),
-        // we MUST still emit a valid msgpack value for element 2 — otherwise the
-        // outer array header claims len=2 but the wire only contains 1 element,
-        // and the receiver fails to decode the response with
-        // "failed to fill whole buffer". Emit msgpack nil in that case.
-        if response.is_empty() {
-            rmp::encode::write_nil(&mut response_data).map_err(|e| e.to_string())?;
-        } else {
-            response_data.extend_from_slice(&response);
-        }
+        //
+        // Callers MUST NOT invoke this with an empty `response`. Python RNS
+        // (RNS/Link.py:handle_request) emits NO response packet at all when
+        // the handler returns None, the request is denied, or no handler is
+        // registered. Mirror that behavior at the call sites; this assertion
+        // catches accidental regressions because emitting array_len=2 with
+        // nothing in element 2 produces a malformed 19-byte plaintext that
+        // the peer fails to decode ("failed to fill whole buffer").
+        debug_assert!(!response.is_empty(), "send_request_response called with empty payload — callers must skip the send instead (matches Python RNS)");
+        response_data.extend_from_slice(&response);
         crate::log(&format!("[REQ] response_data (msgpack) {} bytes: {:02x?}", response_data.len(), &response_data[..response_data.len().min(64)]), crate::LOG_NOTICE, false, false);
 
         // Encrypt directly via self (we already hold the link lock, so we MUST NOT
