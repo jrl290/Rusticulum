@@ -592,7 +592,17 @@ pub fn link_request(
     crate::link::register_runtime_link_handle(link_handle.clone());
 
     // Wait for link establishment.
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+    //
+    // The link itself enforces its own establishment_timeout
+    // (`first_hop + ESTABLISHMENT_TIMEOUT_PER_HOP * hops`, ~24s for hops=3,
+    // ~42s for hops=6) and will fire `link_closed_callback` (→ `est_failed`)
+    // when that fires.  We must NOT impose a shorter cap here, or callers that
+    // pass a small `timeout_secs` (e.g. RfedNotify's 15s) will tear down a
+    // perfectly good in-flight handshake before the protocol-level negotiation
+    // can complete.  Use a generous safety ceiling (90s) that exceeds the
+    // worst-case link establishment_timeout for any realistic hop count.
+    let est_deadline_secs = timeout_secs.max(90.0);
+    let deadline = Instant::now() + Duration::from_secs_f64(est_deadline_secs);
     loop {
         if established.load(Ordering::SeqCst) {
             break;
