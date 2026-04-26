@@ -4193,4 +4193,111 @@ mod tests {
         );
         assert!(!info.status_closed, "link is ACTIVE, status_closed must be false");
     }
+
+    /// Regression: KEEPALIVE packets travel UNENCRYPTED on the wire (1-byte
+    /// payload — see `Packet::pack` which skips encryption for context ==
+    /// KEEPALIVE).  `handle_data_packet` MUST therefore dispatch the KEEPALIVE
+    /// branch BEFORE attempting `self.decrypt(packet.data)`, otherwise a
+    /// 1-byte ciphertext fails AES-GCM and the function silently returns
+    /// Ok(()) without sending the 0xFE pong.  When that bug was present the
+    /// initiator's `last_inbound` never refreshed on quiet links and links
+    /// were torn down at exactly `2*keepalive + STALE_GRACE` (~15 s for
+    /// low-RTT links), causing the iOS pill to flicker between Linked and
+    /// Linking every ~15 s.
+    ///
+    /// We assert the responder side (`initiator = false`) reacts to a 0xFF
+    /// ping by setting `last_keepalive` (which only happens inside
+    /// `prepare_keepalive` → `had_outbound(true)`, i.e. the KEEPALIVE branch
+    /// actually fired).  Sanity-check that `decrypt(&[0xFF])` does indeed
+    /// fail so we know the test is genuinely exercising the pre-decrypt
+    /// dispatch and not a path that happens to also work post-decrypt.
+    #[test]
+    fn keepalive_dispatched_before_decrypt_for_unencrypted_one_byte_payload() {
+        let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(29)).collect();
+        let mut link = make_incoming_link(link_id.clone());
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+        // initiator=false ensures the KEEPALIVE branch SHOULD send a pong.
+        assert!(!link.initiator);
+
+        // Sanity: decrypting a 1-byte buffer must fail so this test would
+        // catch a regression that re-orders KEEPALIVE after the decrypt
+        // step (which would silently drop the packet).
+        assert!(
+            link.decrypt(&[0xFFu8]).is_err(),
+            "1-byte buffer must not be decryptable; otherwise this regression \
+             test would also pass under the buggy post-decrypt ordering"
+        );
+
+        let before = link.last_keepalive;
+
+        // Build the packet exactly as it appears on the wire: DATA packet,
+        // context = KEEPALIVE (0xFA), 1-byte unencrypted payload 0xFF.
+        let dest = link.destination.lock().unwrap().clone();
+        let mut ping = Packet::new(
+            Some(dest),
+            vec![0xFFu8],
+            DATA,
+            crate::packet::KEEPALIVE,
+            crate::transport::BROADCAST,
+            packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        );
+        ping.data = vec![0xFFu8]; // ensure not mutated by pack
+
+        // Dispatch.  Must succeed AND must have triggered the KEEPALIVE
+        // branch (which calls prepare_keepalive → had_outbound(true) →
+        // last_keepalive = now).
+        link.handle_data_packet(&ping)
+            .expect("handle_data_packet must succeed for an unencrypted KEEPALIVE");
+
+        assert!(
+            link.last_keepalive > before,
+            "responder must enter the KEEPALIVE branch (which sets last_keepalive); \
+             if last_keepalive is unchanged, the dispatch fell through to decrypt() \
+             and silently dropped the ping — the exact regression we are guarding \
+             against"
+        );
+    }
+
+    /// Companion regression: an initiator receiving a 0xFE pong must NOT
+    /// generate its own reply (would create an infinite ping/pong loop and
+    /// also matches Python RNS semantics).  Verifies the `!self.initiator`
+    /// guard inside the KEEPALIVE branch.
+    #[test]
+    fn keepalive_pong_does_not_trigger_reply_on_initiator() {
+        let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(31)).collect();
+        let mut link = make_incoming_link(link_id.clone());
+        link.initiator = true; // outbound side
+        link.state = STATE_ACTIVE;
+        link.status = STATE_ACTIVE;
+
+        let before = link.last_keepalive;
+
+        let dest = link.destination.lock().unwrap().clone();
+        let mut pong = Packet::new(
+            Some(dest),
+            vec![0xFEu8],
+            DATA,
+            crate::packet::KEEPALIVE,
+            crate::transport::BROADCAST,
+            packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        );
+        pong.data = vec![0xFEu8];
+
+        link.handle_data_packet(&pong)
+            .expect("handle_data_packet must succeed for a KEEPALIVE pong");
+
+        assert_eq!(
+            link.last_keepalive, before,
+            "initiator must NOT send another keepalive in response to a 0xFE pong"
+        );
+    }
 }
