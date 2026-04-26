@@ -3690,7 +3690,7 @@ impl Transport {
                                 crate::hexrep(destination_hash, false),
                                 packet.hops
                             ),
-                            crate::LOG_DEBUG,
+                            crate::LOG_NOTICE,
                             false,
                             false,
                         );
