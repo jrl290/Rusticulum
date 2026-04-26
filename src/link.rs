@@ -3203,8 +3203,17 @@ impl Link {
         rmp::encode::write_array_len(&mut response_data, 2).map_err(|e| e.to_string())?;
         // First element: request_id as Binary
         rmp::encode::write_bin(&mut response_data, &request_id).map_err(|e| e.to_string())?;
-        // Second element: raw msgpack response value (already encoded by handler)
-        response_data.extend_from_slice(&response);
+        // Second element: raw msgpack response value (already encoded by handler).
+        // CRITICAL: if the handler returned no bytes (denied / no handler / empty),
+        // we MUST still emit a valid msgpack value for element 2 — otherwise the
+        // outer array header claims len=2 but the wire only contains 1 element,
+        // and the receiver fails to decode the response with
+        // "failed to fill whole buffer". Emit msgpack nil in that case.
+        if response.is_empty() {
+            rmp::encode::write_nil(&mut response_data).map_err(|e| e.to_string())?;
+        } else {
+            response_data.extend_from_slice(&response);
+        }
         crate::log(&format!("[REQ] response_data (msgpack) {} bytes: {:02x?}", response_data.len(), &response_data[..response_data.len().min(64)]), crate::LOG_NOTICE, false, false);
 
         // Encrypt directly via self (we already hold the link lock, so we MUST NOT
