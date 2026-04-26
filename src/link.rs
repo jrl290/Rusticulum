@@ -2836,6 +2836,39 @@ impl Link {
             return Ok(());
         }
 
+        // KEEPALIVE handling — matches Python RNS Link.py:
+        //   if not self.initiator and packet.data == bytes([0xFF]):
+        //       keepalive_packet = RNS.Packet(self, bytes([0xFE]), context=RNS.Packet.KEEPALIVE)
+        //       keepalive_packet.send()
+        //       self.had_outbound(is_keepalive = True)
+        //
+        // Without this reply, the initiator's `last_inbound` is never refreshed
+        // on quiet links; the link goes STALE after `stale_time` (= 2*keepalive,
+        // which can be as low as ~96 s for low-RTT links) and the initiator tears
+        // it down even though the peer is still reachable.
+        if packet.context == crate::packet::KEEPALIVE {
+            if !self.initiator && plaintext.as_slice() == [0xFFu8] {
+                if let Some((dest, _link_id)) = self.prepare_keepalive() {
+                    let mut reply = Packet::new(
+                        Some(dest),
+                        vec![0xFEu8],
+                        DATA,
+                        crate::packet::KEEPALIVE,
+                        crate::transport::BROADCAST,
+                        packet::HEADER_1,
+                        None,
+                        None,
+                        false,
+                        0,
+                    );
+                    let _ = reply.send();
+                }
+            }
+            // Initiator-side receipt of 0xFE (or any direction) only needs to
+            // refresh last_inbound, which `receive()` already did via had_inbound().
+            return Ok(());
+        }
+
         if packet.context == crate::packet::RESOURCE_REQ {
             let hash_len = identity::HASHLENGTH / 8;
             if plaintext.len() >= 1 + hash_len {
