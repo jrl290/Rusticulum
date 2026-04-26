@@ -3311,9 +3311,11 @@ impl Transport {
         }
 
         let ptype_str = match packet.packet_type { 0 => "DATA", 1 => "ANNOUNCE", 2 => "LINKREQUEST", 3 => "PROOF", _ => "?" };
-        crate::log(&format!("Inbound {} hops={} dest={} ctx={}", ptype_str, packet.hops,
+        crate::log(&format!("Inbound {} hops={} dest={} ctx={} dtype={:?}", ptype_str, packet.hops,
             packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default(),
-            packet.context), crate::LOG_NOTICE, false, false);
+            packet.context, packet.destination_type), crate::LOG_NOTICE, false, false);
+        let _trace_dest_hex = packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default();
+        let _trace_is_target = _trace_dest_hex.starts_with("6b9f66014d9853");
         packet.hops = packet.hops.saturating_add(1);
 
         // Inline packet_filter + control destination check in a single lock acquisition
@@ -3393,9 +3395,11 @@ impl Transport {
             crate::log(&format!("Inbound FILTERED ptype={} ctx={}", packet.packet_type, packet.context), crate::LOG_NOTICE, false, false);
             return false;
         }
+        if _trace_is_target { crate::log("[TRACE] target passed filter", crate::LOG_NOTICE, false, false); }
 
         // Handle control destination routing (lock already released)
         if let Some(ref aspects) = control_aspects {
+            if _trace_is_target { crate::log(&format!("[TRACE] target HIT control aspects={:?}", aspects), crate::LOG_NOTICE, false, false); }
             match aspects.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
                 ["path", "request"] => Transport::path_request_handler(&packet.data, &packet),
                 ["tunnel", "synthesize"] => Transport::tunnel_synthesize_handler(&packet.data, &packet),
@@ -3406,6 +3410,7 @@ impl Transport {
 
         if packet.context == CACHE_REQUEST {
             if Transport::cache_request_packet(&packet) {
+                if _trace_is_target { crate::log("[TRACE] target HIT cache_request return", crate::LOG_NOTICE, false, false); }
                 return true;
             }
         }
@@ -3486,6 +3491,7 @@ impl Transport {
         let inbound_wait_ms = inbound_lock_wait_started.elapsed().as_millis();
         if inbound_wait_ms > 250 {
         }
+        if _trace_is_target { crate::log(&format!("[TRACE] target acquired inbound state lock (waited {}ms)", inbound_wait_ms), crate::LOG_NOTICE, false, false); }
         let inbound_lock_started = Instant::now();
         let mut deferred_outbound: Vec<(String, Vec<u8>)> = Vec::new();
         let mut deferred_announce_callbacks: Vec<(AnnounceCallback, Vec<u8>, Identity, Vec<u8>, Option<Vec<u8>>, bool)> = Vec::new();
@@ -3657,7 +3663,38 @@ impl Transport {
 
                     let received_from = packet.transport_id.clone().unwrap_or_else(|| destination_hash.clone());
                     let expires = now() + DESTINATION_TIMEOUT;
-                    if should_update_path {
+                    // ── FIX: SKIP OWN-DESTINATION ECHO ──────────────────────────────────────
+                    // DO NOT REVERT.
+                    //
+                    // Bug: when our own announce reaches a directly-connected peer and is
+                    // rebroadcast, it comes back to us as a remote announce for our own
+                    // destination hash.  Without this filter we would install a "remote"
+                    // path for our own destination — meaning subsequent inbound
+                    // LINK_REQUEST packets addressed to that destination get *forwarded*
+                    // back out the mesh instead of being delivered locally to the
+                    // destination handler.  Clients (e.g. Retichat) then see every link
+                    // request silently time out at 50+ s with no PROOF.
+                    //
+                    // Mirrors Python Reticulum's `Transport.receive_announce`, which
+                    // skips path-table updates for any destination_hash present in its
+                    // own `Transport.destinations` list.
+                    // ────────────────────────────────────────────────────────────────────────
+                    let is_own_destination = state
+                        .destinations
+                        .iter()
+                        .any(|d| d.hash.as_slice() == destination_hash.as_slice());
+                    if is_own_destination {
+                        crate::log(
+                            &format!(
+                                "Skipping own-destination echo: dest={} hops={}",
+                                crate::hexrep(destination_hash, false),
+                                packet.hops
+                            ),
+                            crate::LOG_DEBUG,
+                            false,
+                            false,
+                        );
+                    } else if should_update_path {
                         let entry = vec![
                             PathEntryValue::Timestamp(now()),
                             PathEntryValue::NextHop(received_from.clone()),
@@ -4032,17 +4069,38 @@ impl Transport {
         }
 
         if packet.packet_type == DATA {
+            if _trace_is_target { crate::log(&format!("[TRACE] target reached DATA branch dtype={:?}", packet.destination_type), crate::LOG_NOTICE, false, false); }
             if packet.destination_type == Some(crate::destination::DestinationType::Link) {
+                if _trace_is_target { crate::log("[TRACE] target → deferred_link_packets", crate::LOG_NOTICE, false, false); }
                 deferred_link_packets.push(packet.clone());
             } else {
                 if let Some(destination_hash) = &packet.destination_hash {
+                    let mut matched = 0;
                     for dest in &mut state.destinations {
                         if &dest.hash == destination_hash {
                             deferred_destination_receives.push((dest.clone(), packet.clone()));
+                            matched += 1;
                         }
                     }
+                    if matched == 0 {
+                        let registered: Vec<String> = state.destinations.iter()
+                            .map(|d| format!("{}({:?})", crate::hexrep(&d.hash, false), d.dest_type))
+                            .collect();
+                        crate::log(&format!("[DEST-RX] NO MATCH dest={} dtype={:?} ctx={} regcount={} registered=[{}]",
+                            crate::hexrep(destination_hash, false),
+                            packet.destination_type,
+                            packet.context,
+                            state.destinations.len(),
+                            registered.join(",")), crate::LOG_NOTICE, false, false);
+                    } else if _trace_is_target {
+                        crate::log(&format!("[TRACE] target MATCHED {} destination(s)", matched), crate::LOG_NOTICE, false, false);
+                    }
+                } else if _trace_is_target {
+                    crate::log("[TRACE] target has no destination_hash!", crate::LOG_NOTICE, false, false);
                 }
             }
+        } else if _trace_is_target {
+            crate::log(&format!("[TRACE] target packet_type={} (not DATA, no DATA branch)", packet.packet_type), crate::LOG_NOTICE, false, false);
         }
 
         if packet.packet_type == PROOF {
