@@ -2816,6 +2816,17 @@ impl Link {
                 ACCEPT_NONE => {
                 }
                 ACCEPT_APP => {
+                    // Python parity (RNS/Link.py:1106-1109): ACCEPT_APP only
+                    // accepts the resource if `callbacks.resource` is set and
+                    // returns True. If no resource callback is registered,
+                    // the advertisement is silently ignored — assembling the
+                    // resource with no concluded callback would just produce
+                    // a "Resource concluded but no callback registered"
+                    // warning and drop the bytes anyway.
+                    let resource_cb = self.callbacks.resource.clone();
+                    if resource_cb.is_none() {
+                        return Ok(());
+                    }
                     let link_ctx = self.resource_link_context();
                     if let Some(resource) = Resource::accept(
                         &advertisement_packet,
@@ -2830,9 +2841,8 @@ impl Link {
                         // Spawn callback off the actor thread so the user's handler
                         // can freely call LinkHandle methods (snapshot, send_packet,
                         // etc.) without deadlocking the actor on its own queue.
-                        if let Some(callback) = self.callbacks.resource.clone() {
-                            std::thread::spawn(move || callback(resource));
-                        }
+                        let callback = resource_cb.unwrap();
+                        std::thread::spawn(move || callback(resource));
                     } else {
                         Resource::reject(&advertisement_packet);
                     }
