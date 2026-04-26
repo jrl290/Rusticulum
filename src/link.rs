@@ -92,6 +92,11 @@ pub struct LinkHandle {
     /// Eliminates channel round-trips for status queries and prevents
     /// actor self-deadlock when callbacks call status() on their own handle.
     status_atomic: Arc<AtomicU8>,
+    /// Cached destination hash — captured at spawn time, immutable.
+    /// Lets external code (e.g. Transport announce-handling) match a link
+    /// to its target destination without a channel round-trip while holding
+    /// the transport state lock.
+    dest_hash: Arc<Vec<u8>>,
     /// Whether we initiated this link (true) or it was incoming (false).
     /// Immutable after creation — cached here to avoid channel round-trips.
     pub initiator: bool,
@@ -201,12 +206,21 @@ impl LinkHandle {
         let token = Arc::new(());
         let status_atomic = Arc::new(AtomicU8::new(link.status));
         let initiator = link.initiator;
+        // Capture destination hash up-front (immutable for the link's lifetime).
+        let dest_hash = Arc::new(
+            link.destination
+                .lock()
+                .ok()
+                .map(|d| d.hash.clone())
+                .unwrap_or_default(),
+        );
         let (tx, rx) = mpsc::channel();
         let handle = LinkHandle {
             tx: tx.clone(),
             id: Arc::clone(&id),
             token: Arc::clone(&token),
             status_atomic: Arc::clone(&status_atomic),
+            dest_hash: Arc::clone(&dest_hash),
             initiator,
         };
         let self_handle = handle.clone();
@@ -263,6 +277,12 @@ impl LinkHandle {
     /// Get the current link status byte.
     pub fn status(&self) -> u8 {
         self.status_atomic.load(Ordering::Relaxed)
+    }
+
+    /// Lock-free accessor for the destination hash captured at spawn time.
+    /// Safe to call while holding any mutex (no channel round-trip).
+    pub fn cached_destination_hash(&self) -> &[u8] {
+        &self.dest_hash
     }
 
     /// Check if two LinkHandles refer to the same underlying link.
@@ -917,6 +937,50 @@ pub fn unregister_runtime_link(link_id: &[u8]) {
 pub fn get_runtime_link_handle(link_id: &[u8]) -> Option<LinkHandle> {
     let links = RUNTIME_LINKS.lock().ok()?;
     links.get(link_id).cloned()
+}
+
+/// Tear down all currently-pending (non-ACTIVE, non-CLOSED) outbound links
+/// targeting the given destination hash.
+///
+/// Used by Transport when an announce reveals a strictly better path to a
+/// destination — the in-flight link establishment is committed to a stale
+/// long-hop route, so we close it so the application's link-closed handler
+/// (which observes the new path entry) can retry on the better path.
+///
+/// Returns the number of links torn down. Inbound links and ACTIVE links
+/// are never disturbed.
+pub fn teardown_pending_links_to_destination(dest_hash: &[u8]) -> usize {
+    // Snapshot candidate handles under the registry lock, then call teardown
+    // outside the lock to avoid any chance of cross-actor deadlock.
+    let candidates: Vec<LinkHandle> = {
+        let Ok(links) = RUNTIME_LINKS.lock() else {
+            return 0;
+        };
+        links
+            .values()
+            .filter(|h| h.initiator
+                && h.cached_destination_hash() == dest_hash
+                && h.status() != STATE_ACTIVE
+                && h.status() != STATE_CLOSED)
+            .cloned()
+            .collect()
+    };
+
+    let n = candidates.len();
+    for handle in candidates {
+        crate::log(
+            &format!(
+                "Cancelling pending link={} due to better path to dest={}",
+                crate::hexrep(&handle.link_id(), false),
+                crate::hexrep(dest_hash, false),
+            ),
+            crate::LOG_NOTICE,
+            false,
+            false,
+        );
+        handle.teardown();
+    }
+    n
 }
 
 /// Returns (attached_interface, is_closed) for a link by its link_id.

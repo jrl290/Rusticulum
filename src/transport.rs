@@ -3695,6 +3695,13 @@ impl Transport {
                             false,
                         );
                     } else if should_update_path {
+                        // Detect path-quality improvement *before* we overwrite the entry
+                        // so we can cancel any in-flight link establishment that committed
+                        // to the old (worse) route. Without this, a client that learns a
+                        // bad 9-hop path first sits on a 60s timeout even after a 1-hop
+                        // announce arrives 10s later.
+                        let path_improved = has_existing && packet.hops < existing_hops;
+
                         let entry = vec![
                             PathEntryValue::Timestamp(now()),
                             PathEntryValue::NextHop(received_from.clone()),
@@ -3707,6 +3714,45 @@ impl Transport {
                         state.path_table.insert(destination_hash.clone(), entry);
                         crate::log(&format!("Path added dest={} hops={} table_size={}", crate::hexrep(destination_hash, false), packet.hops, state.path_table.len()), crate::LOG_NOTICE, false, false);
                         Transport::cache(&packet, true, Some("announce".to_string()));
+
+                        // ── FIX: CANCEL PENDING LINK ON PATH IMPROVEMENT ──────────────────────
+                        // DO NOT REVERT.
+                        //
+                        // Bug: when a stale long-hop path is learned first (e.g. flooded
+                        // from a peer's cached announce on connect), iOS would commit a
+                        // link request to that path and then ignore a much shorter path
+                        // arriving 10-30s later, sitting on the 60s timeout.
+                        //
+                        // Fix: when an announce strictly improves the hop count for a
+                        // destination, tear down any in-flight (non-ACTIVE) outbound link
+                        // to that destination. The application's link_closed handler then
+                        // observes the new path entry and retries automatically.
+                        // ──────────────────────────────────────────────────────────────────────
+                        if path_improved {
+                            let dest_hash_clone = destination_hash.clone();
+                            // Don't call teardown while holding the transport state lock —
+                            // cross-actor mpsc could deadlock if the link actor is mid-send
+                            // back into Transport. Defer to a tiny helper thread.
+                            let new_hops = packet.hops;
+                            let old_hops = existing_hops;
+                            std::thread::spawn(move || {
+                                let n = crate::link::teardown_pending_links_to_destination(&dest_hash_clone);
+                                if n > 0 {
+                                    crate::log(
+                                        &format!(
+                                            "Path improved for dest={}: hops {}\u{2192}{}, cancelled {} pending link(s)",
+                                            crate::hexrep(&dest_hash_clone, false),
+                                            old_hops,
+                                            new_hops,
+                                            n,
+                                        ),
+                                        crate::LOG_NOTICE,
+                                        false,
+                                        false,
+                                    );
+                                }
+                            });
+                        }
 
                         // Python Transport.py line 1838-1865:
                         // If there is a waiting discovery path request for this destination,
