@@ -290,6 +290,14 @@ pub struct TransportState {
     pub active_links: Vec<crate::link::Link>,
     pub packet_hashlist: HashSet<Vec<u8>>,
     pub packet_hashlist_prev: HashSet<Vec<u8>>,
+    /// Set of `packet_hash` values for ANNOUNCE packets we've already
+    /// successfully Ed25519-validated. A duplicate announce (same packet_hash)
+    /// MUST have identical bytes, hence identical signature, hence is
+    /// guaranteed valid — skip the expensive `validate_announce` call.
+    /// Cleared in lockstep with `packet_hashlist` rotation so it can never
+    /// outgrow it.
+    pub validated_announce_hashes: HashSet<Vec<u8>>,
+    pub validated_announce_hashes_prev: HashSet<Vec<u8>>,
     pub receipts: Vec<crate::packet::PacketReceipt>,
     pub announce_table: HashMap<Vec<u8>, Vec<AnnounceEntryValue>>,
     pub path_table: HashMap<Vec<u8>, Vec<PathEntryValue>>,
@@ -2038,6 +2046,9 @@ impl Transport {
         if state.packet_hashlist.len() > state.hashlist_maxsize / 2 {
             state.packet_hashlist_prev = state.packet_hashlist.clone();
             state.packet_hashlist.clear();
+            // Rotate the validated-announce cache in lockstep with the packet
+            // hashlist so it can never grow unbounded.
+            state.validated_announce_hashes_prev = std::mem::take(&mut state.validated_announce_hashes);
         }
 
         if now() > state.pending_prs_last_checked + state.pending_prs_check_interval {
@@ -3432,13 +3443,31 @@ impl Transport {
 
             announce_should_add = true;
             if packet.data.len() >= (crate::identity::KEYSIZE / 8) {
-                let pub_key = packet.data[..(crate::identity::KEYSIZE / 8)].to_vec();
-                if !Identity::validate_announce(
-                    &packet.data,
-                    packet.destination_hash.as_ref().map(|v| v.as_slice()),
-                    Some(&pub_key),
-                    packet.context_flag,
-                ) {
+                // Fast-path dedup: if we've already Ed25519-validated an
+                // announce with this exact packet_hash, skip the expensive
+                // verify call. Same packet_hash ⇒ identical bytes ⇒ identical
+                // signature ⇒ guaranteed valid. The cache is bounded by the
+                // packet_hashlist rotation policy.
+                let already_validated = packet.packet_hash.as_ref().map(|h| {
+                    let s = TRANSPORT.lock().unwrap();
+                    s.validated_announce_hashes.contains(h)
+                        || s.validated_announce_hashes_prev.contains(h)
+                }).unwrap_or(false);
+
+                let valid = if already_validated {
+                    crate::announce_log::count_dedup_skipped();
+                    true
+                } else {
+                    let pub_key = packet.data[..(crate::identity::KEYSIZE / 8)].to_vec();
+                    Identity::validate_announce(
+                        &packet.data,
+                        packet.destination_hash.as_ref().map(|v| v.as_slice()),
+                        Some(&pub_key),
+                        packet.context_flag,
+                    )
+                };
+
+                if !valid {
                     crate::announce_log::count_invalid();
                     if crate::announce_log::is_whitelisted(packet.destination_hash.as_deref()) {
                         crate::log(&format!("Announce INVALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
@@ -3448,6 +3477,13 @@ impl Transport {
                     crate::announce_log::count_valid();
                     if crate::announce_log::is_whitelisted(packet.destination_hash.as_deref()) {
                         crate::log(&format!("Announce VALID dest={}", packet.destination_hash.as_ref().map(|h| crate::hexrep(h, false)).unwrap_or_default()), crate::LOG_NOTICE, false, false);
+                    }
+                    // Remember this packet_hash as validated so subsequent
+                    // duplicates short-circuit the Ed25519 verify above.
+                    if !already_validated {
+                        if let Some(h) = packet.packet_hash.clone() {
+                            TRANSPORT.lock().unwrap().validated_announce_hashes.insert(h);
+                        }
                     }
                 }
             }

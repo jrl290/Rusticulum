@@ -39,6 +39,7 @@ const FLUSH_INTERVAL_SECS: u64 = 30;
 static INBOUND_ANNOUNCES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ANNOUNCES_VALID: AtomicU64 = AtomicU64::new(0);
 static ANNOUNCES_INVALID: AtomicU64 = AtomicU64::new(0);
+static ANNOUNCES_DEDUP_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static PATHS_ADDED: AtomicU64 = AtomicU64::new(0);
 static LAST_FLUSH_SECS: AtomicU64 = AtomicU64::new(0);
 
@@ -73,6 +74,13 @@ pub fn count_invalid() {
     ANNOUNCES_INVALID.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Increment when an inbound announce's Ed25519 validation was skipped
+/// because we'd already validated this exact `packet_hash` (duplicate
+/// re-broadcast). Cheap visibility into the dedup hit-rate.
+pub fn count_dedup_skipped() {
+    ANNOUNCES_DEDUP_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn count_path_added() {
     PATHS_ADDED.fetch_add(1, Ordering::Relaxed);
 }
@@ -101,20 +109,22 @@ pub fn flush_if_due() {
     let inbound = INBOUND_ANNOUNCES_TOTAL.swap(0, Ordering::Relaxed);
     let valid = ANNOUNCES_VALID.swap(0, Ordering::Relaxed);
     let invalid = ANNOUNCES_INVALID.swap(0, Ordering::Relaxed);
+    let dedup = ANNOUNCES_DEDUP_SKIPPED.swap(0, Ordering::Relaxed);
     let paths = PATHS_ADDED.swap(0, Ordering::Relaxed);
 
-    if inbound == 0 && valid == 0 && invalid == 0 && paths == 0 {
+    if inbound == 0 && valid == 0 && invalid == 0 && paths == 0 && dedup == 0 {
         return;
     }
 
     let interval = now.saturating_sub(last);
     crate::log(
         format!(
-            "[ANNOUNCE-SUMMARY] window={}s inbound={} valid={} invalid={} paths_added={} ({:.1}/s)",
+            "[ANNOUNCE-SUMMARY] window={}s inbound={} valid={} invalid={} dedup_skipped={} paths_added={} ({:.1}/s)",
             interval,
             inbound,
             valid,
             invalid,
+            dedup,
             paths,
             inbound as f64 / interval.max(1) as f64,
         ),
