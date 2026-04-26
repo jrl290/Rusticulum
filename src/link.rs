@@ -2877,6 +2877,38 @@ impl Link {
             return Ok(());
         }
 
+        // KEEPALIVE packets travel UNENCRYPTED on the wire (single byte 0xFF
+        // ping / 0xFE pong — see Packet::pack which skips encryption for
+        // context == KEEPALIVE).  They MUST therefore be handled BEFORE the
+        // decrypt step below, or self.decrypt() will fail on a 1-byte input
+        // and we'll silently return Ok(()) without ever sending a reply —
+        // which causes the initiator's last_inbound to never refresh on
+        // quiet links and the link to be torn down at stale_time
+        // (= 2*keepalive + STALE_GRACE, i.e. ~15s for low-RTT links).
+        // had_inbound() at the top of receive() has already refreshed our
+        // own last_inbound; here we only need to bounce a 0xFE reply if we
+        // are the responder so the initiator's stale timer also resets.
+        if packet.context == crate::packet::KEEPALIVE {
+            if !self.initiator && packet.data.as_slice() == [0xFFu8] {
+                if let Some((dest, _link_id)) = self.prepare_keepalive() {
+                    let mut reply = Packet::new(
+                        Some(dest),
+                        vec![0xFEu8],
+                        DATA,
+                        crate::packet::KEEPALIVE,
+                        crate::transport::BROADCAST,
+                        packet::HEADER_1,
+                        None,
+                        None,
+                        false,
+                        0,
+                    );
+                    let _ = reply.send();
+                }
+            }
+            return Ok(());
+        }
+
         let plaintext = match self.decrypt(&packet.data) {
             Ok(plaintext) => {
                 plaintext
@@ -2908,38 +2940,7 @@ impl Link {
             return Ok(());
         }
 
-        // KEEPALIVE handling — matches Python RNS Link.py:
-        //   if not self.initiator and packet.data == bytes([0xFF]):
-        //       keepalive_packet = RNS.Packet(self, bytes([0xFE]), context=RNS.Packet.KEEPALIVE)
-        //       keepalive_packet.send()
-        //       self.had_outbound(is_keepalive = True)
-        //
-        // Without this reply, the initiator's `last_inbound` is never refreshed
-        // on quiet links; the link goes STALE after `stale_time` (= 2*keepalive,
-        // which can be as low as ~96 s for low-RTT links) and the initiator tears
-        // it down even though the peer is still reachable.
-        if packet.context == crate::packet::KEEPALIVE {
-            if !self.initiator && plaintext.as_slice() == [0xFFu8] {
-                if let Some((dest, _link_id)) = self.prepare_keepalive() {
-                    let mut reply = Packet::new(
-                        Some(dest),
-                        vec![0xFEu8],
-                        DATA,
-                        crate::packet::KEEPALIVE,
-                        crate::transport::BROADCAST,
-                        packet::HEADER_1,
-                        None,
-                        None,
-                        false,
-                        0,
-                    );
-                    let _ = reply.send();
-                }
-            }
-            // Initiator-side receipt of 0xFE (or any direction) only needs to
-            // refresh last_inbound, which `receive()` already did via had_inbound().
-            return Ok(());
-        }
+        // KEEPALIVE is handled above (BEFORE decrypt) — see comment block.
 
         if packet.context == crate::packet::RESOURCE_REQ {
             let hash_len = identity::HASHLENGTH / 8;
