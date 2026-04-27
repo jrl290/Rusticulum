@@ -475,6 +475,16 @@ impl TcpClientInterface {
                     if let Some(name) = &self.base.name {
                         Transport::set_interface_online(name, false);
                     }
+                    // Python parity (RNS/Interfaces/TCPInterface.py:process_outgoing → teardown):
+                    // Python uses a single shared socket object so a failed sendall()
+                    // immediately causes the read_loop's recv() to fail, which then
+                    // triggers reconnect(). Our read loop runs on a try_clone()'d fd,
+                    // so nulling self.socket is not enough — the cloned fd would stay
+                    // blocked in read() forever. Explicitly shut down BOTH halves so
+                    // the cloned read fd returns EOF/error and the read loop's
+                    // existing reconnect path (RECONNECT_WAIT=5s, matching Python)
+                    // wakes up and re-establishes the connection.
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
                     self.socket = None;
                     self.writing = false;
                     return Err(format!("Failed to send data: {}", e));
